@@ -20,15 +20,21 @@ import io.netty.util.concurrent.PromiseCombiner;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 
 public class RakNetClientChannel extends DatagramChannelProxy {
     private static final byte GATE_ROUTE_HINT_PACKET_ID = (byte) 0xFE;
-    private static final byte GATE_ROUTE_HINT_VERSION = 1;
+    private static final byte GATE_ROUTE_HINT_VERSION = 2;
+    private static final int GATE_ROUTE_HINT_TOKEN_LENGTH = 16;
     private static final int GATE_ROUTE_HINT_MAX_HOST_LENGTH = 1024;
+    private static final int GATE_ROUTE_HINT_RETRIES = 4;
+    private static final int GATE_ROUTE_HINT_RETRY_DELAY_MILLIS = 50;
     private static final byte[] GATE_ROUTE_HINT_MAGIC = "GATE_RAKNET_ROUTE".getBytes(StandardCharsets.US_ASCII);
 
     protected final ChannelPromise connectPromise;
+    protected final byte[] gateRouteHintToken = new byte[GATE_ROUTE_HINT_TOKEN_LENGTH];
     protected volatile String gateRouteHint;
 
     public RakNetClientChannel() {
@@ -37,12 +43,14 @@ public class RakNetClientChannel extends DatagramChannelProxy {
 
     public RakNetClientChannel(Supplier<? extends DatagramChannel> ioChannelSupplier) {
         super(ioChannelSupplier);
+        ThreadLocalRandom.current().nextBytes(gateRouteHintToken);
         connectPromise = newPromise();
         addDefaultPipeline();
     }
 
     public RakNetClientChannel(Class<? extends DatagramChannel> ioChannelType) {
         super(ioChannelType);
+        ThreadLocalRandom.current().nextBytes(gateRouteHintToken);
         connectPromise = newPromise();
         addDefaultPipeline();
     }
@@ -127,11 +135,26 @@ public class RakNetClientChannel extends DatagramChannelProxy {
                 return newFailedFuture(new IllegalArgumentException("Invalid Gate RakNet route hint host length"));
             }
 
-            final ByteBuf buf = alloc().ioBuffer(1 + GATE_ROUTE_HINT_MAGIC.length + 1 + 2 + hostBytes.length);
+            final ChannelFuture firstWrite = writeGateRouteHint(hostBytes);
+            for (int i = 1; i < GATE_ROUTE_HINT_RETRIES; i++) {
+                final int delayMillis = GATE_ROUTE_HINT_RETRY_DELAY_MILLIS * i;
+                listener.eventLoop().schedule(() -> {
+                    if (connectPromise.isDone() || !listener.isOpen()) {
+                        return;
+                    }
+                    writeGateRouteHint(hostBytes).addListener(RakNet.INTERNAL_WRITE_LISTENER);
+                }, delayMillis, TimeUnit.MILLISECONDS);
+            }
+            return firstWrite;
+        }
+
+        private ChannelFuture writeGateRouteHint(byte[] hostBytes) {
+            final ByteBuf buf = alloc().ioBuffer(1 + GATE_ROUTE_HINT_MAGIC.length + 1 + GATE_ROUTE_HINT_TOKEN_LENGTH + 2 + hostBytes.length);
             try {
                 buf.writeByte(GATE_ROUTE_HINT_PACKET_ID & 0xFF);
                 buf.writeBytes(GATE_ROUTE_HINT_MAGIC);
                 buf.writeByte(GATE_ROUTE_HINT_VERSION);
+                buf.writeBytes(gateRouteHintToken);
                 buf.writeShort(hostBytes.length);
                 buf.writeBytes(hostBytes);
                 return listener.writeAndFlush(buf);
