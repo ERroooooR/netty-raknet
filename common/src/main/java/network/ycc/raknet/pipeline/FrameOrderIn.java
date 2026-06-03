@@ -101,29 +101,29 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
             Constants.packetLossCheck(queue.size(), "missed ordered packets");
         }
 
-        // Item 2: skip the missing packet and deliver all consecutive queued data
+        // Item 2: skip over the missing packet(s) and deliver all queued data
+        // that follows the gap. Handles consecutive gaps by scanning forward.
         private void flushGap(List<Object> list) {
-            final int gapIdx = UINT.B3.plus(lastOrderIndex, 1);
-            FramedPacket data = queue.remove(gapIdx);
-            if (data != null) {
-                // Gap packet arrived between timeout check and now — deliver normally
-                list.add(data);
-                lastOrderIndex = gapIdx;
-                int nextIdx = UINT.B3.plus(gapIdx, 1);
-                while ((data = queue.remove(nextIdx)) != null) {
+            int nextIdx = UINT.B3.plus(lastOrderIndex, 1);
+            while (true) {
+                FramedPacket data = queue.remove(nextIdx);
+                if (data != null) {
+                    // Found a packet past the gap(s) — deliver it and continue
+                    // delivering everything consecutive that follows
                     list.add(data);
                     lastOrderIndex = nextIdx;
                     nextIdx = UINT.B3.plus(nextIdx, 1);
+                    while ((data = queue.remove(nextIdx)) != null) {
+                        list.add(data);
+                        lastOrderIndex = nextIdx;
+                        nextIdx = UINT.B3.plus(nextIdx, 1);
+                    }
+                    break;
                 }
-            } else {
-                // Gap still missing — skip it and deliver the rest
-                lastOrderIndex = gapIdx; // accept the gap
-                int nextIdx = UINT.B3.plus(gapIdx, 1);
-                while ((data = queue.remove(nextIdx)) != null) {
-                    list.add(data);
-                    lastOrderIndex = nextIdx;
-                    nextIdx = UINT.B3.plus(nextIdx, 1);
-                }
+                // This index is also missing — skip it and continue scanning
+                lastOrderIndex = nextIdx;
+                nextIdx = UINT.B3.plus(nextIdx, 1);
+                if (queue.isEmpty()) break;
             }
             gapStartNanos = 0;
         }
