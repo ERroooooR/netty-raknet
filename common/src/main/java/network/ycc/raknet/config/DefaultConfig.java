@@ -166,6 +166,8 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
     public void setRTTNanos(long rtt) {
         rttStats.clear();
         rttStats.addValue(rtt);
+        minRTTNanos = rtt;
+        minRTTResetNanos = System.nanoTime();
     }
 
     public long getRTTStdDevNanos() {

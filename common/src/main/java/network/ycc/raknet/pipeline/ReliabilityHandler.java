@@ -274,7 +274,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected void produceFrameSet(ChannelHandlerContext ctx, int maxSize) {
         if (frameQueue.isEmpty()) return;
         final FrameSet frameSet = FrameSet.create();
-        int maxRetryCount = 0;
+        int minRetryCount = Integer.MAX_VALUE;
         Frame frame;
         while ((frame = frameQueue.peek()) != null) {
             assert frame.refCnt() > 0 : "Frame has lost reference";
@@ -288,11 +288,11 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             }
             frameQueue.poll();
             this.queuedBytes -= roughPacketSize;
-            maxRetryCount = Math.max(maxRetryCount, frame.getRetryCount());
+            minRetryCount = Math.min(minRetryCount, frame.getRetryCount());
             frameSet.addPacket(frame);
         }
         if (!frameSet.isEmpty()) {
-            frameSet.setRetryCount(maxRetryCount);
+            frameSet.setRetryCount(minRetryCount == Integer.MAX_VALUE ? 0 : minRetryCount);
             frameSet.setSeqId(nextSendSeqId);
             nextSendSeqId = UINT.B3.plus(nextSendSeqId, 1);
             pendingFrameSets.put(frameSet.getSeqId(), frameSet);
