@@ -72,6 +72,7 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
                         config.setMTU(cr2.getMtu());
                     }
                     state = State.CR2;
+                    resetRetryCount();
                 }
                 break;
             case CR2: {
@@ -82,6 +83,7 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
                             cr.getTimestamp());
                     ctx.writeAndFlush(packet).addListener(RakNet.INTERNAL_WRITE_LISTENER);
                     state = State.CR3;
+                    resetRetryCount();
                     startPing(ctx);
                 }
                 break;
@@ -97,7 +99,7 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
                 throw new IllegalStateException("Unknown state " + state);
         }
 
-        sendRequest(ctx);
+        scheduleRetry(ctx);
     }
 
     @SuppressWarnings("unchecked")

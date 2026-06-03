@@ -41,6 +41,7 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
                     config.setMTU(cr1.getMtu());
                     config.setServerId(cr1.getServerId());
                     state = State.CR2;
+                    resetRetryCount();
                 } else if (msg instanceof InvalidVersion) {
                     fail(new InvalidVersion.InvalidVersionException());
                 }
@@ -53,6 +54,7 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
                     config.setMTU(cr2.getMtu());
                     config.setServerId(cr2.getServerId());
                     state = State.CR3;
+                    resetRetryCount();
                     final Packet packet = new ConnectionRequest(config.getClientId());
                     ctx.writeAndFlush(packet).addListener(RakNet.INTERNAL_WRITE_LISTENER);
                 } else if (msg instanceof ConnectionFailed) {
@@ -77,15 +79,20 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
                 throw new IllegalStateException("Unknown state " + state);
         }
 
-        sendRequest(ctx);
+        scheduleRetry(ctx);
     }
 
     public void sendRequest(ChannelHandlerContext ctx) {
         final RakNet.Config config = RakNet.config(ctx);
         switch (state) {
             case CR1: {
+                // Reduce MTU only after the burst phase (every 3rd retry after burst)
+                final int mtu = cr1Retries >= 3 && (cr1Retries - 3) % 3 == 0
+                        ? Math.max(config.getMTU() - 32, 512)
+                        : config.getMTU();
                 final Packet packet = new ConnectionRequest1(config.getMagic(),
-                        config.getProtocolVersion(), Math.max(config.getMTU() - (cr1Retries * 16), 130));
+                        config.getProtocolVersion(), mtu);
+                config.setMTU(mtu);
                 cr1Retries += 1;
                 ctx.writeAndFlush(packet).addListener(RakNet.INTERNAL_WRITE_LISTENER);
                 break;

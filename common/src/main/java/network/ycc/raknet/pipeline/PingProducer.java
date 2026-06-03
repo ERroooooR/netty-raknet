@@ -4,8 +4,10 @@ import network.ycc.raknet.packet.Ping;
 
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.util.AttributeKey;
 import io.netty.util.concurrent.ScheduledFuture;
 
+import java.net.SocketTimeoutException;
 import java.util.concurrent.TimeUnit;
 
 public class PingProducer implements ChannelHandler {
@@ -13,13 +15,27 @@ public class PingProducer implements ChannelHandler {
     public static final String NAME = "rn-ping-producer";
     public static final long DEFAULT_INTERVAL_MILLIS = Math.max(50L, Long.getLong("raknetify.pingIntervalMillis", 200L));
 
+    private static final int MAX_MISSED_PONGS = Integer.getInteger("raknetify.maxMissedPongs", 5);
+    private static final AttributeKey<Integer> CONSECUTIVE_MISSED = AttributeKey.valueOf("rn-consecutive-missed-pongs");
+
     ScheduledFuture<?> pingTask = null;
 
     public void handlerAdded(ChannelHandlerContext ctx) {
-        pingTask = ctx.channel().eventLoop().scheduleAtFixedRate(
-                () -> ctx.writeAndFlush(new Ping()),
-                0, DEFAULT_INTERVAL_MILLIS, TimeUnit.MILLISECONDS
-        );
+        pingTask = ctx.channel().eventLoop().scheduleAtFixedRate(() -> {
+            checkDeadConnection(ctx);
+            ctx.writeAndFlush(new Ping());
+        }, 0, DEFAULT_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
+    }
+
+    private void checkDeadConnection(ChannelHandlerContext ctx) {
+        final Long lastPong = ctx.channel().attr(PongHandler.LAST_PONG_NANOS).get();
+        if (lastPong == null) return; // too early, no pong yet
+        final long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - lastPong);
+        if (elapsedMillis > DEFAULT_INTERVAL_MILLIS * MAX_MISSED_PONGS) {
+            final long seconds = elapsedMillis / 1000;
+            ctx.fireExceptionCaught(new SocketTimeoutException(
+                    "No pong response for " + seconds + "s (missed " + MAX_MISSED_PONGS + "+ pings)"));
+        }
     }
 
     public void handlerRemoved(ChannelHandlerContext ctx) {

@@ -14,6 +14,7 @@ import io.netty.handler.codec.TooLongFrameException;
 import io.netty.util.ReferenceCountUtil;
 
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 
@@ -22,6 +23,8 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
     public static final String NAME = "rn-join";
 
     protected final Int2ObjectOpenHashMap<Builder> pendingPackets = new Int2ObjectOpenHashMap<>();
+    protected long lastCleanupNanos = 0;
+    private static final long CLEANUP_INTERVAL_NANOS = TimeUnit.NANOSECONDS.convert(500, TimeUnit.MILLISECONDS);
 
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
@@ -32,6 +35,7 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
 
     @Override
     protected void decode(ChannelHandlerContext ctx, Frame frame, List<Object> list) {
+        cleanupExpired(ctx);
         if (!frame.hasSplit()) {
             frame.touch("Not split");
             list.add(frame.retain());
@@ -56,6 +60,24 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
         }
     }
 
+    private void cleanupExpired(ChannelHandlerContext ctx) {
+        final long now = System.nanoTime();
+        if (now - lastCleanupNanos < CLEANUP_INTERVAL_NANOS) return;
+        lastCleanupNanos = now;
+
+        final long timeoutNanos = TimeUnit.NANOSECONDS.convert(
+                Integer.getInteger("raknetify.fragmentTimeoutSecs", 3), TimeUnit.SECONDS);
+
+        final var it = pendingPackets.int2ObjectEntrySet().fastIterator();
+        while (it.hasNext()) {
+            final var entry = it.next();
+            if (entry.getValue().isExpired(timeoutNanos)) {
+                entry.getValue().release();
+                it.remove();
+            }
+        }
+    }
+
     protected static final class Builder {
 
         protected final Int2ObjectOpenHashMap<ByteBuf> queue;
@@ -64,6 +86,7 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
         protected int splitIdx;
         protected int orderId;
         protected FrameData.Reliability reliability;
+        protected long createdAt;
 
         private Builder(int size) {
             queue = new Int2ObjectOpenHashMap<>(size);
@@ -72,6 +95,7 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
         private static Builder create(ByteBufAllocator alloc, Frame frame) {
             final Builder out = new Builder(frame.getSplitCount());
             out.init(alloc, frame);
+            out.createdAt = System.nanoTime();
             return out;
         }
 
@@ -83,6 +107,10 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
             reliability = packet.getReliability();
             samplePacket = packet.retain();
             add(packet);
+        }
+
+        boolean isExpired(long timeoutNanos) {
+            return System.nanoTime() - createdAt > timeoutNanos;
         }
 
         void add(Frame packet) {
