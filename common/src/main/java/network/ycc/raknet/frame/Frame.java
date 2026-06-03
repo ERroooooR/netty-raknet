@@ -43,6 +43,7 @@ public final class Frame extends AbstractReferenceCounted {
     private FrameData frameData = null;
     private ResourceLeakTracker<Frame> tracker = null;
     private ChannelPromise promise = null;
+    private int retryCount = 0;
 
     private Frame(Recycler.Handle<Frame> handle) {
         this.handle = handle;
@@ -114,6 +115,7 @@ public final class Frame extends AbstractReferenceCounted {
         assert out.frameData == null;
         assert out.promise == null;
         out.hasSplit = false;
+        out.retryCount = 0;
         out.reliableIndex = out.sequenceIndex = out.orderIndex =
                 out.splitCount = out.splitID = out.splitIndex = 0;
         out.setRefCnt(1);
@@ -197,6 +199,7 @@ public final class Frame extends AbstractReferenceCounted {
             tracker = null;
         }
         promise = null;
+        retryCount = 0;
         handle.recycle(this);
     }
 
@@ -297,6 +300,14 @@ public final class Frame extends AbstractReferenceCounted {
 
     public void setPromise(ChannelPromise promise) {
         this.promise = promise;
+    }
+
+    public int getRetryCount() {
+        return retryCount;
+    }
+
+    public void incRetryCount() {
+        this.retryCount++;
     }
 
     protected static final class FrameComparator implements java.util.Comparator<Frame> {

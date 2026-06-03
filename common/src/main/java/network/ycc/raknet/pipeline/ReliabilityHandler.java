@@ -252,22 +252,29 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected void recallExpiredFrameSets() {
         final ObjectIterator<FrameSet> packetItr = pendingFrameSets.values().iterator();
         //2 sd from mean RTT is about 97% coverage
-        final long deadline = System.nanoTime() -
-                (config.getRTTNanos() + 2 * config.getRTTStdDevNanos() + config.getRetryDelayNanos());
+        final long baseTimeout = config.getRTTNanos() + 2 * config.getRTTStdDevNanos() + config.getRetryDelayNanos();
+        final long now = System.nanoTime();
         while (packetItr.hasNext()) {
             final FrameSet frameSet = packetItr.next();
+            // exponential backoff: 1x, 2x, 4x, 8x (max)
+            final long multiplier = 1L << Math.min(frameSet.getRetryCount(), 3);
+            final long deadline = now - baseTimeout * multiplier;
             if (frameSet.getSentTime() < deadline) {
                 packetItr.remove();
                 recallFrameSet(frameSet);
-            } else {
-                break; // FrameSets are ordered by send time: LinkedMap
+                continue;
             }
+            // remaining FrameSets are newer — check sentTime ordering still holds
+            // since higher retryCount = longer timeout, an older FrameSet with high
+            // retryCount could be before a newer FrameSet with low retryCount.
+            // Continue scanning rather than breaking to handle this correctly.
         }
     }
 
     protected void produceFrameSet(ChannelHandlerContext ctx, int maxSize) {
         if (frameQueue.isEmpty()) return;
         final FrameSet frameSet = FrameSet.create();
+        int maxRetryCount = 0;
         Frame frame;
         while ((frame = frameQueue.peek()) != null) {
             assert frame.refCnt() > 0 : "Frame has lost reference";
@@ -281,9 +288,11 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             }
             frameQueue.poll();
             this.queuedBytes -= roughPacketSize;
+            maxRetryCount = Math.max(maxRetryCount, frame.getRetryCount());
             frameSet.addPacket(frame);
         }
         if (!frameSet.isEmpty()) {
+            frameSet.setRetryCount(maxRetryCount);
             frameSet.setSeqId(nextSendSeqId);
             nextSendSeqId = UINT.B3.plus(nextSendSeqId, 1);
             pendingFrameSets.put(frameSet.getSeqId(), frameSet);
@@ -319,6 +328,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             frameSet.touch("Recalled");
             frameSet.createFrames(frame -> {
                 if (frame.getReliability().isReliable) {
+                    frame.incRetryCount();
                     queueFrame(frame);
                 } else {
                     frame.getPromise().trySuccess(); //TODO: maybe need a fail here

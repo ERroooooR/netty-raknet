@@ -114,6 +114,7 @@ public class RakNet {
         long getRTTNanos();
         void setRTTNanos(long rtt);
         long getRTTStdDevNanos();
+        long getMinRTTNanos();
         void updateRTTNanos(long rttSample);
 
         int getMaxPendingFrameSets();

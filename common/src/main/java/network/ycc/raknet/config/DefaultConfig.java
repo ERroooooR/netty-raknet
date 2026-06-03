@@ -23,6 +23,9 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
     private static final Random rnd = new Random();
 
     protected final DescriptiveStatistics rttStats = new DescriptiveStatistics(16);
+    private volatile long minRTTNanos = 0;
+    private volatile long minRTTResetNanos = 0;
+    private static final long MIN_RTT_WINDOW_NANOS = TimeUnit.NANOSECONDS.convert(10, TimeUnit.SECONDS);
     //TODO: add rest of ChannelOptions
     private volatile long serverId = rnd.nextLong();
     private volatile long clientId = rnd.nextLong();
@@ -169,8 +172,19 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
         return (long) rttStats.getStandardDeviation(); //ns
     }
 
+    public long getMinRTTNanos() {
+        return minRTTNanos;
+    }
+
     public void updateRTTNanos(long rttSample) {
         rttStats.addValue(rttSample);
+        final long now = System.nanoTime();
+        if (now - minRTTResetNanos > MIN_RTT_WINDOW_NANOS) {
+            minRTTNanos = rttSample;
+            minRTTResetNanos = now;
+        } else if (minRTTNanos == 0 || rttSample < minRTTNanos) {
+            minRTTNanos = rttSample;
+        }
         metrics.measureRTTns(getRTTNanos());
         metrics.measureRTTnsStdDev(getRTTStdDevNanos());
     }
