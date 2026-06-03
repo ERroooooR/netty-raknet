@@ -20,6 +20,7 @@ public class PingProducer implements ChannelHandler {
 
     ScheduledFuture<?> pingTask = null;
     private long firstPingNanos;
+    private long currentIntervalMillis = DEFAULT_INTERVAL_MILLIS;
 
     public void handlerAdded(ChannelHandlerContext ctx) {
         firstPingNanos = System.nanoTime();
@@ -33,12 +34,12 @@ public class PingProducer implements ChannelHandler {
     private void scheduleNextPing(ChannelHandlerContext ctx) {
         final long rttNanos = RakNet.config(ctx).getRTTNanos();
         final long rttMillis = TimeUnit.NANOSECONDS.toMillis(rttNanos);
-        final long interval = Math.max(MIN_INTERVAL_MILLIS, Math.min(rttMillis, MAX_INTERVAL_MILLIS));
+        currentIntervalMillis = Math.max(MIN_INTERVAL_MILLIS, Math.min(rttMillis, MAX_INTERVAL_MILLIS));
         pingTask = ctx.channel().eventLoop().schedule(() -> {
             checkDeadConnection(ctx);
             ctx.writeAndFlush(new Ping());
             scheduleNextPing(ctx);
-        }, interval, TimeUnit.MILLISECONDS);
+        }, currentIntervalMillis, TimeUnit.MILLISECONDS);
     }
 
     private void checkDeadConnection(ChannelHandlerContext ctx) {
@@ -54,7 +55,7 @@ public class PingProducer implements ChannelHandler {
             maxMissed = MAX_MISSED_PONGS;
         }
         final long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - referenceNanos);
-        if (elapsedMillis > DEFAULT_INTERVAL_MILLIS * maxMissed) {
+        if (elapsedMillis > currentIntervalMillis * maxMissed) {
             final long seconds = elapsedMillis / 1000;
             System.err.println("Raknetify: no pong for " + seconds + "s, closing connection");
             ctx.close();

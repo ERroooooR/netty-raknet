@@ -84,15 +84,18 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
                 } while (data != null);
             } else if (indexDiff > 1 && !queue.containsKey(frame.getOrderIndex())) {
                 // only new future data goes in the queue
-                if (gapStartNanos == 0) {
+                // Gap timeout only applies to unreliable frames — reliable frames
+                // will be retransmitted, so skipping them would break RELIABLE_ORDERED.
+                final boolean isUnreliable = !frame.getReliability().isReliable;
+                if (isUnreliable && gapStartNanos == 0) {
                     gapStartNanos = System.nanoTime();
                 }
                 queue.put(frame.getOrderIndex(), frame.retainedFrameData());
-                // Check gap timeout — if the missing packet hasn't arrived after
-                // GAP_TIMEOUT_MULTIPLIER * RTT, flush queued packets to avoid HOL blocking
-                final long gapTimeoutNanos = rttNanos * GAP_TIMEOUT_MULTIPLIER;
-                if (System.nanoTime() - gapStartNanos > gapTimeoutNanos && !queue.isEmpty()) {
-                    flushGap(list);
+                if (isUnreliable && gapStartNanos > 0) {
+                    final long gapTimeoutNanos = rttNanos * GAP_TIMEOUT_MULTIPLIER;
+                    if (System.nanoTime() - gapStartNanos > gapTimeoutNanos && !queue.isEmpty()) {
+                        flushGap(list);
+                    }
                 }
             }
             Constants.packetLossCheck(queue.size(), "missed ordered packets");
