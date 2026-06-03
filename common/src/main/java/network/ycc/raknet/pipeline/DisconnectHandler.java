@@ -17,6 +17,7 @@ public class DisconnectHandler extends ChannelDuplexHandler {
 
     public static final String NAME = "rn-disconnect";
     public static final DisconnectHandler INSTANCE = new DisconnectHandler();
+    private static final long DISCONNECT_TIMEOUT_SECS = Long.getLong("raknetify.disconnectTimeoutSecs", 3);
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) {
@@ -37,7 +38,7 @@ public class DisconnectHandler extends ChannelDuplexHandler {
                     () -> {
                         disconnectPromise.trySuccess();
                         throw new SocketTimeoutException();
-                    }, 3, TimeUnit.SECONDS); //TODO: config
+                    }, DISCONNECT_TIMEOUT_SECS, TimeUnit.SECONDS);
             ctx.channel().writeAndFlush(new Disconnect())
                     .addListener(f -> disconnectPromise.trySuccess());
             disconnectPromise.addListener(f -> {

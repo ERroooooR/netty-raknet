@@ -12,6 +12,7 @@ import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.MessageToMessageDecoder;
 import io.netty.handler.codec.TooLongFrameException;
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.concurrent.ScheduledFuture;
 
 import java.util.List;
 import java.util.concurrent.TimeUnit;
@@ -26,10 +27,23 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
 
     protected final Int2ObjectOpenHashMap<Builder> pendingPackets = new Int2ObjectOpenHashMap<>();
     protected long lastCleanupNanos = 0;
-    private static final long CLEANUP_INTERVAL_NANOS = TimeUnit.NANOSECONDS.convert(500, TimeUnit.MILLISECONDS);
+    protected ScheduledFuture<?> cleanupTask = null;
+    private static final long CLEANUP_INTERVAL_MILLIS = 500;
+    private static final long CLEANUP_INTERVAL_NANOS = TimeUnit.NANOSECONDS.convert(CLEANUP_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
+
+    @Override
+    public void handlerAdded(ChannelHandlerContext ctx) {
+        cleanupTask = ctx.channel().eventLoop().scheduleAtFixedRate(
+                () -> cleanupExpired(ctx),
+                CLEANUP_INTERVAL_MILLIS, CLEANUP_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
+    }
 
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
+        if (cleanupTask != null) {
+            cleanupTask.cancel(false);
+            cleanupTask = null;
+        }
         super.handlerRemoved(ctx);
         pendingPackets.values().forEach(Builder::release);
         pendingPackets.clear();

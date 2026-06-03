@@ -1,5 +1,6 @@
 package network.ycc.raknet.pipeline;
 
+import network.ycc.raknet.RakNet;
 import network.ycc.raknet.packet.Ping;
 
 import io.netty.channel.ChannelHandler;
@@ -14,21 +15,46 @@ public class PingProducer implements ChannelHandler {
     public static final long DEFAULT_INTERVAL_MILLIS = Math.max(50L, Long.getLong("raknetify.pingIntervalMillis", 200L));
 
     private static final int MAX_MISSED_PONGS = Integer.getInteger("raknetify.maxMissedPongs", 5);
+    private static final long MIN_INTERVAL_MILLIS = 50;
+    private static final long MAX_INTERVAL_MILLIS = 500;
 
     ScheduledFuture<?> pingTask = null;
+    private long firstPingNanos;
 
     public void handlerAdded(ChannelHandlerContext ctx) {
-        pingTask = ctx.channel().eventLoop().scheduleAtFixedRate(() -> {
+        firstPingNanos = System.nanoTime();
+        scheduleNextPing(ctx);
+    }
+
+    // Item 6: adaptive ping interval based on current RTT
+    // interval = max(50ms, min(RTT, 500ms))
+    // Fast RTT → ping more frequently → faster dead detection
+    // Slow RTT → ping less frequently → avoid adding congestion
+    private void scheduleNextPing(ChannelHandlerContext ctx) {
+        final long rttNanos = RakNet.config(ctx).getRTTNanos();
+        final long rttMillis = TimeUnit.NANOSECONDS.toMillis(rttNanos);
+        final long interval = Math.max(MIN_INTERVAL_MILLIS, Math.min(rttMillis, MAX_INTERVAL_MILLIS));
+        pingTask = ctx.channel().eventLoop().schedule(() -> {
             checkDeadConnection(ctx);
             ctx.writeAndFlush(new Ping());
-        }, 0, DEFAULT_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
+            scheduleNextPing(ctx);
+        }, interval, TimeUnit.MILLISECONDS);
     }
 
     private void checkDeadConnection(ChannelHandlerContext ctx) {
         final Long lastPong = ctx.channel().attr(PongHandler.LAST_PONG_NANOS).get();
-        if (lastPong == null) return; // too early, no pong yet
-        final long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - lastPong);
-        if (elapsedMillis > DEFAULT_INTERVAL_MILLIS * MAX_MISSED_PONGS) {
+        final long referenceNanos;
+        final int maxMissed;
+        if (lastPong == null) {
+            // No pong ever received — use handlerAdded time with extra grace
+            referenceNanos = firstPingNanos;
+            maxMissed = MAX_MISSED_PONGS * 2;
+        } else {
+            referenceNanos = lastPong;
+            maxMissed = MAX_MISSED_PONGS;
+        }
+        final long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - referenceNanos);
+        if (elapsedMillis > DEFAULT_INTERVAL_MILLIS * maxMissed) {
             final long seconds = elapsedMillis / 1000;
             System.err.println("Raknetify: no pong for " + seconds + "s, closing connection");
             ctx.close();

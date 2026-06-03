@@ -41,6 +41,12 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected RakNet.Config config = null; //TODO: not really needed anymore
     protected ChannelHandlerContext ctx;
 
+    // Item 3: track when first ACK was queued for time-based flush
+    protected long firstAckNanos = 0;
+    private static final long ACK_FLUSH_DELAY_NANOS = 2_000_000; // 2ms
+    // Item 7: guard against recursive flush from recallFrameSet
+    protected boolean flushing = false;
+
     protected Runnable frameSetProduction = () -> {
         this.produceFrameSets(ctx);
         ctx.flush();
@@ -63,13 +69,19 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
         if (msg instanceof Frame) {
             final Frame frame = (Frame) msg;
+            // Item 1: detect idle→active transition for immediate flush
+            final boolean wasIdle = frameQueue.isEmpty();
             queueFrame(frame);
             frame.setPromise(promise);
+            Constants.packetLossCheck(pendingFrameSets.size(), "unconfirmed sent packets");
+            FlushTickHandler.checkFlushTick(ctx.channel());
+            // Items 1 & 5: immediate flush on idle→active or when capacity available
+            if (wasIdle || pendingFrameSets.size() < config.getDefaultPendingFrameSets() + burstTokens) {
+                ctx.flush();
+            }
         } else {
             ctx.write(msg, promise);
         }
-        Constants.packetLossCheck(pendingFrameSets.size(), "unconfirmed sent packets");
-        FlushTickHandler.checkFlushTick(ctx.channel());
     }
 
     @Override
@@ -78,14 +90,21 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             ctx.flush();
             return;
         }
-        //all data sent in order of priority
-        sendResponses(ctx);
-        recallExpiredFrameSets();
-        produceFrameSets(ctx);
-        updateBurstTokens(1);
-        updateBackPressure(ctx);
-        Constants.packetLossCheck(pendingFrameSets.size(), "resend queue");
-        ctx.flush();
+        // Item 7: prevent recursive flush from recallFrameSet during expire path
+        if (flushing) return;
+        flushing = true;
+        try {
+            //all data sent in order of priority
+            sendResponses(ctx);
+            recallExpiredFrameSets();
+            produceFrameSets(ctx);
+            updateBurstTokens(1);
+            updateBackPressure(ctx);
+            Constants.packetLossCheck(pendingFrameSets.size(), "resend queue");
+            ctx.flush();
+        } finally {
+            flushing = false;
+        }
     }
 
     @Override
@@ -132,6 +151,10 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 
     protected void readFrameSet(ChannelHandlerContext ctx, FrameSet frameSet) {
         final int packetSeqId = frameSet.getSeqId();
+        // Item 3: track first ACK time for time-based flush trigger
+        if (ackSet.isEmpty()) {
+            firstAckNanos = System.nanoTime();
+        }
         ackSet.add(packetSeqId);
         if (config.isNACKEnabled())
             nackSet.remove(packetSeqId);
@@ -234,6 +257,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             ctx.write(new Reliability.ACK(ackSet)).addListener(RakNet.INTERNAL_WRITE_LISTENER);
             config.getMetrics().acksSent(ackSet.size());
             ackSet.clear();
+            firstAckNanos = 0;
         }
         if (config.isNACKEnabled() && !nackSet.isEmpty() && config.isAutoRead()) { //only nack if we can read
             ctx.write(new Reliability.NACK(nackSet)).addListener(RakNet.INTERNAL_WRITE_LISTENER);
@@ -243,7 +267,11 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     }
 
     protected void trySendResponses(ChannelHandlerContext ctx) {
-        if (ackSet.size() >= config.getDefaultPendingFrameSets() - 1) {
+        // Item 3: send ACKs on count OR time threshold (2ms), whichever comes first
+        final boolean countTrigger = ackSet.size() >= config.getDefaultPendingFrameSets() - 1;
+        final boolean timeTrigger = !ackSet.isEmpty()
+                && System.nanoTime() - firstAckNanos > ACK_FLUSH_DELAY_NANOS;
+        if (countTrigger || timeTrigger) {
             sendResponses(ctx);
             ctx.flush();
         }
@@ -336,6 +364,10 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 }
             });
             tryProduceFrameSets();
+            // Item 7: immediate flush for NACK-triggered recall (skip during expire path)
+            if (!flushing) {
+                ctx.flush();
+            }
         } finally {
             frameSet.release();
         }
