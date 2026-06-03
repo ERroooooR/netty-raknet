@@ -69,14 +69,15 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
         if (msg instanceof Frame) {
             final Frame frame = (Frame) msg;
-            // Item 1: detect idle→active transition for immediate flush
+            // Item 1: detect idle→active transition for immediate flush.
+            // Only flush on the first frame after silence — subsequent frames
+            // are batched by the normal flush cycle for packet efficiency.
             final boolean wasIdle = frameQueue.isEmpty();
             queueFrame(frame);
             frame.setPromise(promise);
             Constants.packetLossCheck(pendingFrameSets.size(), "unconfirmed sent packets");
             FlushTickHandler.checkFlushTick(ctx.channel());
-            // Items 1 & 5: immediate flush on idle→active or when capacity available
-            if (wasIdle || pendingFrameSets.size() < config.getDefaultPendingFrameSets() + burstTokens) {
+            if (wasIdle) {
                 ctx.flush();
             }
         } else {

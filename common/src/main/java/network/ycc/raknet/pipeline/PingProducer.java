@@ -47,7 +47,9 @@ public class PingProducer implements ChannelHandler {
         final long referenceNanos;
         final int maxMissed;
         if (lastPong == null) {
-            // No pong ever received — use handlerAdded time with extra grace
+            // No pong ever received — use handlerAdded time with extra grace.
+            // Floor to DEFAULT_INTERVAL_MILLIS so cold-RTT (0 samples → 50ms adaptive)
+            // doesn't produce an unreasonably short initial timeout.
             referenceNanos = firstPingNanos;
             maxMissed = MAX_MISSED_PONGS * 2;
         } else {
@@ -55,7 +57,12 @@ public class PingProducer implements ChannelHandler {
             maxMissed = MAX_MISSED_PONGS;
         }
         final long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - referenceNanos);
-        if (elapsedMillis > currentIntervalMillis * maxMissed) {
+        // Use DEFAULT_INTERVAL_MILLIS as floor when no pong has been seen yet,
+        // otherwise use the actual adaptive interval.
+        final long effectiveInterval = lastPong == null
+                ? Math.max(currentIntervalMillis, DEFAULT_INTERVAL_MILLIS)
+                : currentIntervalMillis;
+        if (elapsedMillis > effectiveInterval * maxMissed) {
             final long seconds = elapsedMillis / 1000;
             System.err.println("Raknetify: no pong for " + seconds + "s, closing connection");
             ctx.close();
