@@ -138,6 +138,10 @@ public class RakNetClientThreadedChannel extends AbstractChannel {
         return parent().config();
     }
 
+    public void setGateRouteHint(String host) {
+        parent().setGateRouteHint(host);
+    }
+
     public boolean isOpen() {
         return parent().isOpen();
     }
