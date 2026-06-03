@@ -79,7 +79,7 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
                 throw new IllegalStateException("Unknown state " + state);
         }
 
-        scheduleRetry(ctx);
+        sendRequest(ctx);
     }
 
     public void sendRequest(ChannelHandlerContext ctx) {
@@ -108,6 +108,7 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
             default:
                 throw new IllegalStateException("Unknown state " + state);
         }
+        adjustRetryInterval(ctx);
     }
 
     protected void removeHandler(ChannelHandlerContext ctx) {

@@ -4,10 +4,8 @@ import network.ycc.raknet.packet.Ping;
 
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
-import io.netty.util.AttributeKey;
 import io.netty.util.concurrent.ScheduledFuture;
 
-import java.net.SocketTimeoutException;
 import java.util.concurrent.TimeUnit;
 
 public class PingProducer implements ChannelHandler {
@@ -16,7 +14,6 @@ public class PingProducer implements ChannelHandler {
     public static final long DEFAULT_INTERVAL_MILLIS = Math.max(50L, Long.getLong("raknetify.pingIntervalMillis", 200L));
 
     private static final int MAX_MISSED_PONGS = Integer.getInteger("raknetify.maxMissedPongs", 5);
-    private static final AttributeKey<Integer> CONSECUTIVE_MISSED = AttributeKey.valueOf("rn-consecutive-missed-pongs");
 
     ScheduledFuture<?> pingTask = null;
 
@@ -33,8 +30,8 @@ public class PingProducer implements ChannelHandler {
         final long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - lastPong);
         if (elapsedMillis > DEFAULT_INTERVAL_MILLIS * MAX_MISSED_PONGS) {
             final long seconds = elapsedMillis / 1000;
-            ctx.fireExceptionCaught(new SocketTimeoutException(
-                    "No pong response for " + seconds + "s (missed " + MAX_MISSED_PONGS + "+ pings)"));
+            System.err.println("Raknetify: no pong for " + seconds + "s, closing connection");
+            ctx.close();
         }
     }
 

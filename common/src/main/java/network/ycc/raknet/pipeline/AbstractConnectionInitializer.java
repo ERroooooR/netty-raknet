@@ -24,10 +24,9 @@ public abstract class AbstractConnectionInitializer extends SimpleChannelInbound
     protected ScheduledFuture<?> connectTimer = null;
     protected int retryCount = 0;
 
-    private static final int BURST_COUNT = 3;
+    private static final int BURST_COUNT = 2;
     private static final long BURST_DELAY_MS = 10;
-    private static final long BASE_RETRY_DELAY_MS = 50;
-    private static final long MAX_RETRY_DELAY_MS = 500;
+    private static final long NORMAL_DELAY_MS = 50;
 
     public AbstractConnectionInitializer(ChannelPromise connectPromise) {
         this.connectPromise = connectPromise;
@@ -39,27 +38,22 @@ public abstract class AbstractConnectionInitializer extends SimpleChannelInbound
 
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) {
+        sendTimer = ctx.channel().eventLoop().scheduleAtFixedRate(() -> sendRequest(ctx),
+                0, NORMAL_DELAY_MS, TimeUnit.MILLISECONDS);
         connectTimer = ctx.channel().eventLoop().schedule(this::doTimeout,
                 ctx.channel().config().getConnectTimeoutMillis(), TimeUnit.MILLISECONDS);
-        scheduleRetry(ctx);
+        sendRequest(ctx);
     }
 
-    protected void scheduleRetry(ChannelHandlerContext ctx) {
-        if (sendTimer != null) {
-            sendTimer.cancel(false);
-        }
-        final long delay;
+    // Called at the end of sendRequest() — schedules extra burst sends
+    // alongside the reliable 50ms timer
+    protected void adjustRetryInterval(ChannelHandlerContext ctx) {
         if (retryCount < BURST_COUNT) {
-            delay = BURST_DELAY_MS;                       // 0-2: 10ms burst
-        } else if (retryCount < BURST_COUNT + 4) {
-            delay = BASE_RETRY_DELAY_MS << (retryCount - BURST_COUNT);
-            // 3:50ms 4:100ms 5:200ms 6:400ms
-        } else {
-            delay = MAX_RETRY_DELAY_MS;                   // 7+: 500ms cap
+            retryCount++;
+            ctx.channel().eventLoop().schedule(
+                    () -> sendRequest(ctx),
+                    BURST_DELAY_MS, TimeUnit.MILLISECONDS);
         }
-        retryCount++;
-        sendTimer = ctx.channel().eventLoop().schedule(
-                () -> sendRequest(ctx), delay, TimeUnit.MILLISECONDS);
     }
 
     protected void resetRetryCount() {

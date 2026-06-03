@@ -17,6 +17,8 @@ import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.objects.ObjectIterator;
+import it.unimi.dsi.fastutil.ints.Int2ObjectMap;
 
 public class FrameJoiner extends MessageToMessageDecoder<Frame> {
 
@@ -68,9 +70,9 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
         final long timeoutNanos = TimeUnit.NANOSECONDS.convert(
                 Integer.getInteger("raknetify.fragmentTimeoutSecs", 3), TimeUnit.SECONDS);
 
-        final var it = pendingPackets.int2ObjectEntrySet().fastIterator();
+        final ObjectIterator<Int2ObjectMap.Entry<Builder>> it = pendingPackets.int2ObjectEntrySet().fastIterator();
         while (it.hasNext()) {
-            final var entry = it.next();
+            final Int2ObjectMap.Entry<Builder> entry = it.next();
             if (entry.getValue().isExpired(timeoutNanos)) {
                 entry.getValue().release();
                 it.remove();
@@ -119,6 +121,7 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
             assert packet.getOrderIndex() == samplePacket.getOrderIndex();
             if (!queue.containsKey(packet.getSplitIndex()) && packet.getSplitIndex() >= splitIdx) {
                 queue.put(packet.getSplitIndex(), packet.retainedFragmentData());
+                createdAt = System.nanoTime(); // refresh activity time
                 update();
             }
             Constants.packetLossCheck(queue.size(), "packet defragment queue");
