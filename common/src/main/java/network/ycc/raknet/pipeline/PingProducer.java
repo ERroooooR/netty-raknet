@@ -57,11 +57,10 @@ public class PingProducer implements ChannelHandler {
             maxMissed = MAX_MISSED_PONGS;
         }
         final long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - referenceNanos);
-        // Use DEFAULT_INTERVAL_MILLIS as floor when no pong has been seen yet,
-        // otherwise use the actual adaptive interval.
-        final long effectiveInterval = lastPong == null
-                ? Math.max(currentIntervalMillis, DEFAULT_INTERVAL_MILLIS)
-                : currentIntervalMillis;
+        // Always use DEFAULT_INTERVAL_MILLIS as floor so dead detection
+        // is never more aggressive than 200ms * maxMissed, preventing
+        // premature disconnect on low-RTT connections (min threshold: 1s).
+        final long effectiveInterval = Math.max(currentIntervalMillis, DEFAULT_INTERVAL_MILLIS);
         if (elapsedMillis > effectiveInterval * maxMissed) {
             final long seconds = elapsedMillis / 1000;
             System.err.println("Raknetify: no pong for " + seconds + "s, closing connection");
