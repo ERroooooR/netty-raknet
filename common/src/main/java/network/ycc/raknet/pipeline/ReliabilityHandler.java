@@ -19,6 +19,7 @@ import network.ycc.raknet.utils.Constants;
 import network.ycc.raknet.utils.UINT;
 
 import java.util.PriorityQueue;
+import java.util.concurrent.TimeUnit;
 
 /**
  * This handler handles the bulk of reliable (framed) transport.
@@ -78,7 +79,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             Constants.packetLossCheck(pendingFrameSets.size(), "unconfirmed sent packets");
             FlushTickHandler.checkFlushTick(ctx.channel());
             if (wasIdle) {
-                ctx.flush();
+                flush(ctx);
             }
         } else {
             ctx.write(msg, promise);
@@ -151,10 +152,17 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     }
 
     protected void readFrameSet(ChannelHandlerContext ctx, FrameSet frameSet) {
+        // Treat any inbound data as proof of liveness, not just pongs
+        ctx.channel().attr(PongHandler.LAST_PONG_NANOS).set(System.nanoTime());
         final int packetSeqId = frameSet.getSeqId();
         // Item 3: track first ACK time for time-based flush trigger
         if (ackSet.isEmpty()) {
             firstAckNanos = System.nanoTime();
+            // Schedule guaranteed ACK flush so low-traffic connections
+            // don't wait until the 50ms flush tick or next FrameSet arrival.
+            ctx.channel().eventLoop().schedule(() -> {
+                trySendResponses(ctx);
+            }, ACK_FLUSH_DELAY_NANOS + 500_000L, TimeUnit.NANOSECONDS);
         }
         ackSet.add(packetSeqId);
         if (config.isNACKEnabled())
@@ -365,10 +373,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 }
             });
             tryProduceFrameSets();
-            // Item 7: immediate flush for NACK-triggered recall (skip during expire path)
-            if (!flushing) {
-                ctx.flush();
-            }
+            flush(ctx);
         } finally {
             frameSet.release();
         }

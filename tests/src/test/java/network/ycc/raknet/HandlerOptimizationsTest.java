@@ -70,50 +70,38 @@ public class HandlerOptimizationsTest {
     }
 
     @Test
-    public void testGapTimeoutSkipsUnreliableSequenced() throws Exception {
+    public void testSequencedSkipsOlderData() throws Exception {
         final FrameOrderIn handler = new FrameOrderIn();
         final Object queue = getChannelQueue(handler);
-        final Method decodeOrdered = getDecodeOrderedMethod(queue);
+        final Method decodeSequenced = queue.getClass()
+                .getDeclaredMethod("decodeSequenced", Frame.class, List.class, long.class);
+        decodeSequenced.setAccessible(true);
         final ByteBufAllocator alloc = ByteBufAllocator.DEFAULT;
         final long rttNanos = 50_000_000L; // 50ms RTT
-        final long gapTimeoutNanos = rttNanos * 2; // 100ms
 
-        // Baseline: deliver frame 0
+        // Baseline: deliver frame at order-index 0, sequence-index 0
         final Frame f0 = makeFrame(alloc, 0, 0, FramedPacket.Reliability.UNRELIABLE_SEQUENCED, 0);
         final List<Object> out0 = new ArrayList<>();
-        decodeOrdered.invoke(queue, f0, out0, rttNanos);
-        Assertions.assertEquals(1, out0.size(), "Frame 0 should be delivered");
+        decodeSequenced.invoke(queue, f0, out0, rttNanos);
+        Assertions.assertEquals(1, out0.size(), "Frame 0 should be delivered in-order");
         Assertions.assertEquals(0, getLastOrderIndex(queue));
         ReferenceCountUtil.release(out0.get(0));
         f0.release();
 
-        // Create gap: frame at order-index 3 (gaps at 1,2)
-        final Frame f3 = makeFrame(alloc, 3, 3, FramedPacket.Reliability.UNRELIABLE_SEQUENCED, 0);
-        final List<Object> out3 = new ArrayList<>();
-        decodeOrdered.invoke(queue, f3, out3, rttNanos);
-        Assertions.assertTrue(out3.isEmpty(), "Frame 3 should be queued (gap at 1,2)");
-        f3.release();
+        // Gap: frame at order-index 2, sequence-index 2 (newer) arrives.
+        // Sequenced semantics: skip over gap at index 1, deliver frame 2 directly.
+        final Frame f2 = makeFrame(alloc, 2, 2, FramedPacket.Reliability.UNRELIABLE_SEQUENCED, 0);
+        final List<Object> out2 = new ArrayList<>();
+        decodeSequenced.invoke(queue, f2, out2, rttNanos);
+        Assertions.assertEquals(1, out2.size(), "Frame 2 should be delivered (skipping gap at 1)");
+        Assertions.assertEquals(2, getLastOrderIndex(queue),
+                "lastOrderIndex should advance to 2, skipping index 1");
+        ReferenceCountUtil.release(out2.get(0));
+        f2.release();
 
-        // gapStartNanos should be set for unreliable frames
-        final long gapStart = getGapStartNanos(queue);
-        Assertions.assertTrue(gapStart > 0, "gapStartNanos should be set for UNRELIABLE_SEQUENCED gap");
-
-        // Artificially age the gap to trigger timeout
-        final Field gapField = queue.getClass().getDeclaredField("gapStartNanos");
-        gapField.setAccessible(true);
-        gapField.set(queue, System.nanoTime() - gapTimeoutNanos - 1_000_000L);
-
-        // Next unreliable frame should trigger flushGap
-        final Frame f5 = makeFrame(alloc, 5, 5, FramedPacket.Reliability.UNRELIABLE_SEQUENCED, 0);
-        final List<Object> out5 = new ArrayList<>();
-        decodeOrdered.invoke(queue, f5, out5, rttNanos);
-
-        // After timeout, frame 3 should be delivered (gap skipped), frame 5 queued
-        Assertions.assertFalse(out5.isEmpty(), "Queued frames should flush after gap timeout");
-        // gapStartNanos should be reset after flush
-        Assertions.assertEquals(0L, getGapStartNanos(queue), "gapStartNanos should reset after flush");
-        for (Object o : out5) ReferenceCountUtil.release(o);
-        f5.release();
+        // gapStartNanos must be 0 — UNRELIABLE_SEQUENCED never triggers gap timeout
+        Assertions.assertEquals(0L, getGapStartNanos(queue),
+                "gapStartNanos must be 0 — sequenced frames skip gaps, never queue them");
     }
 
     @Test

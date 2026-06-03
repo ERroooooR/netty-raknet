@@ -81,14 +81,18 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
         if (now - lastCleanupNanos < CLEANUP_INTERVAL_NANOS) return;
         lastCleanupNanos = now;
 
-        final long timeoutNanos = TimeUnit.NANOSECONDS.convert(
+        final long unreliableTimeoutNanos = TimeUnit.NANOSECONDS.convert(
                 Integer.getInteger("raknetify.fragmentTimeoutSecs", 3), TimeUnit.SECONDS);
+        final long reliableTimeoutNanos = TimeUnit.NANOSECONDS.convert(
+                Integer.getInteger("raknetify.reliableFragmentTimeoutSecs", 60), TimeUnit.SECONDS);
 
         final ObjectIterator<Int2ObjectMap.Entry<Builder>> it = pendingPackets.int2ObjectEntrySet().fastIterator();
         while (it.hasNext()) {
             final Int2ObjectMap.Entry<Builder> entry = it.next();
-            if (entry.getValue().isExpired(timeoutNanos)) {
-                entry.getValue().release();
+            final Builder builder = entry.getValue();
+            final long timeoutNanos = builder.reliability.isReliable ? reliableTimeoutNanos : unreliableTimeoutNanos;
+            if (builder.isExpired(timeoutNanos)) {
+                builder.release();
                 it.remove();
             }
         }
