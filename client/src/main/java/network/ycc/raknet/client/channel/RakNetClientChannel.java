@@ -16,6 +16,7 @@ import io.netty.channel.socket.DatagramPacket;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.PromiseCombiner;
+import io.netty.util.concurrent.ScheduledFuture;
 
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
@@ -31,11 +32,13 @@ public class RakNetClientChannel extends DatagramChannelProxy {
     private static final int GATE_ROUTE_HINT_MAX_HOST_LENGTH = 1024;
     private static final int GATE_ROUTE_HINT_RETRIES = 4;
     private static final int GATE_ROUTE_HINT_RETRY_DELAY_MILLIS = 50;
+    private static final int GATE_ROUTE_HINT_REFRESH_MILLIS = 5000;
     private static final byte[] GATE_ROUTE_HINT_MAGIC = "GATE_RAKNET_ROUTE".getBytes(StandardCharsets.US_ASCII);
 
     protected final ChannelPromise connectPromise;
     protected final byte[] gateRouteHintToken = new byte[GATE_ROUTE_HINT_TOKEN_LENGTH];
     protected volatile String gateRouteHint;
+    protected volatile ScheduledFuture<?> gateRouteHintRefreshTask;
 
     public RakNetClientChannel() {
         this(NioDatagramChannel.class);
@@ -83,10 +86,19 @@ public class RakNetClientChannel extends DatagramChannelProxy {
                 RakNetClientChannel.this.close();
             }
         });
+        closeFuture().addListener(res -> cancelGateRouteHintRefresh());
     }
 
     protected ChannelHandler newClientHandler() {
         return new ClientHandler();
+    }
+
+    protected void cancelGateRouteHintRefresh() {
+        final ScheduledFuture<?> task = gateRouteHintRefreshTask;
+        if (task != null) {
+            gateRouteHintRefreshTask = null;
+            task.cancel(false);
+        }
     }
 
     protected class ClientHandler extends ChannelDuplexHandler {
@@ -136,6 +148,7 @@ public class RakNetClientChannel extends DatagramChannelProxy {
             }
 
             final ChannelFuture firstWrite = writeGateRouteHint(hostBytes);
+            scheduleGateRouteHintRefresh(hostBytes);
             for (int i = 1; i < GATE_ROUTE_HINT_RETRIES; i++) {
                 final int delayMillis = GATE_ROUTE_HINT_RETRY_DELAY_MILLIS * i;
                 listener.eventLoop().schedule(() -> {
@@ -146,6 +159,25 @@ public class RakNetClientChannel extends DatagramChannelProxy {
                 }, delayMillis, TimeUnit.MILLISECONDS);
             }
             return firstWrite;
+        }
+
+        private void scheduleGateRouteHintRefresh(byte[] hostBytes) {
+            if (gateRouteHintRefreshTask != null) {
+                return;
+            }
+            gateRouteHintRefreshTask = listener.eventLoop().scheduleAtFixedRate(() -> {
+                if (!listener.isOpen() || !RakNetClientChannel.this.isOpen()) {
+                    cancelGateRouteHintRefresh();
+                    return;
+                }
+                if (connectPromise.isDone() && !connectPromise.isSuccess()) {
+                    cancelGateRouteHintRefresh();
+                    return;
+                }
+                if (connectPromise.isSuccess()) {
+                    writeGateRouteHint(hostBytes).addListener(RakNet.INTERNAL_WRITE_LISTENER);
+                }
+            }, GATE_ROUTE_HINT_REFRESH_MILLIS, GATE_ROUTE_HINT_REFRESH_MILLIS, TimeUnit.MILLISECONDS);
         }
 
         private ChannelFuture writeGateRouteHint(byte[] hostBytes) {

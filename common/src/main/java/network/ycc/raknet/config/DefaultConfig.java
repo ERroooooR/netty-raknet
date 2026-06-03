@@ -28,7 +28,7 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
     private volatile long clientId = rnd.nextLong();
     private volatile RakNet.MetricsLogger metrics = DEFAULT_METRICS;
     private volatile int mtu = DEFAULT_MTU;
-    private volatile long retryDelayNanos = TimeUnit.NANOSECONDS.convert(15, TimeUnit.MILLISECONDS);
+    private volatile long retryDelayNanos = TimeUnit.NANOSECONDS.convert(25, TimeUnit.MILLISECONDS);
     private volatile int maxPendingFrameSets = 1024;
     private volatile int defaultPendingFrameSets = 32;
     private volatile int maxQueuedBytes = 3 * 1024 * 1024;
