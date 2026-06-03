@@ -120,6 +120,11 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) {
+        // Any inbound data (ACK, NACK, or FrameSet) proves the connection is alive.
+        // This covers the case where only ACKs/NACKs are being received while
+        // Pongs and application FrameSets are lost — without this, the peer
+        // could be falsely detected as dead despite continuous bidirectional traffic.
+        ctx.channel().attr(PongHandler.LAST_PONG_NANOS).set(System.nanoTime());
         try {
             if (msg instanceof Reliability.ACK) {
                 readAck((Reliability.ACK) msg);

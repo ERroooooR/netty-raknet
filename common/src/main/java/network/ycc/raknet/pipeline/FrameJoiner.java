@@ -9,6 +9,8 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.CompositeByteBuf;
 import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.CodecException;
+import io.netty.handler.codec.CorruptedFrameException;
 import io.netty.handler.codec.MessageToMessageDecoder;
 import io.netty.handler.codec.TooLongFrameException;
 import io.netty.util.ReferenceCountUtil;
@@ -27,9 +29,13 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
 
     protected final Int2ObjectOpenHashMap<Builder> pendingPackets = new Int2ObjectOpenHashMap<>();
     protected long lastCleanupNanos = 0;
+    protected long totalPendingBytes = 0;
     protected ScheduledFuture<?> cleanupTask = null;
     private static final long CLEANUP_INTERVAL_MILLIS = 500;
     private static final long CLEANUP_INTERVAL_NANOS = TimeUnit.NANOSECONDS.convert(CLEANUP_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
+    private static final int DEFAULT_MAX_PENDING_BUILDERS = 256;
+    private static final long DEFAULT_MAX_PENDING_BYTES = 4L * 1024L * 1024L; // 4 MiB
+    private static final long DEFAULT_RELIABLE_TIMEOUT_SECS = 120L;
 
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) {
@@ -47,6 +53,7 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
         super.handlerRemoved(ctx);
         pendingPackets.values().forEach(Builder::release);
         pendingPackets.clear();
+        totalPendingBytes = 0;
     }
 
     @Override
@@ -65,10 +72,12 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
             } else if (partial == null) {
                 Constants.packetLossCheck(frame.getSplitCount(), "frame join elements");
                 pendingPackets.put(splitID, Builder.create(ctx.alloc(), frame));
+                totalPendingBytes += totalSize;
             } else {
                 partial.add(frame);
                 if (partial.isDone()) {
                     pendingPackets.remove(splitID);
+                    totalPendingBytes -= partial.estimatedBytes;
                     list.add(partial.finish());
                 }
             }
@@ -84,14 +93,47 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
         final long unreliableTimeoutNanos = TimeUnit.NANOSECONDS.convert(
                 Integer.getInteger("raknetify.fragmentTimeoutSecs", 3), TimeUnit.SECONDS);
         final long reliableTimeoutNanos = TimeUnit.NANOSECONDS.convert(
-                Integer.getInteger("raknetify.reliableFragmentTimeoutSecs", 60), TimeUnit.SECONDS);
+                Long.getLong("raknetify.reliableFragmentTimeoutSecs", DEFAULT_RELIABLE_TIMEOUT_SECS), TimeUnit.SECONDS);
+        final int maxPendingBuilders = Integer.getInteger("raknetify.maxPendingBuilders", DEFAULT_MAX_PENDING_BUILDERS);
+        final long maxPendingBytes = Long.getLong("raknetify.maxPendingFragmentBytes", DEFAULT_MAX_PENDING_BYTES);
+
+        // Guard against remote memory exhaustion: close the connection
+        // rather than silently dropping reliable fragments (which would
+        // cause permanent data loss since ACKed fragments aren't retransmitted).
+        if (totalPendingBytes > maxPendingBytes) {
+            final CodecException e = new CodecException(
+                    "Pending fragment bytes exceeded: " + totalPendingBytes + " > " + maxPendingBytes);
+            ctx.close();
+            throw e;
+        }
+        if (pendingPackets.size() > maxPendingBuilders) {
+            final CodecException e = new CodecException(
+                    "Pending fragment builders exceeded: " + pendingPackets.size() + " > " + maxPendingBuilders);
+            ctx.close();
+            throw e;
+        }
 
         final ObjectIterator<Int2ObjectMap.Entry<Builder>> it = pendingPackets.int2ObjectEntrySet().fastIterator();
         while (it.hasNext()) {
             final Int2ObjectMap.Entry<Builder> entry = it.next();
             final Builder builder = entry.getValue();
-            final long timeoutNanos = builder.reliability.isReliable ? reliableTimeoutNanos : unreliableTimeoutNanos;
-            if (builder.isExpired(timeoutNanos)) {
+            if (builder.reliability.isReliable) {
+                // All fragments are forced to reliable (Frame.java:166).
+                // Use a generous timeout as safety net — close the connection
+                // instead of silently releasing to avoid permanent data loss.
+                if (builder.isExpired(reliableTimeoutNanos)) {
+                    totalPendingBytes -= builder.estimatedBytes;
+                    builder.release();
+                    it.remove();
+                    ctx.close();
+                    throw new CorruptedFrameException(
+                            "Reliable fragment reassembly timed out after " +
+                            TimeUnit.NANOSECONDS.toSeconds(reliableTimeoutNanos) + "s");
+                }
+                continue;
+            }
+            if (builder.isExpired(unreliableTimeoutNanos)) {
+                totalPendingBytes -= builder.estimatedBytes;
                 builder.release();
                 it.remove();
             }
@@ -107,6 +149,7 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
         protected int orderId;
         protected FrameData.Reliability reliability;
         protected long createdAt;
+        protected int estimatedBytes;
 
         private Builder(int size) {
             queue = new Int2ObjectOpenHashMap<>(size);
@@ -125,6 +168,7 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
             data = alloc.compositeDirectBuffer(packet.getSplitCount());
             orderId = packet.getOrderChannel();
             reliability = packet.getReliability();
+            estimatedBytes = packet.getSplitCount() * packet.getRoughPacketSize();
             samplePacket = packet.retain();
             add(packet);
         }
