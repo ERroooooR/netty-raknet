@@ -251,11 +251,9 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 
     protected void recallExpiredFrameSets() {
         final ObjectIterator<FrameSet> packetItr = pendingFrameSets.values().iterator();
-        final long retryNanos = Math.max(
-                config.getRTTNanos() + config.getRTTStdDevNanos(),
-                config.getRetryDelayNanos()
-        );
-        final long deadline = System.nanoTime() - retryNanos;
+        //2 sd from mean RTT is about 97% coverage
+        final long deadline = System.nanoTime() -
+                (config.getRTTNanos() + 2 * config.getRTTStdDevNanos() + config.getRetryDelayNanos());
         while (packetItr.hasNext()) {
             final FrameSet frameSet = packetItr.next();
             if (frameSet.getSentTime() < deadline) {

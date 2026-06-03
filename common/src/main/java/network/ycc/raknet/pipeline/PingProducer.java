@@ -11,7 +11,7 @@ import java.util.concurrent.TimeUnit;
 public class PingProducer implements ChannelHandler {
 
     public static final String NAME = "rn-ping-producer";
-    public static final long DEFAULT_INTERVAL_MILLIS = Math.max(50L, Long.getLong("raknetify.pingIntervalMillis", 500L));
+    public static final long DEFAULT_INTERVAL_MILLIS = Math.max(50L, Long.getLong("raknetify.pingIntervalMillis", 200L));
 
     ScheduledFuture<?> pingTask = null;
 
