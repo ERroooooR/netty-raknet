@@ -36,6 +36,7 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
     private static final int DEFAULT_MAX_PENDING_BUILDERS = 256;
     private static final long DEFAULT_MAX_PENDING_BYTES = 4L * 1024L * 1024L; // 4 MiB
     private static final long DEFAULT_RELIABLE_TIMEOUT_SECS = 120L;
+    private static final int MAX_FRAGMENT_COMPONENTS = 16384;
 
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) {
@@ -65,19 +66,40 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
         } else {
             final int splitID = frame.getSplitId();
             final Builder partial = pendingPackets.get(splitID);
-            final int totalSize = frame.getSplitCount() * frame.getRoughPacketSize();
+            final int splitCount = frame.getSplitCount();
+            final long totalSize = (long) splitCount * (long) frame.getRoughPacketSize();
             frame.touch("Is split");
+            if (splitCount <= 0 || frame.getSplitIndex() < 0 || frame.getSplitIndex() >= splitCount) {
+                throw new CorruptedFrameException("Invalid split: count=" + splitCount + " index=" + frame.getSplitIndex());
+            }
+            if (splitCount > MAX_FRAGMENT_COMPONENTS) {
+                throw new TooLongFrameException("Fragmented frame split count exceeds maximum: " + splitCount);
+            }
+            if (totalSize > Integer.MAX_VALUE) {
+                throw new TooLongFrameException("Fragmented frame total size exceeds maximum");
+            }
             if (totalSize > RakNet.config(ctx).getMaxQueuedBytes()) {
                 throw new TooLongFrameException("Fragmented frame too large");
-            } else if (partial == null) {
-                Constants.packetLossCheck(frame.getSplitCount(), "frame join elements");
-                pendingPackets.put(splitID, Builder.create(ctx.alloc(), frame));
-                totalPendingBytes += totalSize;
+            }
+            if (partial == null) {
+                Constants.packetLossCheck(splitCount, "frame join elements");
+                final int maxPendingBuilders = Integer.getInteger("raknetify.maxPendingBuilders", DEFAULT_MAX_PENDING_BUILDERS);
+                if (pendingPackets.size() >= maxPendingBuilders) {
+                    final CodecException e = new CodecException(
+                            "Pending fragment builders exceeded: " + pendingPackets.size());
+                    ctx.close();
+                    throw e;
+                }
+                final Builder builder = Builder.create(ctx.alloc(), frame);
+                pendingPackets.put(splitID, builder);
+                totalPendingBytes += builder.actualBytes;
             } else {
+                final long before = partial.actualBytes;
                 partial.add(frame);
+                totalPendingBytes += partial.actualBytes - before;
                 if (partial.isDone()) {
                     pendingPackets.remove(splitID);
-                    totalPendingBytes -= partial.estimatedBytes;
+                    totalPendingBytes -= partial.actualBytes;
                     list.add(partial.finish());
                 }
             }
@@ -122,7 +144,7 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
                 // Use a generous timeout as safety net — close the connection
                 // instead of silently releasing to avoid permanent data loss.
                 if (builder.isExpired(reliableTimeoutNanos)) {
-                    totalPendingBytes -= builder.estimatedBytes;
+                    totalPendingBytes -= builder.actualBytes;
                     builder.release();
                     it.remove();
                     ctx.close();
@@ -133,7 +155,7 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
                 continue;
             }
             if (builder.isExpired(unreliableTimeoutNanos)) {
-                totalPendingBytes -= builder.estimatedBytes;
+                totalPendingBytes -= builder.actualBytes;
                 builder.release();
                 it.remove();
             }
@@ -149,26 +171,28 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
         protected int orderId;
         protected FrameData.Reliability reliability;
         protected long createdAt;
-        protected int estimatedBytes;
+        protected long estimatedBytes;
+        protected long actualBytes;
 
         private Builder(int size) {
             queue = new Int2ObjectOpenHashMap<>(size);
         }
 
         private static Builder create(ByteBufAllocator alloc, Frame frame) {
-            final Builder out = new Builder(frame.getSplitCount());
-            out.init(alloc, frame);
+            final int cappedSplitCount = Math.min(frame.getSplitCount(), MAX_FRAGMENT_COMPONENTS);
+            final Builder out = new Builder(cappedSplitCount);
+            out.init(alloc, frame, cappedSplitCount);
             out.createdAt = System.nanoTime();
             return out;
         }
 
-        void init(ByteBufAllocator alloc, Frame packet) {
+        void init(ByteBufAllocator alloc, Frame packet, int cappedComponents) {
             assert data == null;
             splitIdx = 0;
-            data = alloc.compositeDirectBuffer(packet.getSplitCount());
+            data = alloc.compositeDirectBuffer(cappedComponents);
             orderId = packet.getOrderChannel();
             reliability = packet.getReliability();
-            estimatedBytes = packet.getSplitCount() * packet.getRoughPacketSize();
+            estimatedBytes = (long) packet.getSplitCount() * (long) packet.getRoughPacketSize();
             samplePacket = packet.retain();
             add(packet);
         }
@@ -182,7 +206,9 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
             assert packet.getOrderChannel() == samplePacket.getOrderChannel();
             assert packet.getOrderIndex() == samplePacket.getOrderIndex();
             if (!queue.containsKey(packet.getSplitIndex()) && packet.getSplitIndex() >= splitIdx) {
-                queue.put(packet.getSplitIndex(), packet.retainedFragmentData());
+                final ByteBuf fragmentData = packet.retainedFragmentData();
+                queue.put(packet.getSplitIndex(), fragmentData);
+                actualBytes += fragmentData.readableBytes();
                 createdAt = System.nanoTime(); // refresh activity time
                 update();
             }

@@ -7,6 +7,7 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufAllocator;
 import io.netty.buffer.CompositeByteBuf;
 import io.netty.channel.ChannelPromise;
+import io.netty.handler.codec.CorruptedFrameException;
 import io.netty.util.AbstractReferenceCounted;
 import io.netty.util.Recycler;
 import io.netty.util.ReferenceCounted;
@@ -74,6 +75,9 @@ public final class Frame extends AbstractReferenceCounted {
                 out.splitCount = buf.readInt();
                 out.splitID = buf.readUnsignedShort();
                 out.splitIndex = buf.readInt();
+                if (out.splitCount <= 0 || out.splitIndex < 0 || out.splitIndex >= out.splitCount) {
+                    throw new CorruptedFrameException("Invalid split: count=" + out.splitCount + " index=" + out.splitIndex);
+                }
                 out.hasSplit = true;
             }
 
