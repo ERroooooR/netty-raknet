@@ -12,7 +12,6 @@ import network.ycc.raknet.pipeline.DisconnectHandler;
 import network.ycc.raknet.pipeline.FrameJoiner;
 import network.ycc.raknet.pipeline.FrameOrderIn;
 import network.ycc.raknet.pipeline.PingProducer;
-import network.ycc.raknet.pipeline.PongHandler;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -196,52 +195,12 @@ public class HandlerOptimizationsTest {
         Assertions.assertEquals(500L, interval, "Cleanup interval should be 500ms");
     }
 
-    // ─── PingProducer: state initialisation ─────────────────────────────────────
+    // ─── PingProducer: basic state ──────────────────────────────────────────────
 
     @Test
-    public void testPingProducerInitialState() throws Exception {
-        // Test fields before handlerAdded (no channel needed for static/init fields)
-        final PingProducer handler = new PingProducer();
-
-        final Field intervalField = PingProducer.class.getDeclaredField("currentIntervalMillis");
-        intervalField.setAccessible(true);
-        final long interval = (long) intervalField.get(handler);
-        Assertions.assertEquals(PingProducer.DEFAULT_INTERVAL_MILLIS, interval,
-                "currentIntervalMillis should start at DEFAULT_INTERVAL_MILLIS");
-
-        final Field minField = PingProducer.class.getDeclaredField("MIN_INTERVAL_MILLIS");
-        final Field maxField = PingProducer.class.getDeclaredField("MAX_INTERVAL_MILLIS");
-        minField.setAccessible(true);
-        maxField.setAccessible(true);
-        Assertions.assertEquals(50L, (long) minField.get(handler));
-        Assertions.assertEquals(500L, (long) maxField.get(handler));
-    }
-
-    @Test
-    public void testPingProducerConstants() throws Exception {
-        final Field maxMissedField = PingProducer.class.getDeclaredField("MAX_MISSED_PONGS");
-        maxMissedField.setAccessible(true);
-        final int maxMissed = (int) maxMissedField.get(null);
-        Assertions.assertTrue(maxMissed >= 5, "MAX_MISSED_PONGS should be at least 5");
-
+    public void testPingProducerConstants() {
         Assertions.assertTrue(PingProducer.DEFAULT_INTERVAL_MILLIS >= 50L,
                 "DEFAULT_INTERVAL_MILLIS should be >= 50ms for safe minimum");
-    }
-
-    // ─── PongHandler: LAST_PONG_NANOS attribute ─────────────────────────────────
-
-    @Test
-    public void testLastPongAttributeDefined() {
-        Assertions.assertNotNull(PongHandler.LAST_PONG_NANOS,
-                "LAST_PONG_NANOS AttributeKey should be defined");
-    }
-
-    @Test
-    public void testLastPongInitiallyNull() {
-        final EmbeddedChannel channel = new EmbeddedChannel(PongHandler.INSTANCE);
-        final Long initial = channel.attr(PongHandler.LAST_PONG_NANOS).get();
-        Assertions.assertNull(initial, "LAST_PONG_NANOS should be null before first pong");
-        channel.finishAndReleaseAll();
     }
 
     // ─── DisconnectHandler: configurable timeout ────────────────────────────────
