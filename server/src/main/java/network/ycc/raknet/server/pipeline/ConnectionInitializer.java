@@ -84,12 +84,12 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
                     ctx.writeAndFlush(packet).addListener(RakNet.INTERNAL_WRITE_LISTENER);
                     state = State.CR3;
                     resetRetryCount();
-                    startPing(ctx);
                 }
                 break;
             }
             case CR3: {
                 if (msg instanceof ClientHandshake) {
+                    startPing(ctx);
                     finish(ctx);
                     return;
                 }
