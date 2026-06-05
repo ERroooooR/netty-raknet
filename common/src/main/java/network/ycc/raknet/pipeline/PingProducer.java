@@ -20,7 +20,7 @@ public class PingProducer implements ChannelHandler {
             if (ctx.channel().isOpen()) {
                 ctx.writeAndFlush(new Ping());
             }
-        }, 0, DEFAULT_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
+        }, DEFAULT_INTERVAL_MILLIS, DEFAULT_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
     }
 
     public void handlerRemoved(ChannelHandlerContext ctx) {
