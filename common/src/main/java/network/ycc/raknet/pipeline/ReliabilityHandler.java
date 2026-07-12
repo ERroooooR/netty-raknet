@@ -41,6 +41,10 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected int burstTokens = 0;
     protected RakNet.Config config = null; //TODO: not really needed anymore
     protected ChannelHandlerContext ctx;
+    protected AdaptiveTransportController adaptive;
+    protected boolean pacingScheduled;
+    protected boolean coalesceScheduled;
+    private static final long SMALL_WRITE_COALESCE_NANOS = 250_000L;
 
     // Item 3: track when first ACK was queued for time-based flush
     protected long firstAckNanos = 0;
@@ -57,6 +61,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     public void handlerAdded(ChannelHandlerContext ctx) {
         config = RakNet.config(ctx);
         this.ctx = ctx;
+        this.adaptive = new AdaptiveTransportController(config);
         ctx.channel().attr(RakNet.WRITABLE).set(true);
         if (config.isIgnoreResendGauge()) this.resendGauge = 2;
     }
@@ -78,8 +83,14 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             frame.setPromise(promise);
             Constants.packetLossCheck(pendingFrameSets.size(), "unconfirmed sent packets");
             FlushTickHandler.checkFlushTick(ctx.channel());
-            if (wasIdle) {
+            if (wasIdle && frame.getRoughPacketSize() >= config.getMTU() / 2) {
                 flush(ctx);
+            } else if (wasIdle && !coalesceScheduled) {
+                coalesceScheduled = true;
+                ctx.executor().schedule(() -> {
+                    coalesceScheduled = false;
+                    if (ctx.channel().isOpen()) flush(ctx);
+                }, SMALL_WRITE_COALESCE_NANOS, TimeUnit.NANOSECONDS);
             }
         } else {
             ctx.write(msg, promise);
@@ -190,6 +201,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 final FrameSet frameSet = pendingFrameSets.remove(id);
                 if (frameSet != null) {
                     ackdBytes += frameSet.getRoughSize();
+                    adaptive.onAck(frameSet.getRoughSize());
                     adjustResendGauge(1);
                     frameSet.succeed();
                     frameSet.release();
@@ -212,6 +224,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 final FrameSet frameSet = pendingFrameSets.remove(id);
                 if (frameSet != null) {
                     bytesNACKd += frameSet.getRoughSize();
+                    adaptive.onLoss(frameSet.getRoughSize(), false);
                     recallFrameSet(frameSet);
                 }
                 Constants.packetLossCheck(nIterations++, "nack confirm range");
@@ -299,6 +312,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             final long timeout = saturatedMultiply(baseTimeout, multiplier);
             if (now - frameSet.getSentTime() > timeout) {
                 packetItr.remove();
+                adaptive.onLoss(frameSet.getRoughSize(), true);
                 recallFrameSet(frameSet);
                 continue;
             }
@@ -354,11 +368,21 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     }
 
     protected void produceFrameSets(ChannelHandlerContext ctx) {
+        if (frameQueue.isEmpty() && pendingFrameSets.isEmpty()) adaptive.applyPendingMtu();
         final int mtu = config.getMTU();
         final int maxSize = mtu - FrameSet.HEADER_SIZE - Frame.HEADER_SIZE;
         final int maxPendingFrameSets = config.getDefaultPendingFrameSets() + burstTokens;
-        while (pendingFrameSets.size() < maxPendingFrameSets && !frameQueue.isEmpty()) {
+        int pacingBudget = adaptive.sendBudget(System.nanoTime());
+        while (pacingBudget-- > 0 && pendingFrameSets.size() < maxPendingFrameSets && !frameQueue.isEmpty()) {
             produceFrameSet(ctx, maxSize);
+        }
+        adaptive.applyDscp(ctx.channel().parent());
+        if (!frameQueue.isEmpty() && !pacingScheduled) {
+            pacingScheduled = true;
+            ctx.executor().schedule(() -> {
+                pacingScheduled = false;
+                if (ctx.channel().isOpen()) flush(ctx);
+            }, adaptive.nanosUntilSend(System.nanoTime()), TimeUnit.NANOSECONDS);
         }
     }
 

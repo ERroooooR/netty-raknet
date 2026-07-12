@@ -17,7 +17,8 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
             (byte) 0xfe, (byte) 0xfe, (byte) 0xfd, (byte) 0xfd, (byte) 0xfd, (byte) 0xfd,
             (byte) 0x12, (byte) 0x34, (byte) 0x56, (byte) 0x78});
 
-    public static final int DEFAULT_MTU = 1500;
+    // RakNet v11 implementations use 1400 to avoid fragmentation on common tunnels.
+    public static final int DEFAULT_MTU = 1400;
 
     private static final RakNet.MetricsLogger DEFAULT_METRICS = new RakNet.MetricsLogger() {};
     private static final Random rnd = new Random();
@@ -37,9 +38,9 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
     private volatile int maxQueuedBytes = 3 * 1024 * 1024;
     private volatile RakNet.Magic magic = DEFAULT_MAGIC;
     private volatile RakNet.Codec codec = DefaultCodec.INSTANCE;
-    private volatile int[] protocolVersions = new int[]{9, 10};
+    private volatile int[] protocolVersions = new int[]{9, 10, 11, 12};
     private volatile int maxConnections = 2048;
-    private volatile int protocolVersion = 9;
+    private volatile int protocolVersion = 11;
     private volatile boolean ignoreResendGauge = false;
     private volatile boolean NACKEnabled = false;
     private volatile boolean noDelay = false;
