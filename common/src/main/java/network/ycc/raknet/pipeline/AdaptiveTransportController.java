@@ -39,6 +39,8 @@ final class AdaptiveTransportController {
     private long minRtt = Long.MAX_VALUE;
     private long smoothedRtt;
     private long lastDscpVote;
+    private final long createdAt = System.nanoTime();
+    private boolean emergencySendUsed;
 
     AdaptiveTransportController(RakNet.Config config) {
         this.config = config;
@@ -48,9 +50,14 @@ final class AdaptiveTransportController {
 
     int sendBudget(long nowNanos) {
         if (!config.isAdaptiveTransportEnabled()) return Integer.MAX_VALUE;
-        // Never let pacing suppress all forward progress: explicit flushes and
-        // retransmissions must be able to emit one datagram immediately.
-        if (nowNanos < nextSendNanos) return 1;
+        // Permit one immediate progress datagram per pacing interval, but do not
+        // allow repeated writeAndFlush calls to bypass the limiter.
+        if (nowNanos < nextSendNanos) {
+            if (emergencySendUsed) return 0;
+            emergencySendUsed = true;
+            return 1;
+        }
+        emergencySendUsed = false;
         final int budget = lossType == LossType.BURST || lossType == LossType.QUEUE ? 1 : 4;
         nextSendNanos = nowNanos + Math.max(200_000L, (long) (1_000_000_000D / packetsPerSecond));
         return budget;
@@ -173,7 +180,9 @@ final class AdaptiveTransportController {
         long packets = 0;
         for (long value : acked) packets += value;
         if (packets > 0) {
-            final double target = Math.max(50D, Math.min(2000D, packets / 10D * 1.25D));
+            final double seconds = Math.max(1D, Math.min(10D,
+                    (System.nanoTime() - createdAt) / 1_000_000_000D));
+            final double target = Math.max(50D, Math.min(2000D, packets / seconds * 1.25D));
             packetsPerSecond = packetsPerSecond * 0.8D + target * 0.2D;
         }
         publishMetrics();
