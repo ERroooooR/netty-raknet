@@ -12,10 +12,16 @@ public class PongHandler extends SimpleChannelInboundHandler<Pong> {
 
     public static final String NAME = "rn-pong";
     public static final PongHandler INSTANCE = new PongHandler();
+    private static final long MAX_RTT_NANOS = 60_000_000_000L;
 
     protected void channelRead0(ChannelHandlerContext ctx, Pong pong) {
         if (!pong.getReliability().isReliable) {
-            RakNet.config(ctx).updateRTTNanos(pong.getRTT());
+            final long rtt = pong.getRTT();
+            // Pong timestamps are supplied by the peer. Ignore forged, stale or
+            // wrapped values instead of poisoning retransmission timers.
+            if (rtt > 0 && rtt <= MAX_RTT_NANOS) {
+                RakNet.config(ctx).updateRTTNanos(rtt);
+            }
         }
     }
 

@@ -287,14 +287,16 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected void recallExpiredFrameSets() {
         final ObjectIterator<FrameSet> packetItr = pendingFrameSets.values().iterator();
         //2 sd from mean RTT is about 97% coverage
-        final long baseTimeout = config.getRTTNanos() + 2 * config.getRTTStdDevNanos() + config.getRetryDelayNanos();
+        final long baseTimeout = saturatedAdd(
+                saturatedAdd(Math.max(1, config.getRTTNanos()), saturatedMultiply(Math.max(0, config.getRTTStdDevNanos()), 2)),
+                Math.max(0, config.getRetryDelayNanos()));
         final long now = System.nanoTime();
         while (packetItr.hasNext()) {
             final FrameSet frameSet = packetItr.next();
             // exponential backoff: 1x, 2x, 4x, 8x (max)
             final long multiplier = 1L << Math.min(frameSet.getRetryCount(), 3);
-            final long deadline = now - baseTimeout * multiplier;
-            if (frameSet.getSentTime() < deadline) {
+            final long timeout = saturatedMultiply(baseTimeout, multiplier);
+            if (now - frameSet.getSentTime() > timeout) {
                 packetItr.remove();
                 recallFrameSet(frameSet);
                 continue;
@@ -304,6 +306,14 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             // retryCount could be before a newer FrameSet with low retryCount.
             // Continue scanning rather than breaking to handle this correctly.
         }
+    }
+
+    private static long saturatedAdd(long a, long b) {
+        return a > Long.MAX_VALUE - b ? Long.MAX_VALUE : a + b;
+    }
+
+    private static long saturatedMultiply(long value, long multiplier) {
+        return value > Long.MAX_VALUE / multiplier ? Long.MAX_VALUE : value * multiplier;
     }
 
     protected void produceFrameSet(ChannelHandlerContext ctx, int maxSize) {
