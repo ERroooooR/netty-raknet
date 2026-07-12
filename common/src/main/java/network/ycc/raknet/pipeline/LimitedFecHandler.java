@@ -69,6 +69,8 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
                     groups.remove();
                 }
                 tryRecover(ctx);
+            } catch (Exception ignored) {
+                // Malformed FEC packet from wire; drop silently.
             } finally {
                 ReferenceCountUtil.release(msg);
             }
@@ -154,7 +156,8 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
                     missing = entry;
                     missingCount++;
                 } else {
-                    for (int i = 0; i < value.length; i++) data[i] ^= value[i];
+                    final int len = Math.min(value.length, data.length);
+                    for (int i = 0; i < len; i++) data[i] ^= value[i];
                 }
             }
             if (missingCount == 0) {

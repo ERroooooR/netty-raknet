@@ -142,13 +142,16 @@ final class AdaptiveTransportController {
             lastDscpVote = now;
         }
         final long previous = LAST_DSCP_CHANGE.get();
-        if (now - previous < DSCP_COOLDOWN || !LAST_DSCP_CHANGE.compareAndSet(previous, now)) return;
+        if (now - previous < DSCP_COOLDOWN) return;
         final long healthy = HEALTHY_VOTES.sumThenReset();
         final long congested = CONGESTED_VOTES.sumThenReset();
         if (healthy + congested < 16) return;
         // Require a 2:1 majority to avoid players fighting over the shared socket.
         final int tos = congested > healthy * 2 ? 0x00 : healthy > congested * 2 ? 0x88 : CURRENT_TOS.get();
-        if (tos >= 0 && CURRENT_TOS.getAndSet(tos) != tos) channel.config().setOption(ChannelOption.IP_TOS, tos);
+        if (tos >= 0 && CURRENT_TOS.getAndSet(tos) != tos
+                && LAST_DSCP_CHANGE.compareAndSet(previous, now)) {
+            channel.config().setOption(ChannelOption.IP_TOS, tos);
+        }
     }
 
     private double lossRatio() {
