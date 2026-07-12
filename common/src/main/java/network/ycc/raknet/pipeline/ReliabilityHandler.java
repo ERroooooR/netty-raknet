@@ -43,6 +43,8 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected ChannelHandlerContext ctx;
     protected AdaptiveTransportController adaptive;
     protected boolean pacingScheduled;
+    protected boolean coalesceScheduled;
+    private static final long SMALL_WRITE_COALESCE_NANOS = 250_000L;
 
     // Item 3: track when first ACK was queued for time-based flush
     protected long firstAckNanos = 0;
@@ -83,6 +85,12 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             FlushTickHandler.checkFlushTick(ctx.channel());
             if (wasIdle && frame.getRoughPacketSize() >= config.getMTU() / 2) {
                 flush(ctx);
+            } else if (wasIdle && !coalesceScheduled) {
+                coalesceScheduled = true;
+                ctx.executor().schedule(() -> {
+                    coalesceScheduled = false;
+                    if (ctx.channel().isOpen() && !frameQueue.isEmpty()) flush(ctx);
+                }, SMALL_WRITE_COALESCE_NANOS, TimeUnit.NANOSECONDS);
             }
         } else {
             ctx.write(msg, promise);
@@ -360,7 +368,10 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     }
 
     protected void produceFrameSets(ChannelHandlerContext ctx) {
-        if (frameQueue.isEmpty() && pendingFrameSets.isEmpty()) adaptive.applyPendingMtu();
+        if (frameQueue.isEmpty()) {
+            if (pendingFrameSets.isEmpty()) adaptive.applyPendingMtu();
+            return;
+        }
         final int mtu = config.getMTU();
         final int maxSize = mtu - FrameSet.HEADER_SIZE - Frame.HEADER_SIZE;
         final int maxPendingFrameSets = config.getDefaultPendingFrameSets() + burstTokens;
