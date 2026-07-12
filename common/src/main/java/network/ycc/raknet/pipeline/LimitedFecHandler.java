@@ -54,11 +54,21 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
 
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) {
-        if (!enabled(ctx) || !(msg instanceof ByteBuf)) {
+        if (!(msg instanceof ByteBuf)) {
             ctx.fireChannelRead(msg);
             return;
         }
         final ByteBuf buf = (ByteBuf) msg;
+        if (!enabled(ctx)) {
+            // Drop FEC datagrams when the feature is not negotiated,
+            // otherwise RawPacketCodec throws on unknown packet ID 0x1e.
+            if (buf.isReadable() && buf.getUnsignedByte(buf.readerIndex()) == FEC_PACKET_ID) {
+                ReferenceCountUtil.release(msg);
+                return;
+            }
+            ctx.fireChannelRead(msg);
+            return;
+        }
         if (buf.isReadable() && buf.getUnsignedByte(buf.readerIndex()) == FEC_PACKET_ID) {
             try {
                 final Parity parity = readParity(buf);
@@ -94,7 +104,8 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
 
     private boolean enabled(ChannelHandlerContext ctx) {
         final Long features = ctx.channel().attr(RakNet.TRANSPORT_FEATURES).get();
-        return RakNet.config(ctx).getProtocolVersion() >= ADAPTIVE_PROTOCOL_VERSION
+        return RakNet.config(ctx).isAdaptiveTransportEnabled()
+                && RakNet.config(ctx).getProtocolVersion() >= ADAPTIVE_PROTOCOL_VERSION
                 && features != null && (features & TransportFeatures.FEC) != 0;
     }
 
