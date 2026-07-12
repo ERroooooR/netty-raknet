@@ -40,26 +40,25 @@ public final class PathMtuDiscoveryHandler extends ChannelDuplexHandler {
             return;
         }
         final ByteBuf in = (ByteBuf) msg;
-        if (in.readableBytes() >= 11 && enabled(ctx)) {
+        if (in.readableBytes() >= 11) {
             final int id = in.getUnsignedByte(in.readerIndex());
-            if (id == PROBE_ID) {
-                final long token = in.getLong(in.readerIndex() + 1);
-                final int mtu = in.getUnsignedShort(in.readerIndex() + 9);
-                ReferenceCountUtil.release(msg);
-                ctx.writeAndFlush(ctx.alloc().ioBuffer(11).writeByte(ACK_ID).writeLong(token).writeShort(mtu));
-                return;
-            }
-            if (id == ACK_ID) {
-                final long token = in.getLong(in.readerIndex() + 1);
-                final int mtu = in.getUnsignedShort(in.readerIndex() + 9);
-                ReferenceCountUtil.release(msg);
-                if (token == pendingToken && mtu == pendingMtu) {
-                    final ReliabilityHandler reliability = ctx.pipeline().get(ReliabilityHandler.class);
-                    if (reliability != null) reliability.adaptiveController().onProbeAck(mtu);
-                    RakNet.config(ctx).getMetrics().pathMtuProbe(true, mtu);
-                    pendingToken = 0;
-                    pendingMtu = 0;
+            if (id == PROBE_ID || id == ACK_ID) {
+                if (id == PROBE_ID && enabled(ctx)) {
+                    final long token = in.getLong(in.readerIndex() + 1);
+                    final int mtu = in.getUnsignedShort(in.readerIndex() + 9);
+                    ctx.writeAndFlush(ctx.alloc().ioBuffer(11).writeByte(ACK_ID).writeLong(token).writeShort(mtu));
+                } else if (id == ACK_ID && enabled(ctx)) {
+                    final long token = in.getLong(in.readerIndex() + 1);
+                    final int mtu = in.getUnsignedShort(in.readerIndex() + 9);
+                    if (token == pendingToken && mtu == pendingMtu) {
+                        final ReliabilityHandler reliability = ctx.pipeline().get(ReliabilityHandler.class);
+                        if (reliability != null) reliability.adaptiveController().onProbeAck(mtu);
+                        RakNet.config(ctx).getMetrics().pathMtuProbe(true, mtu);
+                        pendingToken = 0;
+                        pendingMtu = 0;
+                    }
                 }
+                ReferenceCountUtil.release(msg);
                 return;
             }
         }
