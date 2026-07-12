@@ -9,6 +9,7 @@ import network.ycc.raknet.utils.UINT;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.MessageToMessageDecoder;
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.concurrent.ScheduledFuture;
 
 import java.util.Arrays;
 import java.util.List;
@@ -40,7 +41,7 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
             channels[frame.getOrderChannel()].decodeSequenced(frame, list, RakNet.config(ctx).getRTTNanos());
         } else if (frame.getReliability().isOrdered) {
             frame.touch("Ordered");
-            channels[frame.getOrderChannel()].decodeOrdered(frame, list, RakNet.config(ctx).getRTTNanos());
+            channels[frame.getOrderChannel()].decodeOrdered(ctx, frame, list, RakNet.config(ctx).getRTTNanos());
         } else {
             frame.touch("No order");
             list.add(frame.retainedFrameData());
@@ -57,6 +58,8 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
         // If the missing packet doesn't arrive within gapTimeoutNanos, flush queued
         // packets to unblock head-of-line. Default: 2x RTT (one retransmission cycle).
         protected long gapStartNanos = 0;
+        protected ScheduledFuture<?> gapTask;
+        protected boolean gapIsSkippable;
         private static final long GAP_TIMEOUT_MULTIPLIER = Long.getLong("raknetify.orderedGapTimeoutMultiplier", 2);
 
         protected void decodeSequenced(Frame frame, List<Object> list, long rttNanos) {
@@ -72,10 +75,14 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
         }
 
         protected void decodeOrdered(Frame frame, List<Object> list, long rttNanos) {
+            decodeOrdered(null, frame, list, rttNanos);
+        }
+
+        protected void decodeOrdered(ChannelHandlerContext ctx, Frame frame, List<Object> list, long rttNanos) {
             final int indexDiff = UINT.B3.minusWrap(frame.getOrderIndex(), lastOrderIndex);
             Constants.packetLossCheck(indexDiff, "ordered difference");
             if (indexDiff == 1) { //got next packet in line
-                gapStartNanos = 0; // gap resolved
+                cancelGapTask();
                 FramedPacket data = frame.retainedFrameData();
                 do { //process this packet, and any queued packets following in sequence
                     list.add(data);
@@ -89,6 +96,15 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
                 final boolean isUnreliable = !frame.getReliability().isReliable;
                 if (isUnreliable && gapStartNanos == 0) {
                     gapStartNanos = System.nanoTime();
+                    gapIsSkippable = true;
+                    if (ctx != null) {
+                        final long delay = Math.max(1_000_000L, saturatedMultiply(
+                                Math.max(1L, rttNanos), Math.max(1L, GAP_TIMEOUT_MULTIPLIER)));
+                        gapTask = ctx.executor().schedule(() -> flushGap(ctx), delay, java.util.concurrent.TimeUnit.NANOSECONDS);
+                    }
+                } else if (!isUnreliable) {
+                    // Never let a timer skip a gap once reliable ordered data is waiting.
+                    cancelGapTask();
                 }
                 queue.put(frame.getOrderIndex(), frame.retainedFrameData());
                 if (isUnreliable && gapStartNanos > 0) {
@@ -99,6 +115,27 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
                 }
             }
             Constants.packetLossCheck(queue.size(), "missed ordered packets");
+        }
+
+        private void flushGap(ChannelHandlerContext ctx) {
+            if (!gapIsSkippable || queue.isEmpty() || !ctx.channel().isOpen()) return;
+            final java.util.ArrayList<Object> out = new java.util.ArrayList<>();
+            flushGap(out);
+            for (Object msg : out) ctx.fireChannelRead(msg);
+            if (!out.isEmpty()) ctx.fireChannelReadComplete();
+        }
+
+        private static long saturatedMultiply(long value, long multiplier) {
+            return value > Long.MAX_VALUE / multiplier ? Long.MAX_VALUE : value * multiplier;
+        }
+
+        private void cancelGapTask() {
+            gapStartNanos = 0;
+            gapIsSkippable = false;
+            if (gapTask != null) {
+                gapTask.cancel(false);
+                gapTask = null;
+            }
         }
 
         // Item 2: skip over the missing packet(s) and deliver all queued data
@@ -126,9 +163,12 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
                 if (queue.isEmpty()) break;
             }
             gapStartNanos = 0;
+            gapIsSkippable = false;
+            gapTask = null;
         }
 
         protected void clear() {
+            cancelGapTask();
             queue.values().forEach(ReferenceCountUtil::release);
             queue.clear();
         }

@@ -11,6 +11,7 @@ import network.ycc.raknet.pipeline.FrameSplitter;
 import network.ycc.raknet.pipeline.FramedPacketCodec;
 import network.ycc.raknet.pipeline.PingHandler;
 import network.ycc.raknet.pipeline.PongHandler;
+import network.ycc.raknet.pipeline.PingTracker;
 import network.ycc.raknet.pipeline.ReliabilityHandler;
 
 import io.netty.buffer.ByteBuf;
@@ -29,6 +30,8 @@ import java.nio.channels.ClosedChannelException;
 public class RakNet {
 
     public static final AttributeKey<Boolean> WRITABLE = AttributeKey.valueOf("RN_WRITABLE");
+    public static final AttributeKey<PingTracker> PING_TRACKER = AttributeKey.valueOf("RN_PING_TRACKER");
+    public static final AttributeKey<Long> LAST_INBOUND_NANOS = AttributeKey.valueOf("RN_LAST_INBOUND_NANOS");
 
     public static final ChannelOption<Long> SERVER_ID = ChannelOption.valueOf("RN_SERVER_ID");
     public static final ChannelOption<Long> CLIENT_ID = ChannelOption.valueOf("RN_CLIENT_ID");

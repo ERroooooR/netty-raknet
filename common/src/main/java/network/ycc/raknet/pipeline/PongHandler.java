@@ -19,8 +19,11 @@ public class PongHandler extends SimpleChannelInboundHandler<Pong> {
             final long rtt = pong.getRTT();
             // Pong timestamps are supplied by the peer. Ignore forged, stale or
             // wrapped values instead of poisoning retransmission timers.
-            if (rtt > 0 && rtt <= MAX_RTT_NANOS) {
+            final PingTracker tracker = ctx.channel().attr(RakNet.PING_TRACKER).get();
+            if (tracker != null && tracker.acknowledge(pong.getPingTimestamp())
+                    && rtt > 0 && rtt <= MAX_RTT_NANOS) {
                 RakNet.config(ctx).updateRTTNanos(rtt);
+                ctx.channel().attr(RakNet.LAST_INBOUND_NANOS).set(System.nanoTime());
             }
         }
     }

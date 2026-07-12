@@ -36,6 +36,8 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
     private static final int DEFAULT_MAX_PENDING_BUILDERS = 256;
     private static final long DEFAULT_MAX_PENDING_BYTES = 4L * 1024L * 1024L; // 4 MiB
     private static final long DEFAULT_RELIABLE_TIMEOUT_SECS = 300L;
+    private static final long DEFAULT_ABSOLUTE_TIMEOUT_SECS = 600L;
+    private static final int DEFAULT_MAX_DUPLICATE_FRAGMENTS = 64;
     private static final int MAX_FRAGMENT_COMPONENTS = 16384;
 
     @Override
@@ -86,7 +88,6 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
                 final int maxPendingBuilders = positiveIntProperty("raknetify.maxPendingBuilders", DEFAULT_MAX_PENDING_BUILDERS);
                 if (pendingPackets.size() >= maxPendingBuilders) {
                     final String msg = "Pending fragment builders exceeded: " + pendingPackets.size() + " >= " + maxPendingBuilders;
-                    System.err.println("Raknetify: " + msg + " — closing connection");
                     final CodecException e = new CodecException(msg);
                     ctx.close();
                     throw e;
@@ -118,6 +119,8 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
                 positiveIntProperty("raknetify.fragmentTimeoutSecs", 3), TimeUnit.SECONDS);
         final long reliableTimeoutNanos = TimeUnit.NANOSECONDS.convert(
                 positiveLongProperty("raknetify.reliableFragmentTimeoutSecs", DEFAULT_RELIABLE_TIMEOUT_SECS), TimeUnit.SECONDS);
+        final long absoluteTimeoutNanos = TimeUnit.NANOSECONDS.convert(
+                positiveLongProperty("raknetify.absoluteFragmentTimeoutSecs", DEFAULT_ABSOLUTE_TIMEOUT_SECS), TimeUnit.SECONDS);
         final int maxPendingBuilders = positiveIntProperty("raknetify.maxPendingBuilders", DEFAULT_MAX_PENDING_BUILDERS);
         final long maxPendingBytes = positiveLongProperty("raknetify.maxPendingFragmentBytes", DEFAULT_MAX_PENDING_BYTES);
 
@@ -126,14 +129,12 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
         // cause permanent data loss since ACKed fragments aren't retransmitted).
         if (totalPendingBytes > maxPendingBytes) {
             final String msg = "Pending fragment bytes exceeded: " + totalPendingBytes + " > " + maxPendingBytes;
-            System.err.println("Raknetify: " + msg + " — closing connection");
             final CodecException e = new CodecException(msg);
             ctx.close();
             throw e;
         }
         if (pendingPackets.size() > maxPendingBuilders) {
             final String msg = "Pending fragment builders exceeded: " + pendingPackets.size() + " > " + maxPendingBuilders;
-            System.err.println("Raknetify: " + msg + " — closing connection");
             final CodecException e = new CodecException(msg);
             ctx.close();
             throw e;
@@ -143,6 +144,13 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
         while (it.hasNext()) {
             final Int2ObjectMap.Entry<Builder> entry = it.next();
             final Builder builder = entry.getValue();
+            if (builder.isAbsolutelyExpired(absoluteTimeoutNanos)) {
+                totalPendingBytes -= builder.actualBytes;
+                builder.release();
+                it.remove();
+                ctx.close();
+                throw new CorruptedFrameException("Fragment reassembly exceeded absolute lifetime");
+            }
             if (builder.reliability.isReliable) {
                 // All fragments are forced to reliable (Frame.java:166).
                 if (builder.isExpired(reliableTimeoutNanos)) {
@@ -183,6 +191,8 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
         protected int orderId;
         protected FrameData.Reliability reliability;
         protected long createdAt;
+        protected long firstCreatedAt;
+        protected int duplicateFragments;
         protected long estimatedBytes;
         protected long actualBytes;
 
@@ -195,6 +205,7 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
             final Builder out = new Builder(cappedSplitCount);
             out.init(alloc, frame, cappedSplitCount);
             out.createdAt = System.nanoTime();
+            out.firstCreatedAt = out.createdAt;
             return out;
         }
 
@@ -213,6 +224,10 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
             return System.nanoTime() - createdAt > timeoutNanos;
         }
 
+        boolean isAbsolutelyExpired(long timeoutNanos) {
+            return System.nanoTime() - firstCreatedAt > timeoutNanos;
+        }
+
         void add(Frame packet) {
             assert packet.getReliability().equals(samplePacket.getReliability());
             assert packet.getOrderChannel() == samplePacket.getOrderChannel();
@@ -223,6 +238,9 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
                 actualBytes += fragmentData.readableBytes();
                 createdAt = System.nanoTime(); // refresh activity time
                 update();
+            } else if (++duplicateFragments > positiveIntProperty(
+                    "raknetify.maxDuplicateFragments", DEFAULT_MAX_DUPLICATE_FRAGMENTS)) {
+                throw new CorruptedFrameException("Too many duplicate fragments for split ID " + packet.getSplitId());
             }
             Constants.packetLossCheck(queue.size(), "packet defragment queue");
         }

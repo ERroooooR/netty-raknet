@@ -121,6 +121,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     @Override
     public void channelRead(ChannelHandlerContext ctx, Object msg) {
         try {
+            ctx.channel().attr(RakNet.LAST_INBOUND_NANOS).set(System.nanoTime());
             if (msg instanceof Reliability.ACK) {
                 readAck((Reliability.ACK) msg);
             } else if (msg instanceof Reliability.NACK) {
