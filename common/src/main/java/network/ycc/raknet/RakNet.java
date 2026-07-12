@@ -32,6 +32,7 @@ public class RakNet {
     public static final AttributeKey<Boolean> WRITABLE = AttributeKey.valueOf("RN_WRITABLE");
     public static final AttributeKey<PingTracker> PING_TRACKER = AttributeKey.valueOf("RN_PING_TRACKER");
     public static final AttributeKey<Long> LAST_INBOUND_NANOS = AttributeKey.valueOf("RN_LAST_INBOUND_NANOS");
+    public static final AttributeKey<Long> TRANSPORT_FEATURES = AttributeKey.valueOf("RN_TRANSPORT_FEATURES");
 
     public static final ChannelOption<Long> SERVER_ID = ChannelOption.valueOf("RN_SERVER_ID");
     public static final ChannelOption<Long> CLIENT_ID = ChannelOption.valueOf("RN_CLIENT_ID");
@@ -42,6 +43,8 @@ public class RakNet {
     public static final ChannelOption<Magic> MAGIC = ChannelOption.valueOf("RN_MAGIC");
     public static final ChannelOption<Long> RETRY_DELAY_NANOS = ChannelOption.valueOf("RN_RETRY_DELAY_NANOS");
     public static final ChannelOption<Integer> MAX_CONNECTIONS = ChannelOption.valueOf("RN_MAX_CONNECTIONS");
+    public static final ChannelOption<Boolean> ADAPTIVE_TRANSPORT = ChannelOption.valueOf("RN_ADAPTIVE_TRANSPORT");
+    public static final ChannelOption<Boolean> ADAPTIVE_DSCP = ChannelOption.valueOf("RN_ADAPTIVE_DSCP");
 
     public static final ChannelFutureListener INTERNAL_WRITE_LISTENER = future -> {
         if (!future.isSuccess() && !(future.cause() instanceof ClosedChannelException)) {
@@ -81,6 +84,11 @@ public class RakNet {
         default void measureRTTns(long n) {}
         default void measureRTTnsStdDev(long n) {}
         default void measureBurstTokens(int n) {}
+        default void adaptivePacingRate(double packetsPerSecond) {}
+        default void adaptiveLossType(String type) {}
+        default void adaptiveMTU(int mtu) {}
+        default void fecRecovered(int delta) {}
+        default void pathMtuProbe(boolean acknowledged, int mtu) {}
 
         default void currentQueuedBytes(int bytes) {}
     }
@@ -152,6 +160,11 @@ public class RakNet {
 
         boolean isNoDelayEnabled();
         void setNoDelayEnabled(boolean value);
+
+        boolean isAdaptiveTransportEnabled();
+        void setAdaptiveTransportEnabled(boolean value);
+        boolean isAdaptiveDscpEnabled();
+        void setAdaptiveDscpEnabled(boolean value);
     }
 
     public interface Codec {

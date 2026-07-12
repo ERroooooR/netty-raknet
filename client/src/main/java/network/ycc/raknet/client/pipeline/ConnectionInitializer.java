@@ -1,6 +1,7 @@
 package network.ycc.raknet.client.pipeline;
 
 import network.ycc.raknet.RakNet;
+import network.ycc.raknet.TransportFeatures;
 import network.ycc.raknet.packet.ClientHandshake;
 import network.ycc.raknet.packet.ConnectionFailed;
 import network.ycc.raknet.packet.ConnectionReply1;
@@ -55,7 +56,10 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
                     config.setServerId(cr2.getServerId());
                     state = State.CR3;
                     resetRetryCount();
-                    final Packet packet = new ConnectionRequest(config.getClientId());
+                    final long requestedFeatures = config.getProtocolVersion() >= 12 && config.isAdaptiveTransportEnabled()
+                            ? TransportFeatures.SUPPORTED : 0;
+                    ctx.channel().attr(RakNet.TRANSPORT_FEATURES).set(requestedFeatures);
+                    final Packet packet = new ConnectionRequest(config.getClientId(), requestedFeatures);
                     ctx.writeAndFlush(packet).addListener(RakNet.INTERNAL_WRITE_LISTENER);
                 } else if (msg instanceof ConnectionFailed) {
                     fail(new ChannelException("RakNet connection failed"));
@@ -64,6 +68,8 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
             }
             case CR3: {
                 if (msg instanceof ServerHandshake) {
+                    final long negotiated = ((ServerHandshake) msg).getTransportFeatures();
+                    ctx.channel().attr(RakNet.TRANSPORT_FEATURES).set(negotiated);
                     final Packet packet = new ClientHandshake(
                             ((ServerHandshake) msg).getTimestamp(),
                             (InetSocketAddress) ctx.channel().remoteAddress(),

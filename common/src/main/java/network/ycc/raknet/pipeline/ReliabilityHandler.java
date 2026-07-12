@@ -43,8 +43,6 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected ChannelHandlerContext ctx;
     protected AdaptiveTransportController adaptive;
     protected boolean pacingScheduled;
-    protected boolean coalesceScheduled;
-    private static final long SMALL_WRITE_COALESCE_NANOS = 250_000L;
 
     // Item 3: track when first ACK was queued for time-based flush
     protected long firstAckNanos = 0;
@@ -85,12 +83,6 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             FlushTickHandler.checkFlushTick(ctx.channel());
             if (wasIdle && frame.getRoughPacketSize() >= config.getMTU() / 2) {
                 flush(ctx);
-            } else if (wasIdle && !coalesceScheduled) {
-                coalesceScheduled = true;
-                ctx.executor().schedule(() -> {
-                    coalesceScheduled = false;
-                    if (ctx.channel().isOpen()) flush(ctx);
-                }, SMALL_WRITE_COALESCE_NANOS, TimeUnit.NANOSECONDS);
             }
         } else {
             ctx.write(msg, promise);
@@ -201,7 +193,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 final FrameSet frameSet = pendingFrameSets.remove(id);
                 if (frameSet != null) {
                     ackdBytes += frameSet.getRoughSize();
-                    adaptive.onAck(frameSet.getRoughSize());
+                    adaptive.onAck(frameSet.getRoughSize(), System.nanoTime() - frameSet.getSentTime());
                     adjustResendGauge(1);
                     frameSet.succeed();
                     frameSet.release();
@@ -440,5 +432,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 //        return byteSize;
         return this.queuedBytes;
     }
+
+    AdaptiveTransportController adaptiveController() { return adaptive; }
 
 }

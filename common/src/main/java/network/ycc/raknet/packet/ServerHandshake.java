@@ -9,6 +9,7 @@ public class ServerHandshake extends SimpleFramedPacket {
     private InetSocketAddress clientAddr;
     private long timestamp;
     private int nExtraAddresses;
+    private long transportFeatures;
 
     public ServerHandshake() {
         reliability = Reliability.RELIABLE;
@@ -25,12 +26,21 @@ public class ServerHandshake extends SimpleFramedPacket {
         this.nExtraAddresses = nExtraAddresses;
     }
 
+    public ServerHandshake(InetSocketAddress clientAddr, long timestamp, int nExtraAddresses, long transportFeatures) {
+        this(clientAddr, timestamp, nExtraAddresses);
+        this.transportFeatures = transportFeatures;
+    }
+
     @Override
     public void encode(ByteBuf buf) {
         writeAddress(buf, clientAddr);
         buf.writeShort(0);
         for (int i = 0; i < nExtraAddresses; i++) {
             writeAddress(buf);
+        }
+        if (transportFeatures != 0) {
+            buf.writeInt(network.ycc.raknet.TransportFeatures.MAGIC);
+            buf.writeLong(transportFeatures);
         }
         buf.writeLong(timestamp);
         buf.writeLong(System.currentTimeMillis());
@@ -41,6 +51,12 @@ public class ServerHandshake extends SimpleFramedPacket {
         clientAddr = readAddress(buf);
         buf.readShort();
         for (nExtraAddresses = 0; buf.readableBytes() > 16; nExtraAddresses++) {
+            if (buf.readableBytes() == 28
+                    && buf.getInt(buf.readerIndex()) == network.ycc.raknet.TransportFeatures.MAGIC) {
+                buf.skipBytes(4);
+                transportFeatures = buf.readLong();
+                break;
+            }
             readAddress(buf);
         }
         timestamp = buf.readLong();
@@ -70,5 +86,7 @@ public class ServerHandshake extends SimpleFramedPacket {
     public void setnExtraAddresses(int nExtraAddresses) {
         this.nExtraAddresses = nExtraAddresses;
     }
+
+    public long getTransportFeatures() { return transportFeatures; }
 
 }

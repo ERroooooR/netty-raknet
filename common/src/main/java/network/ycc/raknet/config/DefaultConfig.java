@@ -44,6 +44,8 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
     private volatile boolean ignoreResendGauge = false;
     private volatile boolean NACKEnabled = false;
     private volatile boolean noDelay = false;
+    private volatile boolean adaptiveTransport = true;
+    private volatile boolean adaptiveDscp = false;
 
     public DefaultConfig(Channel channel) {
         super(channel);
@@ -56,7 +58,8 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
         return getOptions(
                 super.getOptions(),
                 RakNet.SERVER_ID, RakNet.CLIENT_ID, RakNet.METRICS, RakNet.MTU,
-                RakNet.RTT, RakNet.PROTOCOL_VERSION, RakNet.MAGIC, RakNet.RETRY_DELAY_NANOS);
+                RakNet.RTT, RakNet.PROTOCOL_VERSION, RakNet.MAGIC, RakNet.RETRY_DELAY_NANOS,
+                RakNet.ADAPTIVE_TRANSPORT, RakNet.ADAPTIVE_DSCP);
     }
 
     @Override
@@ -80,6 +83,10 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
             return (T) (Long) retryDelayNanos;
         } else if (option == RakNet.MAX_CONNECTIONS) {
             return (T) (Integer) maxConnections;
+        } else if (option == RakNet.ADAPTIVE_TRANSPORT) {
+            return (T) (Boolean) adaptiveTransport;
+        } else if (option == RakNet.ADAPTIVE_DSCP) {
+            return (T) (Boolean) adaptiveDscp;
         }
         return super.getOption(option);
     }
@@ -105,6 +112,10 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
             retryDelayNanos = (Long) value;
         } else if (option == RakNet.MAX_CONNECTIONS) {
             maxConnections = (Integer) value;
+        } else if (option == RakNet.ADAPTIVE_TRANSPORT) {
+            adaptiveTransport = (Boolean) value;
+        } else if (option == RakNet.ADAPTIVE_DSCP) {
+            adaptiveDscp = (Boolean) value;
         } else {
             return super.setOption(option, value);
         }
@@ -285,4 +296,16 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
     public void setNoDelayEnabled(boolean value) {
         this.noDelay = value;
     }
+
+    @Override
+    public boolean isAdaptiveTransportEnabled() { return adaptiveTransport; }
+
+    @Override
+    public void setAdaptiveTransportEnabled(boolean value) { adaptiveTransport = value; }
+
+    @Override
+    public boolean isAdaptiveDscpEnabled() { return adaptiveDscp; }
+
+    @Override
+    public void setAdaptiveDscpEnabled(boolean value) { adaptiveDscp = value; }
 }

@@ -39,6 +39,31 @@ room for extension with any plugins or custom behavior.
 * Automated flush driver
   * Recommended to write to pipeline with no flush. 
   * Flush cycles condense outbound data for best use of MTU.
+
+## Adaptive transport
+
+Protocol version 11 is the default and remains compatible with maintained Mojang RakNet
+implementations. Versions 9 and 10 are still accepted. This fork adds protocol version 12 for
+explicitly negotiated transport extensions; v9-v11 never emit extension packets.
+
+Adaptive pacing, rolling-window loss classification, idle-boundary MTU fallback/recovery and
+PPS-aware batching are enabled by default. Configure them through Netty channel options:
+
+```java
+bootstrap.option(RakNet.ADAPTIVE_TRANSPORT, true);
+bootstrap.option(RakNet.ADAPTIVE_DSCP, false); // Shared UDP socket: disabled by default.
+bootstrap.option(RakNet.PROTOCOL_VERSION, 12); // Enables negotiated PLPMTUD and limited FEC.
+```
+
+Version 12 protects groups of four small FrameSets with one XOR parity datagram when recent random
+loss is between 1% and 12%. It can recover one loss per group and automatically stays off during
+burst loss or queue congestion. PLPMTUD uses padded path probes and raises the active MTU only after
+a matching token is acknowledged. MTU changes are applied only after queued and in-flight frames
+drain, so existing fragments remain valid.
+
+Adaptive DSCP operates on the single shared server socket. It requires at least 16 connection votes,
+a 2:1 majority and a 30-second cooldown before switching between AF41 and CS0. Per-player DSCP is not
+possible with the shared-socket server architecture.
   
 # Usage
 

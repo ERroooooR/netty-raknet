@@ -122,6 +122,16 @@ public class EndToEndTest {
     }
 
     @Test
+    public void protocol12NegotiatesAdaptiveFeatures() throws Throwable {
+        final Channel server = newServer(null, null, null);
+        final Channel client = newClient(null, null, 12);
+        Assertions.assertEquals(TransportFeatures.SUPPORTED,
+                client.parent().attr(RakNet.TRANSPORT_FEATURES).get().longValue());
+        client.close().sync();
+        server.close().sync();
+    }
+
+    @Test
     public void manyBufferTest() throws Throwable {
         dataTest(100, 5000, false, false, false);
     }
@@ -278,6 +288,11 @@ public class EndToEndTest {
 
     public Channel newClient(ChannelInitializer<Channel> init, MockDatagramPair dgPair)
             throws InterruptedException {
+        return newClient(init, dgPair, 11);
+    }
+
+    public Channel newClient(ChannelInitializer<Channel> init, MockDatagramPair dgPair, int protocolVersion)
+            throws InterruptedException {
         final Bootstrap bootstrap = new Bootstrap()
                 .group(ioGroup)
                 .channelFactory(() -> new RakNetClientThreadedChannel(() -> {
@@ -288,6 +303,7 @@ public class EndToEndTest {
                     }
                 }))
                 .option(RakNet.CLIENT_ID, 6789L)
+                .option(RakNet.PROTOCOL_VERSION, protocolVersion)
                 .option(RakNet.RETRY_DELAY_NANOS,
                         TimeUnit.NANOSECONDS.convert(10, TimeUnit.MILLISECONDS))
                 .handler(new ChannelInitializer<Channel>() {

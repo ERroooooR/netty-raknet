@@ -1,6 +1,7 @@
 package network.ycc.raknet.server.pipeline;
 
 import network.ycc.raknet.RakNet;
+import network.ycc.raknet.TransportFeatures;
 import network.ycc.raknet.packet.ClientHandshake;
 import network.ycc.raknet.packet.ConnectionFailed;
 import network.ycc.raknet.packet.ConnectionReply1;
@@ -78,9 +79,12 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
             case CR2: {
                 if (msg instanceof ConnectionRequest) {
                     final ConnectionRequest cr = (ConnectionRequest) msg;
+                    final long negotiated = config.getProtocolVersion() >= 12
+                            ? cr.getTransportFeatures() & TransportFeatures.SUPPORTED : 0;
+                    ctx.channel().attr(RakNet.TRANSPORT_FEATURES).set(negotiated);
                     final Packet packet = new ServerHandshake(
                             (InetSocketAddress) ctx.channel().remoteAddress(),
-                            cr.getTimestamp());
+                            cr.getTimestamp(), 20, negotiated);
                     ctx.writeAndFlush(packet).addListener(RakNet.INTERNAL_WRITE_LISTENER);
                     state = State.CR3;
                     resetRetryCount();
