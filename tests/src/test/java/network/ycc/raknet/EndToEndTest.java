@@ -152,12 +152,22 @@ public class EndToEndTest {
     }
 
     @Test
+    public void adaptiveV12SurvivesModerateRandomLoss() throws Throwable {
+        dataTest(200, 1000, true, true, false, 12, 0.05);
+    }
+
+    @Test
     public void fireGC() {
         System.gc();
     }
 
     public void dataTest(int nSend, int maxSize, boolean brutalizeWrite, boolean brutalizeRead,
             boolean mockTransport) throws Throwable {
+        dataTest(nSend, maxSize, brutalizeWrite, brutalizeRead, mockTransport, 11, 0.20);
+    }
+
+    public void dataTest(int nSend, int maxSize, boolean brutalizeWrite, boolean brutalizeRead,
+            boolean mockTransport, int protocolVersion, double lossPercent) throws Throwable {
         Random rnd = new Random(34598);
         AtomicInteger bytesSent = new AtomicInteger(0);
         AtomicInteger bytesRecvd = new AtomicInteger(0);
@@ -183,7 +193,7 @@ public class EndToEndTest {
             }
             ReferenceCountUtil.safeRelease(msg);
         }), mockPair);
-        Channel client = newClient(null, mockPair);
+        Channel client = newClient(null, mockPair, protocolVersion);
         ChannelPromise donePromise = client.newPromise();
 
         client.parent().pipeline()
@@ -191,6 +201,7 @@ public class EndToEndTest {
         brutalizer.rnd = rnd;
         brutalizer.brutalizeRead = brutalizeRead;
         brutalizer.brutalizeWrite = brutalizeWrite;
+        brutalizer.lossPercent = lossPercent;
 
         //TODO: server side writes?
 
