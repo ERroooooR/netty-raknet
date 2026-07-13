@@ -18,6 +18,7 @@ public final class PathMtuDiscoveryHandler extends ChannelDuplexHandler {
     private static final int ACK_ID = 0x21;
     private static final long INTERVAL_SECONDS = 30;
     private ScheduledFuture<?> task;
+    private ScheduledFuture<?> probeTimeout;
     private long pendingToken;
     private int pendingMtu;
 
@@ -30,7 +31,9 @@ public final class PathMtuDiscoveryHandler extends ChannelDuplexHandler {
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) {
         if (task != null) task.cancel(false);
+        if (probeTimeout != null) probeTimeout.cancel(false);
         task = null;
+        probeTimeout = null;
     }
 
     @Override
@@ -54,8 +57,11 @@ public final class PathMtuDiscoveryHandler extends ChannelDuplexHandler {
                         final ReliabilityHandler reliability = ctx.pipeline().get(ReliabilityHandler.class);
                         if (reliability != null) reliability.adaptiveController().onProbeAck(mtu);
                         RakNet.config(ctx).getMetrics().pathMtuProbe(true, mtu);
+                        RakNet.config(ctx).getMetrics().pathMtuProbeResult("acknowledged", mtu);
                         pendingToken = 0;
                         pendingMtu = 0;
+                        if (probeTimeout != null) probeTimeout.cancel(false);
+                        probeTimeout = null;
                     }
                 }
                 ReferenceCountUtil.release(msg);
@@ -78,11 +84,14 @@ public final class PathMtuDiscoveryHandler extends ChannelDuplexHandler {
         probe.writeZero(candidate - probe.readableBytes());
         ctx.writeAndFlush(probe);
         RakNet.config(ctx).getMetrics().pathMtuProbe(false, candidate);
-        ctx.executor().schedule(() -> {
+        RakNet.config(ctx).getMetrics().pathMtuProbeResult("sent", candidate);
+        probeTimeout = ctx.executor().schedule(() -> {
             if (pendingMtu == candidate) {
+                reliability.adaptiveController().onProbeTimeout(candidate);
                 pendingToken = 0;
                 pendingMtu = 0;
             }
+            probeTimeout = null;
         }, 5, TimeUnit.SECONDS);
     }
 

@@ -31,4 +31,11 @@ public class LimitedFecHandlerTest {
                 LimitedFecHandler.xor(Arrays.asList(a, b)),
                 LimitedFecHandler.xor(Arrays.asList(b, a)));
     }
+
+    @Test
+    public void adaptsGroupSizeToMeasuredRandomLoss() {
+        Assertions.assertEquals(8, LimitedFecHandler.selectGroupSize(0.01D));
+        Assertions.assertEquals(6, LimitedFecHandler.selectGroupSize(0.04D));
+        Assertions.assertEquals(4, LimitedFecHandler.selectGroupSize(0.08D));
+    }
 }

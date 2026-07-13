@@ -44,7 +44,8 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected AdaptiveTransportController adaptive;
     protected boolean pacingScheduled;
     protected boolean coalesceScheduled;
-    private static final long SMALL_WRITE_COALESCE_NANOS = 250_000L;
+    protected int coalescedFrames;
+    protected long coalesceStartedNanos;
 
     // Item 3: track when first ACK was queued for time-based flush
     protected long firstAckNanos = 0;
@@ -87,10 +88,19 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 flush(ctx);
             } else if (wasIdle && !coalesceScheduled) {
                 coalesceScheduled = true;
+                coalescedFrames = 1;
+                coalesceStartedNanos = System.nanoTime();
                 ctx.executor().schedule(() -> {
                     coalesceScheduled = false;
-                    if (ctx.channel().isOpen() && !frameQueue.isEmpty()) flush(ctx);
-                }, SMALL_WRITE_COALESCE_NANOS, TimeUnit.NANOSECONDS);
+                    if (ctx.channel().isOpen() && !frameQueue.isEmpty()) {
+                        config.getMetrics().smallWriteBatch(coalescedFrames,
+                                System.nanoTime() - coalesceStartedNanos);
+                        flush(ctx);
+                    }
+                    coalescedFrames = 0;
+                }, config.getSmallWriteCoalesceMicros(), TimeUnit.MICROSECONDS);
+            } else if (coalesceScheduled) {
+                coalescedFrames++;
             }
         } else {
             ctx.write(msg, promise);

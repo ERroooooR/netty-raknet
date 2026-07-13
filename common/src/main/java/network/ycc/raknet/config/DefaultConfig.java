@@ -46,6 +46,9 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
     private volatile boolean noDelay = false;
     private volatile boolean adaptiveTransport = true;
     private volatile boolean adaptiveDscp = false;
+    private volatile int adaptiveMinPps = 50;
+    private volatile int adaptiveMaxPps = 2000;
+    private volatile int smallWriteCoalesceMicros = 250;
 
     public DefaultConfig(Channel channel) {
         super(channel);
@@ -59,7 +62,8 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
                 super.getOptions(),
                 RakNet.SERVER_ID, RakNet.CLIENT_ID, RakNet.METRICS, RakNet.MTU,
                 RakNet.RTT, RakNet.PROTOCOL_VERSION, RakNet.MAGIC, RakNet.RETRY_DELAY_NANOS,
-                RakNet.ADAPTIVE_TRANSPORT, RakNet.ADAPTIVE_DSCP);
+                RakNet.ADAPTIVE_TRANSPORT, RakNet.ADAPTIVE_DSCP, RakNet.ADAPTIVE_MIN_PPS,
+                RakNet.ADAPTIVE_MAX_PPS, RakNet.SMALL_WRITE_COALESCE_MICROS);
     }
 
     @Override
@@ -87,6 +91,12 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
             return (T) (Boolean) adaptiveTransport;
         } else if (option == RakNet.ADAPTIVE_DSCP) {
             return (T) (Boolean) adaptiveDscp;
+        } else if (option == RakNet.ADAPTIVE_MIN_PPS) {
+            return (T) (Integer) adaptiveMinPps;
+        } else if (option == RakNet.ADAPTIVE_MAX_PPS) {
+            return (T) (Integer) adaptiveMaxPps;
+        } else if (option == RakNet.SMALL_WRITE_COALESCE_MICROS) {
+            return (T) (Integer) smallWriteCoalesceMicros;
         }
         return super.getOption(option);
     }
@@ -116,6 +126,12 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
             adaptiveTransport = (Boolean) value;
         } else if (option == RakNet.ADAPTIVE_DSCP) {
             adaptiveDscp = (Boolean) value;
+        } else if (option == RakNet.ADAPTIVE_MIN_PPS) {
+            setAdaptiveMinPps((Integer) value);
+        } else if (option == RakNet.ADAPTIVE_MAX_PPS) {
+            setAdaptiveMaxPps((Integer) value);
+        } else if (option == RakNet.SMALL_WRITE_COALESCE_MICROS) {
+            setSmallWriteCoalesceMicros((Integer) value);
         } else {
             return super.setOption(option, value);
         }
@@ -308,4 +324,31 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
 
     @Override
     public void setAdaptiveDscpEnabled(boolean value) { adaptiveDscp = value; }
+
+    @Override
+    public int getAdaptiveMinPps() { return adaptiveMinPps; }
+
+    @Override
+    public void setAdaptiveMinPps(int value) {
+        if (value < 1) throw new IllegalArgumentException("adaptive minimum PPS must be positive");
+        adaptiveMinPps = value;
+    }
+
+    @Override
+    public int getAdaptiveMaxPps() { return adaptiveMaxPps; }
+
+    @Override
+    public void setAdaptiveMaxPps(int value) {
+        if (value < 1) throw new IllegalArgumentException("adaptive maximum PPS must be positive");
+        adaptiveMaxPps = value;
+    }
+
+    @Override
+    public int getSmallWriteCoalesceMicros() { return smallWriteCoalesceMicros; }
+
+    @Override
+    public void setSmallWriteCoalesceMicros(int value) {
+        if (value < 0 || value > 100_000) throw new IllegalArgumentException("small-write coalescing must be 0..100000 microseconds");
+        smallWriteCoalesceMicros = value;
+    }
 }

@@ -17,37 +17,53 @@ import java.util.List;
 import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import io.netty.util.concurrent.ScheduledFuture;
 
 /** Optional one-loss XOR recovery for small FrameSets. Wire format is restricted to protocol v12+. */
 public final class LimitedFecHandler extends ChannelDuplexHandler {
     public static final String NAME = "rn-limited-fec";
     public static final int ADAPTIVE_PROTOCOL_VERSION = 12;
     private static final int FEC_PACKET_ID = 0x1e;
-    private static final int GROUP_SIZE = 4;
+    private static final int MIN_GROUP_SIZE = 4;
+    private static final int MAX_GROUP_SIZE = 8;
     private static final int MAX_PROTECTED_BYTES = 512;
     private static final int MAX_CACHE = 256;
 
-    private final List<Entry> outbound = new ArrayList<>(GROUP_SIZE);
+    private final List<Entry> outbound = new ArrayList<>(MAX_GROUP_SIZE);
     private final Int2ObjectLinkedOpenHashMap<byte[]> received = new Int2ObjectLinkedOpenHashMap<>();
     private final List<Parity> pending = new ArrayList<>();
     private final Set<Integer> recentGroups = new LinkedHashSet<>();
     private int groupId;
+    private int outboundGroupSize;
+    private ScheduledFuture<?> cleanupTask;
+
+    @Override
+    public void handlerAdded(ChannelHandlerContext ctx) {
+        cleanupTask = ctx.executor().scheduleAtFixedRate(
+                () -> tryRecover(ctx), 1, 1, TimeUnit.SECONDS);
+    }
 
     @Override
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
         if (!enabled(ctx) || !fecUseful(ctx) || !(msg instanceof ByteBuf)) {
             outbound.clear();
+            outboundGroupSize = 0;
             ctx.write(msg, promise);
             return;
         }
+        final int groupSize = fecGroupSize(ctx);
+        if (outboundGroupSize != 0 && outboundGroupSize != groupSize) outbound.clear();
+        outboundGroupSize = groupSize;
         final ByteBuf buf = (ByteBuf) msg;
         if (isFrameSet(buf) && buf.readableBytes() <= MAX_PROTECTED_BYTES) {
             final byte[] bytes = copy(buf);
             outbound.add(new Entry(buf.getUnsignedMediumLE(buf.readerIndex() + 1), bytes.length, bytes));
         }
         ctx.write(msg, promise);
-        if (outbound.size() == GROUP_SIZE) {
-            ctx.write(createParity(ctx), ctx.voidPromise());
+        if (outbound.size() == groupSize) {
+            final ByteBuf parity = createParity(ctx);
+            RakNet.config(ctx).getMetrics().fecParity(groupSize, parity.readableBytes());
+            ctx.write(parity, ctx.voidPromise());
             outbound.clear();
         }
     }
@@ -96,6 +112,8 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
 
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) {
+        if (cleanupTask != null) cleanupTask.cancel(false);
+        cleanupTask = null;
         outbound.clear();
         received.clear();
         pending.clear();
@@ -120,8 +138,8 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
         for (Entry entry : outbound) packets.add(entry.data);
         final byte[] parity = xor(packets);
         final int max = parity.length;
-        final ByteBuf out = ctx.alloc().ioBuffer(8 + GROUP_SIZE * 5 + max);
-        out.writeByte(FEC_PACKET_ID).writeInt(groupId++).writeByte(GROUP_SIZE);
+        final ByteBuf out = ctx.alloc().ioBuffer(8 + outbound.size() * 5 + max);
+        out.writeByte(FEC_PACKET_ID).writeInt(groupId++).writeByte(outbound.size());
         for (Entry entry : outbound) out.writeMediumLE(entry.seq).writeShort(entry.length);
         out.writeShort(max).writeBytes(parity);
         return out;
@@ -131,7 +149,9 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
         in.skipBytes(1);
         final int id = in.readInt();
         final int count = in.readUnsignedByte();
-        if (count != GROUP_SIZE) throw new IllegalArgumentException("Invalid FEC group size");
+        if (count < MIN_GROUP_SIZE || count > MAX_GROUP_SIZE) {
+            throw new IllegalArgumentException("Invalid FEC group size");
+        }
         final Entry[] entries = new Entry[count];
         final java.util.HashSet<Integer> sequences = new java.util.HashSet<>();
         for (int i = 0; i < count; i++) {
@@ -155,6 +175,7 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
         while (iterator.hasNext()) {
             final Parity group = iterator.next();
             if (System.nanoTime() - group.createdAt > TimeUnit.SECONDS.toNanos(5)) {
+                RakNet.config(ctx).getMetrics().fecExpired(1);
                 iterator.remove();
                 continue;
             }
@@ -187,6 +208,21 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
     private boolean fecUseful(ChannelHandlerContext ctx) {
         final ReliabilityHandler reliability = ctx.pipeline().get(ReliabilityHandler.class);
         return reliability != null && reliability.adaptiveController().shouldUseFec();
+    }
+
+    private int fecGroupSize(ChannelHandlerContext ctx) {
+        final Long features = ctx.channel().attr(RakNet.TRANSPORT_FEATURES).get();
+        if (features == null || (features & TransportFeatures.DYNAMIC_FEC) == 0) return MIN_GROUP_SIZE;
+        final ReliabilityHandler reliability = ctx.pipeline().get(ReliabilityHandler.class);
+        return reliability == null ? MIN_GROUP_SIZE : reliability.adaptiveController().fecGroupSize();
+    }
+
+    /** Lower loss uses larger groups to cap overhead; higher random loss uses
+     * smaller groups so one loss is more likely to remain recoverable. */
+    static int selectGroupSize(double lossRatio) {
+        if (lossRatio < 0.03D) return 8;
+        if (lossRatio < 0.06D) return 6;
+        return 4;
     }
 
     private static byte[] copy(ByteBuf buf) {

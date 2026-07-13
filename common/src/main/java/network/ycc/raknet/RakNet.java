@@ -45,6 +45,9 @@ public class RakNet {
     public static final ChannelOption<Integer> MAX_CONNECTIONS = ChannelOption.valueOf("RN_MAX_CONNECTIONS");
     public static final ChannelOption<Boolean> ADAPTIVE_TRANSPORT = ChannelOption.valueOf("RN_ADAPTIVE_TRANSPORT");
     public static final ChannelOption<Boolean> ADAPTIVE_DSCP = ChannelOption.valueOf("RN_ADAPTIVE_DSCP");
+    public static final ChannelOption<Integer> ADAPTIVE_MIN_PPS = ChannelOption.valueOf("RN_ADAPTIVE_MIN_PPS");
+    public static final ChannelOption<Integer> ADAPTIVE_MAX_PPS = ChannelOption.valueOf("RN_ADAPTIVE_MAX_PPS");
+    public static final ChannelOption<Integer> SMALL_WRITE_COALESCE_MICROS = ChannelOption.valueOf("RN_SMALL_WRITE_COALESCE_MICROS");
 
     public static final ChannelFutureListener INTERNAL_WRITE_LISTENER = future -> {
         if (!future.isSuccess() && !(future.cause() instanceof ClosedChannelException)) {
@@ -85,10 +88,18 @@ public class RakNet {
         default void measureRTTnsStdDev(long n) {}
         default void measureBurstTokens(int n) {}
         default void adaptivePacingRate(double packetsPerSecond) {}
+        default void adaptiveDeliveryRate(long bytesPerSecond) {}
+        default void adaptiveLoss(double ratio, long acknowledged, long lost) {}
         default void adaptiveLossType(String type) {}
         default void adaptiveMTU(int mtu) {}
         default void fecRecovered(int delta) {}
+        default void fecParity(int packets, int bytes) {}
+        default void fecExpired(int delta) {}
         default void pathMtuProbe(boolean acknowledged, int mtu) {}
+        default void pathMtuProbeResult(String result, int mtu) {}
+        default void adaptiveDscp(int ipTos) {}
+        default void smallWriteBatch(int frames, long delayNanos) {}
+        default void pacingDelay(long delayNanos) {}
 
         default void currentQueuedBytes(int bytes) {}
     }
@@ -165,6 +176,12 @@ public class RakNet {
         void setAdaptiveTransportEnabled(boolean value);
         boolean isAdaptiveDscpEnabled();
         void setAdaptiveDscpEnabled(boolean value);
+        default int getAdaptiveMinPps() { return 50; }
+        default void setAdaptiveMinPps(int value) {}
+        default int getAdaptiveMaxPps() { return 2000; }
+        default void setAdaptiveMaxPps(int value) {}
+        default int getSmallWriteCoalesceMicros() { return 250; }
+        default void setSmallWriteCoalesceMicros(int value) {}
     }
 
     public interface Codec {

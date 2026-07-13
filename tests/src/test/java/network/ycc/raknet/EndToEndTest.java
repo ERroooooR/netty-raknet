@@ -29,6 +29,7 @@ import network.ycc.raknet.server.channel.RakNetServerChannel;
 import network.ycc.raknet.utils.EmptyInit;
 import network.ycc.raknet.utils.MockDatagram;
 import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
 import java.net.InetSocketAddress;
@@ -41,8 +42,15 @@ import java.util.function.BiConsumer;
 public class EndToEndTest {
     final EventLoopGroup ioGroup = new NioEventLoopGroup();
     final EventLoopGroup childGroup = new NioEventLoopGroup();
-    final InetSocketAddress localhost = new InetSocketAddress("localhost", 31745);
-    final InetSocketAddress localSender = new InetSocketAddress("localhost", 31745);
+    final InetSocketAddress mockServerAddress = new InetSocketAddress("localhost", 31745);
+    final InetSocketAddress mockClientAddress = new InetSocketAddress("localhost", 31746);
+    volatile InetSocketAddress serverAddress;
+
+    @AfterEach
+    public void shutdownEventLoops() throws InterruptedException {
+        ioGroup.shutdownGracefully(0, 5, TimeUnit.SECONDS).sync();
+        childGroup.shutdownGracefully(0, 5, TimeUnit.SECONDS).sync();
+    }
 
     public static ChannelInitializer<Channel> simpleHandler(
             BiConsumer<ChannelHandlerContext, Object> func) {
@@ -108,6 +116,7 @@ public class EndToEndTest {
         client.parent().pipeline().fireChannelRead(Unpooled.wrappedBuffer(
                 new byte[]{(byte) DefaultCodec.FRAME_DATA_START, 1, 2, 3, 4, 5, 6, 7, 8, 9}));
 
+        Thread.sleep(100); // exercise a write after transport keepalive traffic consumed the initial token
         client.pipeline().write(Unpooled.wrappedBuffer(new byte[bytesSent]));
         client.pipeline().flush();
 
@@ -294,7 +303,11 @@ public class EndToEndTest {
                         }
                     }
                 });
-        return bootstrap.bind(localhost).sync().channel();
+        final InetSocketAddress bindAddress = dgPair == null
+                ? new InetSocketAddress("127.0.0.1", 0) : mockServerAddress;
+        final Channel channel = bootstrap.bind(bindAddress).sync().channel();
+        serverAddress = (InetSocketAddress) channel.localAddress();
+        return channel;
     }
 
     public Channel newClient(ChannelInitializer<Channel> init, MockDatagramPair dgPair)
@@ -325,7 +338,9 @@ public class EndToEndTest {
                         }
                     }
                 });
-        return bootstrap.connect(localhost).sync().channel();
+        final InetSocketAddress target = dgPair == null ? serverAddress : mockServerAddress;
+        if (target == null) throw new IllegalStateException("server must be started before the client");
+        return bootstrap.connect(target).sync().channel();
     }
 
     public static class Brutalizer extends ChannelDuplexHandler {
@@ -395,8 +410,8 @@ public class EndToEndTest {
     }
 
     public class MockDatagramPair {
-        final MockDatagram server = new MockDatagram(null, localhost, localSender);
-        final MockDatagram client = new MockDatagram(null, localSender, localhost);
+        final MockDatagram server = new MockDatagram(null, mockServerAddress, mockClientAddress);
+        final MockDatagram client = new MockDatagram(null, mockClientAddress, mockServerAddress);
 
         {
             server.writeOut = dg -> client.pipeline().fireChannelRead(dg).fireChannelReadComplete();
