@@ -13,6 +13,7 @@ import network.ycc.raknet.packet.InvalidVersion;
 import network.ycc.raknet.packet.Packet;
 import network.ycc.raknet.packet.ServerHandshake;
 import network.ycc.raknet.pipeline.AbstractConnectionInitializer;
+import network.ycc.raknet.pipeline.ReliabilityHandler;
 
 import io.netty.channel.ChannelException;
 import io.netty.channel.ChannelHandlerContext;
@@ -23,6 +24,7 @@ import java.net.InetSocketAddress;
 public class ConnectionInitializer extends AbstractConnectionInitializer {
 
     private int cr1Retries = 0;
+    private boolean triedLegacyFallback;
 
     public ConnectionInitializer(ChannelPromise connectPromise) {
         super(connectPromise);
@@ -44,7 +46,15 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
                     state = State.CR2;
                     resetRetryCount();
                 } else if (msg instanceof InvalidVersion) {
-                    fail(new InvalidVersion.InvalidVersionException());
+                    if (!triedLegacyFallback && config.getProtocolVersion() >= 12
+                            && config.containsProtocolVersion(11)) {
+                        triedLegacyFallback = true;
+                        config.setProtocolVersion(11);
+                        cr1Retries = 0;
+                        resetRetryCount();
+                    } else {
+                        fail(new InvalidVersion.InvalidVersionException());
+                    }
                 }
                 break;
             }
@@ -53,6 +63,8 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
                     final ConnectionReply2 cr2 = (ConnectionReply2) msg;
                     cr2.getMagic().verify(config.getMagic());
                     config.setMTU(cr2.getMtu());
+                    final ReliabilityHandler reliability = ctx.pipeline().get(ReliabilityHandler.class);
+                    if (reliability != null) reliability.onNegotiatedMtu(cr2.getMtu());
                     config.setServerId(cr2.getServerId());
                     state = State.CR3;
                     resetRetryCount();

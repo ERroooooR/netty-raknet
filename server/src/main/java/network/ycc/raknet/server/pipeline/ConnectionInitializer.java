@@ -13,6 +13,7 @@ import network.ycc.raknet.packet.InvalidVersion;
 import network.ycc.raknet.packet.Packet;
 import network.ycc.raknet.packet.ServerHandshake;
 import network.ycc.raknet.pipeline.AbstractConnectionInitializer;
+import network.ycc.raknet.pipeline.ReliabilityHandler;
 
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFutureListener;
@@ -72,6 +73,8 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
                     if (!mtuFixed) {
                         config.setMTU(cr2.getMtu());
                     }
+                    final ReliabilityHandler reliability = ctx.pipeline().get(ReliabilityHandler.class);
+                    if (reliability != null) reliability.onNegotiatedMtu(config.getMTU());
                     state = State.CR2;
                     resetRetryCount();
                 }

@@ -11,6 +11,7 @@ import it.unimi.dsi.fastutil.ints.IntRBTreeSet;
 import it.unimi.dsi.fastutil.ints.IntSortedSet;
 import it.unimi.dsi.fastutil.objects.ObjectIterator;
 import network.ycc.raknet.RakNet;
+import network.ycc.raknet.TransportFeedbackEvent;
 import network.ycc.raknet.frame.Frame;
 import network.ycc.raknet.packet.FrameSet;
 import network.ycc.raknet.packet.Reliability;
@@ -34,6 +35,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected final Int2ObjectLinkedOpenHashMap<FrameSet> pendingFrameSets = new Int2ObjectLinkedOpenHashMap<>();
 
     protected int queuedBytes = 0;
+    protected long inFlightBytes = 0;
 
     protected int lastReceivedSeqId = 0;
     protected int nextSendSeqId = 0;
@@ -57,6 +59,10 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         this.produceFrameSets(ctx);
         ctx.flush();
     };
+
+    public void onNegotiatedMtu(int mtu) {
+        if (adaptive != null) adaptive.onNegotiatedMtu(mtu);
+    }
 
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) {
@@ -135,6 +141,13 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         //missed some flush ticks, lets catch up on a few things
         if (evt instanceof MissedFlushes) {
             updateBurstTokens(((MissedFlushes) evt).nFlushes);
+        } else if (evt instanceof TransportFeedbackEvent) {
+            final TransportFeedbackEvent feedback = (TransportFeedbackEvent) evt;
+            if (feedback.getType() == TransportFeedbackEvent.Type.ECN_CE) {
+                adaptive.onEcnCe();
+            } else if (feedback.getType() == TransportFeedbackEvent.Type.PACKET_TOO_BIG) {
+                adaptive.onPacketTooBig(feedback.getMtu(), config.getMTU());
+            }
         }
         ctx.fireUserEventTriggered(evt);
     }
@@ -169,6 +182,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         frameQueue.forEach(Frame::release);
         frameQueue.clear();
         this.queuedBytes = 0;
+        this.inFlightBytes = 0;
         pendingFrameSets.values().forEach(FrameSet::release);
         pendingFrameSets.clear();
     }
@@ -211,7 +225,8 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 final FrameSet frameSet = pendingFrameSets.remove(id);
                 if (frameSet != null) {
                     ackdBytes += frameSet.getRoughSize();
-                    adaptive.onAck(frameSet.getRoughSize(), System.nanoTime() - frameSet.getSentTime());
+                    inFlightBytes = Math.max(0, inFlightBytes - frameSet.getRoughSize());
+                    adaptive.onAck(frameSet.getRoughSize(), System.nanoTime() - frameSet.getSentTime(), inFlightBytes);
                     adjustResendGauge(1);
                     frameSet.succeed();
                     frameSet.release();
@@ -234,6 +249,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 final FrameSet frameSet = pendingFrameSets.remove(id);
                 if (frameSet != null) {
                     bytesNACKd += frameSet.getRoughSize();
+                    inFlightBytes = Math.max(0, inFlightBytes - frameSet.getRoughSize());
                     adaptive.onLoss(frameSet.getRoughSize(), false);
                     recallFrameSet(frameSet);
                 }
@@ -322,6 +338,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             final long timeout = saturatedMultiply(baseTimeout, multiplier);
             if (now - frameSet.getSentTime() > timeout) {
                 packetItr.remove();
+                inFlightBytes = Math.max(0, inFlightBytes - frameSet.getRoughSize());
                 adaptive.onLoss(frameSet.getRoughSize(), true);
                 recallFrameSet(frameSet);
                 continue;
@@ -366,6 +383,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             frameSet.setSeqId(nextSendSeqId);
             nextSendSeqId = UINT.B3.plus(nextSendSeqId, 1);
             pendingFrameSets.put(frameSet.getSeqId(), frameSet);
+            inFlightBytes += frameSet.getRoughSize();
             frameSet.touch("Added to pending FrameSet list");
             ctx.write(frameSet.retain()).addListener(RakNet.INTERNAL_WRITE_LISTENER);
             config.getMetrics().packetsOut(1);
@@ -385,7 +403,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         final int mtu = config.getMTU();
         final int maxSize = mtu - FrameSet.HEADER_SIZE - Frame.HEADER_SIZE;
         final int maxPendingFrameSets = config.getDefaultPendingFrameSets() + burstTokens;
-        int pacingBudget = adaptive.sendBudget(System.nanoTime());
+        int pacingBudget = adaptive.sendBudget(System.nanoTime(), inFlightBytes, mtu);
         while (pacingBudget-- > 0 && pendingFrameSets.size() < maxPendingFrameSets && !frameQueue.isEmpty()) {
             produceFrameSet(ctx, maxSize);
         }

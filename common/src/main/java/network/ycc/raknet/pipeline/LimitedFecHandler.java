@@ -5,6 +5,7 @@ import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.concurrent.ScheduledFuture;
 import it.unimi.dsi.fastutil.ints.Int2ObjectLinkedOpenHashMap;
 import network.ycc.raknet.RakNet;
 import network.ycc.raknet.TransportFeatures;
@@ -13,57 +14,66 @@ import network.ycc.raknet.config.DefaultCodec;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
-import java.util.List;
 import java.util.LinkedHashSet;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
-import io.netty.util.concurrent.ScheduledFuture;
 
-/** Optional one-loss XOR recovery for small FrameSets. Wire format is restricted to protocol v12+. */
+/** Negotiated bounded XOR/Reed-Solomon recovery for RakNet FrameSets. */
 public final class LimitedFecHandler extends ChannelDuplexHandler {
     public static final String NAME = "rn-limited-fec";
     public static final int ADAPTIVE_PROTOCOL_VERSION = 12;
-    private static final int FEC_PACKET_ID = 0x1e;
+    private static final int LEGACY_FEC_PACKET_ID = 0x1e;
+    private static final int RS_FEC_PACKET_ID = 0x22;
+    private static final int FEC_FEEDBACK_PACKET_ID = 0x23;
     private static final int MIN_GROUP_SIZE = 4;
-    private static final int MAX_GROUP_SIZE = 8;
-    private static final int MAX_PROTECTED_BYTES = 512;
-    private static final int MAX_CACHE = 256;
+    private static final int MAX_GROUP_SIZE = 12;
+    private static final int LEGACY_MAX_PROTECTED_BYTES = 512;
+    private static final int MAX_CACHE = 512;
 
     private final List<Entry> outbound = new ArrayList<>(MAX_GROUP_SIZE);
     private final Int2ObjectLinkedOpenHashMap<byte[]> received = new Int2ObjectLinkedOpenHashMap<>();
-    private final List<Parity> pending = new ArrayList<>();
+    private final List<LegacyParity> legacyPending = new ArrayList<>();
+    private final Int2ObjectLinkedOpenHashMap<RsGroup> rsPending = new Int2ObjectLinkedOpenHashMap<>();
     private final Set<Integer> recentGroups = new LinkedHashSet<>();
     private int groupId;
-    private int outboundGroupSize;
+    private int outboundDataShards;
+    private int outboundParityShards;
+    private long feedbackGroups;
+    private long feedbackRecovered;
     private ScheduledFuture<?> cleanupTask;
 
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) {
-        cleanupTask = ctx.executor().scheduleAtFixedRate(
-                () -> tryRecover(ctx), 1, 1, TimeUnit.SECONDS);
+        cleanupTask = ctx.executor().scheduleAtFixedRate(() -> tryRecover(ctx), 1, 1, TimeUnit.SECONDS);
     }
 
     @Override
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
         if (!enabled(ctx) || !fecUseful(ctx) || !(msg instanceof ByteBuf)) {
-            outbound.clear();
-            outboundGroupSize = 0;
+            resetOutbound();
             ctx.write(msg, promise);
             return;
         }
-        final int groupSize = fecGroupSize(ctx);
-        if (outboundGroupSize != 0 && outboundGroupSize != groupSize) outbound.clear();
-        outboundGroupSize = groupSize;
+        final boolean reedSolomon = reedSolomonEnabled(ctx);
+        final AdaptiveTransportController.FecParameters parameters = fecParameters(ctx, reedSolomon);
+        if (outboundDataShards != 0 && (outboundDataShards != parameters.dataShards
+                || outboundParityShards != parameters.parityShards)) outbound.clear();
+        outboundDataShards = parameters.dataShards;
+        outboundParityShards = parameters.parityShards;
+
         final ByteBuf buf = (ByteBuf) msg;
-        if (isFrameSet(buf) && buf.readableBytes() <= MAX_PROTECTED_BYTES) {
+        final int payloadLimit = reedSolomon
+                ? Math.max(256, RakNet.config(ctx).getMTU() - (12 + parameters.dataShards * 5))
+                : LEGACY_MAX_PROTECTED_BYTES;
+        if (isFrameSet(buf) && buf.readableBytes() <= payloadLimit) {
             final byte[] bytes = copy(buf);
             outbound.add(new Entry(buf.getUnsignedMediumLE(buf.readerIndex() + 1), bytes.length, bytes));
         }
         ctx.write(msg, promise);
-        if (outbound.size() == groupSize) {
-            final ByteBuf parity = createParity(ctx);
-            RakNet.config(ctx).getMetrics().fecParity(groupSize, parity.readableBytes());
-            ctx.write(parity, ctx.voidPromise());
+        if (outbound.size() == parameters.dataShards) {
+            if (reedSolomon) writeReedSolomonParity(ctx, parameters.parityShards);
+            else writeLegacyParity(ctx);
             outbound.clear();
         }
     }
@@ -75,28 +85,45 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
             return;
         }
         final ByteBuf buf = (ByteBuf) msg;
+        final int id = buf.isReadable() ? buf.getUnsignedByte(buf.readerIndex()) : -1;
         if (!enabled(ctx)) {
-            // Drop FEC datagrams when the feature is not negotiated,
-            // otherwise RawPacketCodec throws on unknown packet ID 0x1e.
-            if (buf.isReadable() && buf.getUnsignedByte(buf.readerIndex()) == FEC_PACKET_ID) {
+            if (id == LEGACY_FEC_PACKET_ID || id == RS_FEC_PACKET_ID || id == FEC_FEEDBACK_PACKET_ID) {
                 ReferenceCountUtil.release(msg);
                 return;
             }
             ctx.fireChannelRead(msg);
             return;
         }
-        if (buf.isReadable() && buf.getUnsignedByte(buf.readerIndex()) == FEC_PACKET_ID) {
+        if (id == FEC_FEEDBACK_PACKET_ID) {
             try {
-                final Parity parity = readParity(buf);
-                if (recentGroups.add(parity.id)) pending.add(parity);
-                while (recentGroups.size() > 128) {
-                    final Iterator<Integer> groups = recentGroups.iterator();
-                    groups.next();
-                    groups.remove();
+                buf.skipBytes(1);
+                buf.readInt(); // group id, reserved for future per-group accounting
+                final int recovered = buf.readUnsignedByte();
+                if (buf.isReadable()) throw new IllegalArgumentException("trailing FEC feedback bytes");
+                feedbackGroups++;
+                feedbackRecovered += recovered;
+                if (feedbackGroups >= 128) {
+                    feedbackGroups /= 2;
+                    feedbackRecovered /= 2;
+                }
+            } catch (RuntimeException ignored) {
+                // Untrusted extension packet.
+            } finally {
+                ReferenceCountUtil.release(msg);
+            }
+            return;
+        }
+        if (id == LEGACY_FEC_PACKET_ID || id == RS_FEC_PACKET_ID) {
+            try {
+                if (id == LEGACY_FEC_PACKET_ID) {
+                    final LegacyParity parity = readLegacyParity(buf);
+                    if (!recentGroups.contains(parity.id)) legacyPending.add(parity);
+                } else if (reedSolomonEnabled(ctx)) {
+                    mergeReedSolomonParity(readReedSolomonParity(buf));
                 }
                 tryRecover(ctx);
-            } catch (Exception ignored) {
-                // Malformed FEC packet from wire; drop silently.
+            } catch (RuntimeException ignored) {
+                // Malformed or inconsistent FEC packet from wire.
             } finally {
                 ReferenceCountUtil.release(msg);
             }
@@ -114,10 +141,147 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
     public void handlerRemoved(ChannelHandlerContext ctx) {
         if (cleanupTask != null) cleanupTask.cancel(false);
         cleanupTask = null;
-        outbound.clear();
+        resetOutbound();
         received.clear();
-        pending.clear();
+        legacyPending.clear();
+        rsPending.clear();
         recentGroups.clear();
+    }
+
+    private void writeLegacyParity(ChannelHandlerContext ctx) {
+        final List<byte[]> packets = outboundData();
+        final byte[] parity = xor(packets);
+        final ByteBuf out = ctx.alloc().ioBuffer(8 + outbound.size() * 5 + parity.length);
+        out.writeByte(LEGACY_FEC_PACKET_ID).writeInt(groupId++).writeByte(outbound.size());
+        writeEntries(out);
+        out.writeShort(parity.length).writeBytes(parity);
+        RakNet.config(ctx).getMetrics().fecParity(1, out.readableBytes());
+        ctx.write(out, ctx.voidPromise());
+    }
+
+    private void writeReedSolomonParity(ChannelHandlerContext ctx, int parityShards) {
+        final int id = groupId++;
+        final byte[][] parity = ReedSolomonCodec.encode(outboundData(), parityShards);
+        int bytes = 0;
+        for (int p = 0; p < parity.length; p++) {
+            final ByteBuf out = ctx.alloc().ioBuffer(10 + outbound.size() * 5 + parity[p].length);
+            out.writeByte(RS_FEC_PACKET_ID).writeInt(id).writeByte(outbound.size())
+                    .writeByte(parity.length).writeByte(p);
+            writeEntries(out);
+            out.writeShort(parity[p].length).writeBytes(parity[p]);
+            bytes += out.readableBytes();
+            ctx.write(out, ctx.voidPromise());
+        }
+        RakNet.config(ctx).getMetrics().fecParity(parity.length, bytes);
+        final double recoveryRatio = feedbackGroups == 0 ? 0D : feedbackRecovered / (double) feedbackGroups;
+        RakNet.config(ctx).getMetrics().fecBudget(outbound.size(), parity.length, recoveryRatio);
+    }
+
+    private void writeEntries(ByteBuf out) {
+        for (Entry entry : outbound) out.writeMediumLE(entry.seq).writeShort(entry.length);
+    }
+
+    private List<byte[]> outboundData() {
+        final List<byte[]> packets = new ArrayList<>(outbound.size());
+        for (Entry entry : outbound) packets.add(entry.data);
+        return packets;
+    }
+
+    private void mergeReedSolomonParity(RsParity shard) {
+        if (recentGroups.contains(shard.id)) return;
+        RsGroup group = rsPending.get(shard.id);
+        if (group == null) {
+            group = new RsGroup(shard.id, shard.entries, new byte[shard.parityCount][], shard.createdAt);
+            rsPending.put(shard.id, group);
+        } else if (!sameEntries(group.entries, shard.entries) || group.parity.length != shard.parityCount) {
+            throw new IllegalArgumentException("inconsistent Reed-Solomon group");
+        }
+        if (group.parity[shard.parityIndex] == null) group.parity[shard.parityIndex] = shard.parity;
+        while (rsPending.size() > 64) rsPending.removeFirst();
+    }
+
+    private void tryRecover(ChannelHandlerContext ctx) {
+        final long now = System.nanoTime();
+        final Iterator<LegacyParity> legacy = legacyPending.iterator();
+        while (legacy.hasNext()) {
+            final LegacyParity group = legacy.next();
+            if (expired(ctx, group.createdAt)) { legacy.remove(); continue; }
+            Entry missing = null;
+            int missingCount = 0;
+            final byte[] data = Arrays.copyOf(group.parity, group.parity.length);
+            for (Entry entry : group.entries) {
+                final byte[] value = received.get(entry.seq);
+                if (value == null) { missing = entry; missingCount++; }
+                else xorInto(data, value);
+            }
+            if (missingCount == 0) {
+                legacy.remove(); rememberGroup(group.id);
+            } else if (missingCount == 1) {
+                final byte[] recovered = Arrays.copyOf(data, missing.length);
+                deliverRecovered(ctx, missing.seq, recovered);
+                legacy.remove(); rememberGroup(group.id);
+            }
+        }
+
+        final Iterator<RsGroup> rs = rsPending.values().iterator();
+        while (rs.hasNext()) {
+            final RsGroup group = rs.next();
+            if (expired(ctx, group.createdAt)) { rs.remove(); rememberGroup(group.id); continue; }
+            final byte[][] data = new byte[group.entries.length][];
+            final int[] lengths = new int[group.entries.length];
+            int missing = 0;
+            for (int i = 0; i < group.entries.length; i++) {
+                data[i] = received.get(group.entries[i].seq);
+                lengths[i] = group.entries[i].length;
+                if (data[i] == null) missing++;
+            }
+            if (missing == 0) {
+                sendFeedback(ctx, group.id, 0);
+                rs.remove(); rememberGroup(group.id);
+                continue;
+            }
+            if (available(group.parity) < missing) continue;
+            final byte[][] recovered = ReedSolomonCodec.recover(data, lengths, group.parity);
+            if (recovered == null) continue;
+            for (int i = 0, r = 0; i < data.length; i++) {
+                if (data[i] == null) deliverRecovered(ctx, group.entries[i].seq, recovered[r++]);
+            }
+            sendFeedback(ctx, group.id, missing);
+            rs.remove(); rememberGroup(group.id);
+        }
+    }
+
+    private boolean expired(ChannelHandlerContext ctx, long createdAt) {
+        if (System.nanoTime() - createdAt <= TimeUnit.SECONDS.toNanos(5)) return false;
+        RakNet.config(ctx).getMetrics().fecExpired(1);
+        return true;
+    }
+
+    private void deliverRecovered(ChannelHandlerContext ctx, int seq, byte[] recovered) {
+        received.put(seq, recovered);
+        RakNet.config(ctx).getMetrics().fecRecovered(1);
+        ctx.fireChannelRead(ctx.alloc().ioBuffer(recovered.length).writeBytes(recovered));
+    }
+
+    private void sendFeedback(ChannelHandlerContext ctx, int id, int recovered) {
+        final ByteBuf feedback = ctx.alloc().ioBuffer(6, 6);
+        feedback.writeByte(FEC_FEEDBACK_PACKET_ID).writeInt(id).writeByte(recovered);
+        ctx.writeAndFlush(feedback, ctx.voidPromise());
+    }
+
+    private AdaptiveTransportController.FecParameters fecParameters(ChannelHandlerContext ctx, boolean rs) {
+        final ReliabilityHandler reliability = ctx.pipeline().get(ReliabilityHandler.class);
+        if (!rs || reliability == null) return new AdaptiveTransportController.FecParameters(fecGroupSize(ctx), 1, 0.20D);
+        final AdaptiveTransportController.FecParameters base = reliability.adaptiveController().fecParameters();
+        if (feedbackGroups >= 16 && feedbackRecovered == 0 && base.parityShards == 1) {
+            return new AdaptiveTransportController.FecParameters(Math.min(MAX_GROUP_SIZE, base.dataShards + 2), 1, base.overheadBudget);
+        }
+        final double benefit = feedbackGroups == 0 ? 0D : feedbackRecovered / (double) feedbackGroups;
+        if (feedbackGroups >= 16 && benefit > 0.15D && base.parityShards < 2
+                && 2D / (base.dataShards + 2D) <= 0.20D) {
+            return new AdaptiveTransportController.FecParameters(base.dataShards, 2, 0.20D);
+        }
+        return base;
     }
 
     private boolean enabled(ChannelHandlerContext ctx) {
@@ -127,82 +291,9 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
                 && features != null && (features & TransportFeatures.FEC) != 0;
     }
 
-    private static boolean isFrameSet(ByteBuf buf) {
-        if (buf.readableBytes() < 4) return false;
-        final int id = buf.getUnsignedByte(buf.readerIndex());
-        return id >= DefaultCodec.FRAME_DATA_START && id <= DefaultCodec.FRAME_DATA_END;
-    }
-
-    private ByteBuf createParity(ChannelHandlerContext ctx) {
-        final List<byte[]> packets = new ArrayList<>(outbound.size());
-        for (Entry entry : outbound) packets.add(entry.data);
-        final byte[] parity = xor(packets);
-        final int max = parity.length;
-        final ByteBuf out = ctx.alloc().ioBuffer(8 + outbound.size() * 5 + max);
-        out.writeByte(FEC_PACKET_ID).writeInt(groupId++).writeByte(outbound.size());
-        for (Entry entry : outbound) out.writeMediumLE(entry.seq).writeShort(entry.length);
-        out.writeShort(max).writeBytes(parity);
-        return out;
-    }
-
-    private static Parity readParity(ByteBuf in) {
-        in.skipBytes(1);
-        final int id = in.readInt();
-        final int count = in.readUnsignedByte();
-        if (count < MIN_GROUP_SIZE || count > MAX_GROUP_SIZE) {
-            throw new IllegalArgumentException("Invalid FEC group size");
-        }
-        final Entry[] entries = new Entry[count];
-        final java.util.HashSet<Integer> sequences = new java.util.HashSet<>();
-        for (int i = 0; i < count; i++) {
-            final int seq = in.readUnsignedMediumLE();
-            final int length = in.readUnsignedShort();
-            if (length < 4 || length > MAX_PROTECTED_BYTES || !sequences.add(seq)) {
-                throw new IllegalArgumentException("Invalid FEC entry");
-            }
-            entries[i] = new Entry(seq, length, null);
-        }
-        final int size = in.readUnsignedShort();
-        if (size > MAX_PROTECTED_BYTES || in.readableBytes() != size) throw new IllegalArgumentException("Invalid FEC parity size");
-        for (Entry entry : entries) if (entry.length > size) throw new IllegalArgumentException("FEC entry exceeds parity");
-        final byte[] parity = new byte[size];
-        in.readBytes(parity);
-        return new Parity(id, entries, parity, System.nanoTime());
-    }
-
-    private void tryRecover(ChannelHandlerContext ctx) {
-        final Iterator<Parity> iterator = pending.iterator();
-        while (iterator.hasNext()) {
-            final Parity group = iterator.next();
-            if (System.nanoTime() - group.createdAt > TimeUnit.SECONDS.toNanos(5)) {
-                RakNet.config(ctx).getMetrics().fecExpired(1);
-                iterator.remove();
-                continue;
-            }
-            Entry missing = null;
-            int missingCount = 0;
-            final byte[] data = Arrays.copyOf(group.parity, group.parity.length);
-            for (Entry entry : group.entries) {
-                final byte[] value = received.get(entry.seq);
-                if (value == null) {
-                    missing = entry;
-                    missingCount++;
-                } else {
-                    final int len = Math.min(value.length, data.length);
-                    for (int i = 0; i < len; i++) data[i] ^= value[i];
-                }
-            }
-            if (missingCount == 0) {
-                iterator.remove();
-            } else if (missingCount == 1) {
-                final byte[] recovered = Arrays.copyOf(data, missing.length);
-                received.put(missing.seq, recovered);
-                iterator.remove();
-                RakNet.config(ctx).getMetrics().fecRecovered(1);
-                ctx.fireChannelRead(ctx.alloc().ioBuffer(recovered.length).writeBytes(recovered));
-            }
-        }
-        while (pending.size() > 64) pending.remove(0);
+    private boolean reedSolomonEnabled(ChannelHandlerContext ctx) {
+        final Long features = ctx.channel().attr(RakNet.TRANSPORT_FEATURES).get();
+        return features != null && (features & TransportFeatures.REED_SOLOMON_FEC) != 0;
     }
 
     private boolean fecUseful(ChannelHandlerContext ctx) {
@@ -217,33 +308,81 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
         return reliability == null ? MIN_GROUP_SIZE : reliability.adaptiveController().fecGroupSize();
     }
 
-    /** Lower loss uses larger groups to cap overhead; higher random loss uses
-     * smaller groups so one loss is more likely to remain recoverable. */
     static int selectGroupSize(double lossRatio) {
         if (lossRatio < 0.03D) return 8;
         if (lossRatio < 0.06D) return 6;
         return 4;
     }
 
-    private static byte[] copy(ByteBuf buf) {
-        final byte[] out = new byte[buf.readableBytes()];
-        buf.getBytes(buf.readerIndex(), out);
-        return out;
+    private static boolean isFrameSet(ByteBuf buf) {
+        if (buf.readableBytes() < 4) return false;
+        final int id = buf.getUnsignedByte(buf.readerIndex());
+        return id >= DefaultCodec.FRAME_DATA_START && id <= DefaultCodec.FRAME_DATA_END;
     }
 
+    private static LegacyParity readLegacyParity(ByteBuf in) {
+        in.skipBytes(1);
+        final int id = in.readInt();
+        final Entry[] entries = readEntries(in, in.readUnsignedByte(), LEGACY_MAX_PROTECTED_BYTES);
+        final int size = in.readUnsignedShort();
+        if (size > LEGACY_MAX_PROTECTED_BYTES || in.readableBytes() != size) throw new IllegalArgumentException("invalid XOR parity size");
+        final byte[] parity = new byte[size]; in.readBytes(parity);
+        return new LegacyParity(id, entries, parity, System.nanoTime());
+    }
+
+    private static RsParity readReedSolomonParity(ByteBuf in) {
+        in.skipBytes(1);
+        final int id = in.readInt();
+        final int dataCount = in.readUnsignedByte();
+        final int parityCount = in.readUnsignedByte();
+        final int parityIndex = in.readUnsignedByte();
+        if (parityCount < 1 || parityCount > 2 || parityIndex >= parityCount) throw new IllegalArgumentException("invalid parity shard");
+        final Entry[] entries = readEntries(in, dataCount, 65_507);
+        final int size = in.readUnsignedShort();
+        if (size > 65_507 || in.readableBytes() != size) throw new IllegalArgumentException("invalid Reed-Solomon parity size");
+        for (Entry entry : entries) if (entry.length > size) throw new IllegalArgumentException("FEC entry exceeds parity");
+        final byte[] parity = new byte[size]; in.readBytes(parity);
+        return new RsParity(id, entries, parityCount, parityIndex, parity, System.nanoTime());
+    }
+
+    private static Entry[] readEntries(ByteBuf in, int count, int maximumLength) {
+        if (count < MIN_GROUP_SIZE || count > MAX_GROUP_SIZE) throw new IllegalArgumentException("invalid FEC group size");
+        final Entry[] entries = new Entry[count];
+        final java.util.HashSet<Integer> sequences = new java.util.HashSet<>();
+        for (int i = 0; i < count; i++) {
+            final int seq = in.readUnsignedMediumLE();
+            final int length = in.readUnsignedShort();
+            if (length < 4 || length > maximumLength || !sequences.add(seq)) throw new IllegalArgumentException("invalid FEC entry");
+            entries[i] = new Entry(seq, length, null);
+        }
+        return entries;
+    }
+
+    private void rememberGroup(int id) {
+        recentGroups.add(id);
+        while (recentGroups.size() > 256) {
+            final Iterator<Integer> iterator = recentGroups.iterator(); iterator.next(); iterator.remove();
+        }
+    }
+
+    private void resetOutbound() { outbound.clear(); outboundDataShards = outboundParityShards = 0; }
+    private static int available(byte[][] values) { int n = 0; for (byte[] value : values) if (value != null) n++; return n; }
+    private static void xorInto(byte[] target, byte[] value) { for (int i = 0; i < Math.min(target.length, value.length); i++) target[i] ^= value[i]; }
+    private static boolean sameEntries(Entry[] a, Entry[] b) {
+        if (a.length != b.length) return false;
+        for (int i = 0; i < a.length; i++) if (a[i].seq != b[i].seq || a[i].length != b[i].length) return false;
+        return true;
+    }
+    private static byte[] copy(ByteBuf buf) { final byte[] out = new byte[buf.readableBytes()]; buf.getBytes(buf.readerIndex(), out); return out; }
+
     static byte[] xor(List<byte[]> packets) {
-        int max = 0;
-        for (byte[] packet : packets) max = Math.max(max, packet.length);
-        final byte[] parity = new byte[max];
-        for (byte[] packet : packets) for (int i = 0; i < packet.length; i++) parity[i] ^= packet[i];
-        return parity;
+        int max = 0; for (byte[] packet : packets) max = Math.max(max, packet.length);
+        final byte[] parity = new byte[max]; for (byte[] packet : packets) xorInto(parity, packet); return parity;
     }
 
     static byte[] recover(byte[] parity, List<byte[]> present, int missingLength) {
         final byte[] recovered = Arrays.copyOf(parity, missingLength);
-        for (byte[] packet : present) {
-            for (int i = 0; i < Math.min(packet.length, recovered.length); i++) recovered[i] ^= packet[i];
-        }
+        for (byte[] packet : present) xorInto(recovered, packet);
         return recovered;
     }
 
@@ -251,10 +390,18 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
         final int seq, length; final byte[] data;
         Entry(int seq, int length, byte[] data) { this.seq = seq; this.length = length; this.data = data; }
     }
-    private static final class Parity {
+    private static final class LegacyParity {
         final int id; final Entry[] entries; final byte[] parity; final long createdAt;
-        Parity(int id, Entry[] entries, byte[] parity, long createdAt) {
-            this.id = id; this.entries = entries; this.parity = parity; this.createdAt = createdAt;
+        LegacyParity(int id, Entry[] entries, byte[] parity, long createdAt) { this.id = id; this.entries = entries; this.parity = parity; this.createdAt = createdAt; }
+    }
+    private static final class RsParity {
+        final int id; final Entry[] entries; final int parityCount, parityIndex; final byte[] parity; final long createdAt;
+        RsParity(int id, Entry[] entries, int parityCount, int parityIndex, byte[] parity, long createdAt) {
+            this.id = id; this.entries = entries; this.parityCount = parityCount; this.parityIndex = parityIndex; this.parity = parity; this.createdAt = createdAt;
         }
+    }
+    private static final class RsGroup {
+        final int id; final Entry[] entries; final byte[][] parity; final long createdAt;
+        RsGroup(int id, Entry[] entries, byte[][] parity, long createdAt) { this.id = id; this.entries = entries; this.parity = parity; this.createdAt = createdAt; }
     }
 }

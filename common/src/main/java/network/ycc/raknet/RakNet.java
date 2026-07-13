@@ -48,13 +48,33 @@ public class RakNet {
     public static final ChannelOption<Integer> ADAPTIVE_MIN_PPS = ChannelOption.valueOf("RN_ADAPTIVE_MIN_PPS");
     public static final ChannelOption<Integer> ADAPTIVE_MAX_PPS = ChannelOption.valueOf("RN_ADAPTIVE_MAX_PPS");
     public static final ChannelOption<Integer> SMALL_WRITE_COALESCE_MICROS = ChannelOption.valueOf("RN_SMALL_WRITE_COALESCE_MICROS");
+    public static final ChannelOption<Integer> PLPMTUD_MAX_MTU = ChannelOption.valueOf("RN_PLPMTUD_MAX_MTU");
 
     public static final ChannelFutureListener INTERNAL_WRITE_LISTENER = future -> {
         if (!future.isSuccess() && !(future.cause() instanceof ClosedChannelException)) {
+            if (isMessageTooLong(future.cause()) && future.channel().config() instanceof Config) {
+                final Config config = (Config) future.channel().config();
+                final int reducedMtu = Math.max(576, config.getMTU() - 32);
+                future.channel().pipeline().fireUserEventTriggered(
+                        TransportFeedbackEvent.packetTooBig(reducedMtu));
+                return;
+            }
             future.channel().pipeline().fireExceptionCaught(future.cause());
             future.channel().close();
         }
     };
+
+    public static boolean isMessageTooLong(Throwable cause) {
+        for (Throwable current = cause; current != null; current = current.getCause()) {
+            final String message = current.getMessage();
+            if (message != null) {
+                final String lower = message.toLowerCase(java.util.Locale.ROOT);
+                if (lower.contains("message too long") || lower.contains("datagram too large")
+                        || lower.contains("emsgsize")) return true;
+            }
+        }
+        return false;
+    }
 
     public static Config config(ChannelHandlerContext ctx) {
         return config(ctx.channel());
@@ -95,11 +115,16 @@ public class RakNet {
         default void fecRecovered(int delta) {}
         default void fecParity(int packets, int bytes) {}
         default void fecExpired(int delta) {}
+        default void fecBudget(int dataShards, int parityShards, double recoveryRatio) {}
         default void pathMtuProbe(boolean acknowledged, int mtu) {}
         default void pathMtuProbeResult(String result, int mtu) {}
         default void adaptiveDscp(int ipTos) {}
         default void smallWriteBatch(int frames, long delayNanos) {}
         default void pacingDelay(long delayNanos) {}
+        default void congestionControl(String mode, long congestionWindowBytes, long inFlightBytes,
+                                       long bandwidthBytesPerSecond, long ackAggregationBytes,
+                                       double ecnCeRatio) {}
+        default void pathMtuState(String state, int confirmedMtu, int probeMtu, int maximumMtu) {}
 
         default void currentQueuedBytes(int bytes) {}
     }
@@ -182,6 +207,8 @@ public class RakNet {
         default void setAdaptiveMaxPps(int value) {}
         default int getSmallWriteCoalesceMicros() { return 250; }
         default void setSmallWriteCoalesceMicros(int value) {}
+        default int getPlpmtudMaxMtu() { return 1500; }
+        default void setPlpmtudMaxMtu(int value) {}
     }
 
     public interface Codec {

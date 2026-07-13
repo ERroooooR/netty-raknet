@@ -40,7 +40,7 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
     private volatile RakNet.Codec codec = DefaultCodec.INSTANCE;
     private volatile int[] protocolVersions = new int[]{9, 10, 11, 12};
     private volatile int maxConnections = 2048;
-    private volatile int protocolVersion = 11;
+    private volatile int protocolVersion = 12;
     private volatile boolean ignoreResendGauge = false;
     private volatile boolean NACKEnabled = false;
     private volatile boolean noDelay = false;
@@ -49,6 +49,7 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
     private volatile int adaptiveMinPps = 50;
     private volatile int adaptiveMaxPps = 2000;
     private volatile int smallWriteCoalesceMicros = 250;
+    private volatile int plpmtudMaxMtu = 1500;
 
     public DefaultConfig(Channel channel) {
         super(channel);
@@ -63,7 +64,8 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
                 RakNet.SERVER_ID, RakNet.CLIENT_ID, RakNet.METRICS, RakNet.MTU,
                 RakNet.RTT, RakNet.PROTOCOL_VERSION, RakNet.MAGIC, RakNet.RETRY_DELAY_NANOS,
                 RakNet.ADAPTIVE_TRANSPORT, RakNet.ADAPTIVE_DSCP, RakNet.ADAPTIVE_MIN_PPS,
-                RakNet.ADAPTIVE_MAX_PPS, RakNet.SMALL_WRITE_COALESCE_MICROS);
+                RakNet.ADAPTIVE_MAX_PPS, RakNet.SMALL_WRITE_COALESCE_MICROS,
+                RakNet.PLPMTUD_MAX_MTU);
     }
 
     @Override
@@ -97,6 +99,8 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
             return (T) (Integer) adaptiveMaxPps;
         } else if (option == RakNet.SMALL_WRITE_COALESCE_MICROS) {
             return (T) (Integer) smallWriteCoalesceMicros;
+        } else if (option == RakNet.PLPMTUD_MAX_MTU) {
+            return (T) (Integer) plpmtudMaxMtu;
         }
         return super.getOption(option);
     }
@@ -132,6 +136,8 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
             setAdaptiveMaxPps((Integer) value);
         } else if (option == RakNet.SMALL_WRITE_COALESCE_MICROS) {
             setSmallWriteCoalesceMicros((Integer) value);
+        } else if (option == RakNet.PLPMTUD_MAX_MTU) {
+            setPlpmtudMaxMtu((Integer) value);
         } else {
             return super.setOption(option, value);
         }
@@ -350,5 +356,14 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
     public void setSmallWriteCoalesceMicros(int value) {
         if (value < 0 || value > 100_000) throw new IllegalArgumentException("small-write coalescing must be 0..100000 microseconds");
         smallWriteCoalesceMicros = value;
+    }
+
+    @Override
+    public int getPlpmtudMaxMtu() { return plpmtudMaxMtu; }
+
+    @Override
+    public void setPlpmtudMaxMtu(int value) {
+        if (value < 576 || value > 65_507) throw new IllegalArgumentException("PLPMTUD maximum MTU must be 576..65507");
+        plpmtudMaxMtu = value;
     }
 }

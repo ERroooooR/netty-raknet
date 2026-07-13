@@ -5,13 +5,14 @@ import io.netty.channel.ChannelDuplexHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.ScheduledFuture;
+import io.netty.channel.ChannelFuture;
 import network.ycc.raknet.RakNet;
 import network.ycc.raknet.TransportFeatures;
 
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 
-/** RFC 4821-style positive path-MTU probing for the negotiated v12 extension. */
+/** RFC 8899-style positive path-MTU probing for the negotiated v12 extension. */
 public final class PathMtuDiscoveryHandler extends ChannelDuplexHandler {
     public static final String NAME = "rn-plpmtud";
     private static final int PROBE_ID = 0x20;
@@ -82,7 +83,22 @@ public final class PathMtuDiscoveryHandler extends ChannelDuplexHandler {
         final ByteBuf probe = ctx.alloc().ioBuffer(candidate, candidate);
         probe.writeByte(PROBE_ID).writeLong(pendingToken).writeShort(candidate);
         probe.writeZero(candidate - probe.readableBytes());
-        ctx.writeAndFlush(probe);
+        reliability.adaptiveController().onProbeSent(candidate);
+        final ChannelFuture write = ctx.writeAndFlush(probe);
+        write.addListener(future -> {
+            if (!future.isSuccess()) {
+                if (RakNet.isMessageTooLong(future.cause())) {
+                    reliability.adaptiveController().onLocalMessageTooLong(candidate);
+                } else {
+                    ctx.fireExceptionCaught(future.cause());
+                    ctx.close();
+                }
+                pendingToken = 0;
+                pendingMtu = 0;
+                if (probeTimeout != null) probeTimeout.cancel(false);
+                probeTimeout = null;
+            }
+        });
         RakNet.config(ctx).getMetrics().pathMtuProbe(false, candidate);
         RakNet.config(ctx).getMetrics().pathMtuProbeResult("sent", candidate);
         probeTimeout = ctx.executor().schedule(() -> {
@@ -90,6 +106,9 @@ public final class PathMtuDiscoveryHandler extends ChannelDuplexHandler {
                 reliability.adaptiveController().onProbeTimeout(candidate);
                 pendingToken = 0;
                 pendingMtu = 0;
+                if (reliability.adaptiveController().shouldRetryProbe()) {
+                    ctx.executor().schedule(() -> probe(ctx), 100, TimeUnit.MILLISECONDS);
+                }
             }
             probeTimeout = null;
         }, 5, TimeUnit.SECONDS);
