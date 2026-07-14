@@ -6,6 +6,9 @@ import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.CodecException;
 import io.netty.handler.codec.CorruptedFrameException;
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.concurrent.ScheduledFuture;
+import it.unimi.dsi.fastutil.ints.Int2LongMap;
+import it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap;
 import it.unimi.dsi.fastutil.ints.Int2ObjectLinkedOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntRBTreeSet;
 import it.unimi.dsi.fastutil.ints.IntSortedSet;
@@ -21,6 +24,7 @@ import network.ycc.raknet.utils.UINT;
 
 import java.util.PriorityQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.function.IntConsumer;
 
 /**
  * This handler handles the bulk of reliable (framed) transport.
@@ -34,6 +38,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected final PriorityQueue<Frame> frameQueue = new PriorityQueue<>(Frame.COMPARATOR);
     protected final Int2ObjectLinkedOpenHashMap<FrameSet> pendingFrameSets = new Int2ObjectLinkedOpenHashMap<>();
     protected final ReliableReceiveWindow reliableReceiveWindow = new ReliableReceiveWindow();
+    protected final DeferredNackTracker deferredNacks = new DeferredNackTracker();
 
     protected int queuedBytes = 0;
     protected long inFlightBytes = 0;
@@ -49,10 +54,13 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected boolean coalesceScheduled;
     protected int coalescedFrames;
     protected long coalesceStartedNanos;
+    protected ScheduledFuture<?> deferredNackFuture;
 
     // Item 3: track when first ACK was queued for time-based flush
     protected long firstAckNanos = 0;
     private static final long ACK_FLUSH_DELAY_NANOS = 2_000_000; // 2ms
+    private static final long MIN_NACK_REORDER_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(3);
+    private static final long MAX_NACK_REORDER_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(12);
     // Item 7: guard against recursive flush from recallFrameSet
     protected boolean flushing = false;
 
@@ -76,6 +84,9 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) {
+        if (deferredNackFuture != null) deferredNackFuture.cancel(false);
+        deferredNackFuture = null;
+        deferredNacks.clear();
         clearQueue(null);
     }
 
@@ -200,13 +211,18 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             }, ACK_FLUSH_DELAY_NANOS + 500_000L, TimeUnit.NANOSECONDS);
         }
         ackSet.add(packetSeqId);
-        if (config.isNACKEnabled())
+        if (config.isNACKEnabled()) {
             nackSet.remove(packetSeqId);
+            if (deferredNacks.cancel(packetSeqId)) {
+                config.getMetrics().reorderedPacket(1);
+            }
+        }
         if (UINT.B3.minusWrap(packetSeqId, lastReceivedSeqId) > 0) {
             lastReceivedSeqId = UINT.B3.plus(lastReceivedSeqId, 1);
             while (lastReceivedSeqId != packetSeqId) { //nack any missed packets before this one
-                if (config.isNACKEnabled())
-                    nackSet.add(lastReceivedSeqId); //add missing packets to nack set
+                if (config.isNACKEnabled()) {
+                    deferNack(ctx, lastReceivedSeqId);
+                }
                 lastReceivedSeqId = UINT.B3.plus(lastReceivedSeqId, 1);
             }
         }
@@ -270,6 +286,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             }
         }
         config.getMetrics().bytesNACKd(bytesNACKd);
+        config.getMetrics().nackRetransmit(bytesNACKd);
     }
 
     protected void queueFrame(Frame frame) {
@@ -350,6 +367,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 packetItr.remove();
                 inFlightBytes = Math.max(0, inFlightBytes - frameSet.getRoughSize());
                 adaptive.onLoss(frameSet.getRoughSize(), true);
+                config.getMetrics().timeoutRetransmit(frameSet.getRoughSize());
                 recallFrameSet(frameSet);
                 continue;
             }
@@ -381,6 +399,71 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         final long roundTripFloor = saturatedAdd(saturatedMultiply(rtt, 2), delay);
         final long base = Math.max(jitterTimeout, roundTripFloor);
         return saturatedMultiply(base, 1L << Math.min(Math.max(0, retryCount), 3));
+    }
+
+    static long nackReorderDelayNanos(long rttNanos) {
+        final long candidate = Math.max(0L, rttNanos) / 8L;
+        return Math.max(MIN_NACK_REORDER_DELAY_NANOS,
+                Math.min(MAX_NACK_REORDER_DELAY_NANOS, candidate));
+    }
+
+    private void deferNack(ChannelHandlerContext ctx, int sequenceId) {
+        final long now = System.nanoTime();
+        final long delay = nackReorderDelayNanos(config.getRTTNanos());
+        if (deferredNacks.defer(sequenceId, now + delay)) {
+            config.getMetrics().nackDeferred(1);
+        }
+        scheduleDeferredNacks(ctx, delay);
+    }
+
+    private void scheduleDeferredNacks(ChannelHandlerContext ctx, long delayNanos) {
+        if (deferredNackFuture != null) return;
+        deferredNackFuture = ctx.executor().schedule(() -> flushDeferredNacks(ctx),
+                Math.max(0L, delayNanos), TimeUnit.NANOSECONDS);
+    }
+
+    private void flushDeferredNacks(ChannelHandlerContext ctx) {
+        deferredNackFuture = null;
+        if (!ctx.channel().isOpen()) return;
+        final long nextDelay = deferredNacks.drainDue(System.nanoTime(), id -> nackSet.add(id));
+        if (!nackSet.isEmpty() && config.isAutoRead()) {
+            sendResponses(ctx);
+            ctx.flush();
+        }
+        if (nextDelay >= 0L) scheduleDeferredNacks(ctx, nextDelay);
+    }
+
+    static final class DeferredNackTracker {
+        private final Int2LongOpenHashMap deadlines = new Int2LongOpenHashMap();
+
+        boolean defer(int sequenceId, long deadlineNanos) {
+            if (deadlines.containsKey(sequenceId)) return false;
+            deadlines.put(sequenceId, deadlineNanos);
+            return true;
+        }
+
+        boolean cancel(int sequenceId) {
+            return deadlines.remove(sequenceId) != 0L;
+        }
+
+        long drainDue(long nowNanos, IntConsumer consumer) {
+            long nextDeadline = Long.MAX_VALUE;
+            final ObjectIterator<Int2LongMap.Entry> iterator = deadlines.int2LongEntrySet().fastIterator();
+            while (iterator.hasNext()) {
+                final Int2LongMap.Entry entry = iterator.next();
+                if (entry.getLongValue() <= nowNanos) {
+                    consumer.accept(entry.getIntKey());
+                    iterator.remove();
+                } else {
+                    nextDeadline = Math.min(nextDeadline, entry.getLongValue());
+                }
+            }
+            return nextDeadline == Long.MAX_VALUE ? -1L : Math.max(0L, nextDeadline - nowNanos);
+        }
+
+        void clear() {
+            deadlines.clear();
+        }
     }
 
     protected void produceFrameSet(ChannelHandlerContext ctx, int maxSize) {

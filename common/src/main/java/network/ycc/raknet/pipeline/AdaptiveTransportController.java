@@ -26,7 +26,10 @@ final class AdaptiveTransportController {
     private static final long PROBE_RTT_NANOS = TimeUnit.MILLISECONDS.toNanos(200);
     private static final long MIN_CONGESTION_RESPONSE_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(250);
     private static final long MIN_LOSS_RECOVERY_QUIET_NANOS = TimeUnit.MILLISECONDS.toNanos(500);
+    private static final long SEVERE_LOSS_RECOVERY_QUIET_NANOS = TimeUnit.SECONDS.toNanos(20);
     private static final long MIN_BANDWIDTH_PROBE_COOLDOWN_NANOS = TimeUnit.SECONDS.toNanos(5);
+    private static final long MIN_DELIVERY_SAMPLE_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
+    private static final long MAX_DELIVERY_SAMPLE_NANOS = TimeUnit.MILLISECONDS.toNanos(500);
 
     private final RakNet.Config config;
     private DplpmtudController pathMtu;
@@ -52,6 +55,8 @@ final class AdaptiveTransportController {
     private long deliveryRateBytesPerSecond;
     private long deliverySampleStarted;
     private long deliverySampleBytes;
+    private long robustBandwidthBytesPerSecond;
+    private long bandwidthEstimateUpdatedNanos;
     private long lastDscpVote;
     private double averagePacketBytes;
     private long congestionWindowBytes;
@@ -69,6 +74,7 @@ final class AdaptiveTransportController {
     private long lastCongestionResponseNanos;
     private long lossRecoveryUpdatedNanos;
     private double lossPacingCeiling = Double.POSITIVE_INFINITY;
+    private boolean severeLossRecovery;
     private long bandwidthProbeSuppressedUntil;
     private String congestionReason = "NONE";
     private boolean pacingCapped;
@@ -209,6 +215,7 @@ final class AdaptiveTransportController {
         }
         final boolean severeLoss = lossType == LossType.QUEUE || lossType == LossType.BURST
                 || lossType == LossType.RATE_LIMIT;
+        if (severeLoss) severeLossRecovery = true;
         final boolean newCongestionResponse = !severeLoss || enterCongestion(now);
         final double reduction = lossType == LossType.RATE_LIMIT ? 0.70D
                 : lossType == LossType.QUEUE || lossType == LossType.BURST ? 0.75D : 0.85D;
@@ -246,6 +253,7 @@ final class AdaptiveTransportController {
     CongestionMode congestionMode() { return congestionMode; }
     long congestionWindowBytes() { return congestionWindowBytes; }
     double packetsPerSecond() { return packetsPerSecond; }
+    long bandwidthEstimateBytesPerSecond() { return maxBandwidth(); }
 
     boolean shouldUseFec() {
         final double ratio = lossRatio();
@@ -396,6 +404,7 @@ final class AdaptiveTransportController {
         for (int i = 0; i < bandwidthFilter.length; i++) {
             bandwidthFilter[i] = bandwidthFilter[i] * 3L / 4L;
         }
+        robustBandwidthBytesPerSecond = robustBandwidthBytesPerSecond * 3L / 4L;
         deliveryRateBytesPerSecond = maxBandwidth();
         return true;
     }
@@ -405,22 +414,29 @@ final class AdaptiveTransportController {
             pacingCapped = false;
             return modelRate;
         }
-        final long quietPeriod = Math.max(MIN_LOSS_RECOVERY_QUIET_NANOS,
-                saturatedMultiply(smoothedRtt, 2L));
+        final long quietPeriod = severeLossRecovery ? SEVERE_LOSS_RECOVERY_QUIET_NANOS
+                : Math.max(MIN_LOSS_RECOVERY_QUIET_NANOS, saturatedMultiply(smoothedRtt, 2L));
         if (now - lastLossNanos > quietPeriod) {
             final long elapsed = Math.max(0L, now - lossRecoveryUpdatedNanos);
             if (elapsed > 0) {
-                // Double the allowed rate per second after a quiet period. This
-                // cannot jump back to a stale pre-QoS estimate on the first ACK.
-                lossPacingCeiling *= Math.pow(2D, elapsed / 1_000_000_000D);
+                // Recover a learned safe rate slowly after sustained queue or
+                // policer loss. Five percent per five seconds avoids repeatedly
+                // slamming an operator gateway after every short quiet period.
+                final double recoveryPeriods = elapsed / (double) TimeUnit.SECONDS.toNanos(5);
+                lossPacingCeiling *= Math.pow(1.05D, recoveryPeriods);
                 lossRecoveryUpdatedNanos = now;
             }
-            if (lossPacingCeiling >= modelRate || (lossRatio() < 0.005D
+            if (lossPacingCeiling >= modelRate || (!severeLossRecovery && lossRatio() < 0.005D
                     && now - lastLossNanos > TimeUnit.SECONDS.toNanos(5))) {
                 lossPacingCeiling = Double.POSITIVE_INFINITY;
+                severeLossRecovery = false;
                 pacingCapped = false;
                 return modelRate;
             }
+        } else {
+            // Do not accumulate twenty seconds of recovery growth and apply it
+            // all at once when the quiet period expires.
+            lossRecoveryUpdatedNanos = now;
         }
         pacingCapped = modelRate > lossPacingCeiling;
         return Math.min(modelRate, lossPacingCeiling);
@@ -484,16 +500,41 @@ final class AdaptiveTransportController {
                 Math.max(ackAggregationBytes * 7L / 8L, excess));
     }
 
-    private void updateDeliveryRate(long now, int bytes) {
+    void updateDeliveryRate(long now, int bytes) {
         if (deliverySampleStarted == 0) deliverySampleStarted = now;
         deliverySampleBytes += bytes;
         final long interval = now - deliverySampleStarted;
-        final long samplingWindow = Math.max(TimeUnit.MILLISECONDS.toNanos(1),
-                Math.min(TimeUnit.MILLISECONDS.toNanos(100), Math.max(1, smoothedRtt / 2L)));
+        // Sub-RTT samples mostly measure ACK batching/compression rather than
+        // sustainable path delivery. Aggregate for at least 100ms and cover two
+        // RTTs on longer paths before updating the bandwidth model.
+        final long samplingWindow = Math.max(MIN_DELIVERY_SAMPLE_NANOS,
+                Math.min(MAX_DELIVERY_SAMPLE_NANOS, Math.max(1L, saturatedMultiply(smoothedRtt, 2L))));
         if (interval < samplingWindow) return;
         final long sample = saturatedMultiply(deliverySampleBytes, 1_000_000_000L) / interval;
-        bandwidthFilter[bucket] = Math.max(bandwidthFilter[bucket], sample);
-        deliveryRateBytesPerSecond = maxBandwidth();
+        if (robustBandwidthBytesPerSecond == 0L) {
+            final long initialCeiling = saturatedMultiply(config.getMTU(),
+                    Math.max(1L, config.getAdaptiveMaxPps()));
+            robustBandwidthBytesPerSecond = Math.min(sample, initialCeiling);
+        } else {
+            final long estimateElapsed = bandwidthEstimateUpdatedNanos == 0L ? interval
+                    : Math.max(0L, now - bandwidthEstimateUpdatedNanos);
+            // A real capacity increase may grow the estimate, but no faster than
+            // 2x per second. Downward samples are accepted through an EWMA so a
+            // stale burst does not pin pacing for the next ten seconds.
+            final double growth = Math.pow(2D,
+                    Math.min(TimeUnit.SECONDS.toNanos(1), estimateElapsed) / 1_000_000_000D);
+            final long growthLimit = Math.max(robustBandwidthBytesPerSecond,
+                    (long) Math.ceil(robustBandwidthBytesPerSecond * growth));
+            final long boundedSample = Math.min(sample, growthLimit);
+            if (boundedSample >= robustBandwidthBytesPerSecond) {
+                robustBandwidthBytesPerSecond += (boundedSample - robustBandwidthBytesPerSecond) / 4L;
+            } else {
+                robustBandwidthBytesPerSecond -= (robustBandwidthBytesPerSecond - boundedSample) / 8L;
+            }
+        }
+        bandwidthEstimateUpdatedNanos = now;
+        bandwidthFilter[bucket] = robustBandwidthBytesPerSecond;
+        deliveryRateBytesPerSecond = robustBandwidthBytesPerSecond;
         deliverySampleStarted = now;
         deliverySampleBytes = 0;
     }
@@ -533,6 +574,7 @@ final class AdaptiveTransportController {
     }
 
     private long maxBandwidth() {
+        if (robustBandwidthBytesPerSecond > 0L) return robustBandwidthBytesPerSecond;
         long max = 0;
         for (long value : bandwidthFilter) max = Math.max(max, value);
         return max;

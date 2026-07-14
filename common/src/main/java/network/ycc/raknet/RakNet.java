@@ -95,6 +95,10 @@ public class RakNet {
         default void packetsIn(int delta) {}
         default void framesIn(int delta) {}
         default void reliableFrameDuplicate(int delta) {}
+        default void nackDeferred(int delta) {}
+        default void reorderedPacket(int delta) {}
+        default void nackRetransmit(int bytes) {}
+        default void timeoutRetransmit(int bytes) {}
         default void frameError(int delta) {}
         default void bytesIn(int delta) {}
         default void packetsOut(int delta) {}
@@ -206,7 +210,7 @@ public class RakNet {
         void setAdaptiveDscpEnabled(boolean value);
         default int getAdaptiveMinPps() { return 50; }
         default void setAdaptiveMinPps(int value) {}
-        default int getAdaptiveMaxPps() { return 2000; }
+        default int getAdaptiveMaxPps() { return 600; }
         default void setAdaptiveMaxPps(int value) {}
         default int getSmallWriteCoalesceMicros() { return 250; }
         default void setSmallWriteCoalesceMicros(int value) {}

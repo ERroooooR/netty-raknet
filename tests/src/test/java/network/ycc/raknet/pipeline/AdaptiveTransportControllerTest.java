@@ -7,13 +7,23 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.List;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 public class AdaptiveTransportControllerTest {
+    @Test
+    public void defaultConfigUsesPublicInternetPpsCeiling() {
+        final EmbeddedChannel channel = new EmbeddedChannel();
+        final DefaultConfig config = new DefaultConfig(channel);
+        Assertions.assertEquals(600, config.getAdaptiveMaxPps());
+        channel.finishAndReleaseAll();
+    }
+
     @Test
     public void failedProbeNarrowsSearchWithoutReducingConfirmedMtu() {
         final RakNet.Config config = mock(RakNet.Config.class);
@@ -104,6 +114,24 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
+    public void severeLossCeilingDoesNotRecoverDuringTwentySecondQuietPeriod() throws Exception {
+        final RakNet.Config config = adaptiveConfig();
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        for (int i = 0; i < 64; i++) controller.onAck(600, 20_000_000L, 0);
+        controller.onLoss(600, false);
+        controller.onLoss(600, false);
+        final double reducedRate = controller.packetsPerSecond();
+
+        final Field bandwidth = AdaptiveTransportController.class.getDeclaredField("bandwidthFilter");
+        bandwidth.setAccessible(true);
+        Arrays.fill((long[]) bandwidth.get(controller), 1_000_000L);
+        setLong(controller, "lastLossNanos", System.nanoTime() - 10_000_000_000L);
+        controller.onAck(1200, 20_000_000L, 0);
+
+        Assertions.assertEquals(reducedRate, controller.packetsPerSecond(), 0.01D);
+    }
+
+    @Test
     public void probeRttIsDeferredWhileLossIsActive() throws Exception {
         final RakNet.Config config = adaptiveConfig();
         final AdaptiveTransportController controller = new AdaptiveTransportController(config);
@@ -174,6 +202,40 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
+    public void nackReorderDelayScalesWithRttAndIsBounded() {
+        final long millis = 1_000_000L;
+        Assertions.assertEquals(3 * millis, ReliabilityHandler.nackReorderDelayNanos(0));
+        Assertions.assertEquals(5 * millis, ReliabilityHandler.nackReorderDelayNanos(40 * millis));
+        Assertions.assertEquals(12 * millis, ReliabilityHandler.nackReorderDelayNanos(200 * millis));
+    }
+
+    @Test
+    public void deferredNackIsCancelledByReorderedArrivalBeforeDeadline() {
+        final ReliabilityHandler.DeferredNackTracker tracker =
+                new ReliabilityHandler.DeferredNackTracker();
+        final List<Integer> due = new ArrayList<>();
+        Assertions.assertTrue(tracker.defer(10, 5_000L));
+        Assertions.assertTrue(tracker.cancel(10));
+        Assertions.assertEquals(-1L, tracker.drainDue(10_000L, due::add));
+        Assertions.assertTrue(due.isEmpty());
+    }
+
+    @Test
+    public void deferredNackPromotesOnlyExpiredSequenceGaps() {
+        final ReliabilityHandler.DeferredNackTracker tracker =
+                new ReliabilityHandler.DeferredNackTracker();
+        final List<Integer> due = new ArrayList<>();
+        tracker.defer(10, 5_000L);
+        tracker.defer(11, 8_000L);
+
+        Assertions.assertEquals(3_000L, tracker.drainDue(5_000L, due::add));
+        Assertions.assertEquals(Arrays.asList(10), due);
+        due.clear();
+        Assertions.assertEquals(-1L, tracker.drainDue(8_000L, due::add));
+        Assertions.assertEquals(Arrays.asList(11), due);
+    }
+
+    @Test
     public void ackCompressionCannotInstantlyJumpToMaximumPacing() throws Exception {
         final RakNet.Config config = adaptiveConfig();
         final AdaptiveTransportController controller = new AdaptiveTransportController(config);
@@ -186,6 +248,23 @@ public class AdaptiveTransportControllerTest {
 
         Assertions.assertTrue(controller.packetsPerSecond() < 600D,
                 "100ms of growth must not jump from 500pps to the 2000pps maximum");
+    }
+
+    @Test
+    public void deliveryEstimatorAggregatesForOneHundredMillisecondsAndRejectsAckSpike() {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        final long second = 1_000_000_000L;
+        controller.updateDeliveryRate(second, 1_200);
+        controller.updateDeliveryRate(second + 50_000_000L, 1_200);
+        Assertions.assertEquals(0L, controller.bandwidthEstimateBytesPerSecond());
+
+        controller.updateDeliveryRate(second + 100_000_000L, 1_200);
+        final long baseline = controller.bandwidthEstimateBytesPerSecond();
+        Assertions.assertEquals(36_000L, baseline);
+
+        controller.updateDeliveryRate(second + 200_000_000L, 1_000_000);
+        Assertions.assertTrue(controller.bandwidthEstimateBytesPerSecond() < baseline * 1.05D,
+                "a compressed ACK burst must not become the sustained bandwidth estimate");
     }
 
     @Test
