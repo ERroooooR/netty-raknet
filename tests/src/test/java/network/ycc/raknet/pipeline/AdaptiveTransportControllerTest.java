@@ -174,6 +174,8 @@ public class AdaptiveTransportControllerTest {
         final RakNet.Config config = adaptiveConfig();
         when(config.getSmallWriteCoalesceMicros()).thenReturn(500);
         final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        Assertions.assertEquals(2_000_000L, controller.ackFlushDelayNanos());
+        Assertions.assertFalse(controller.shouldProtectAcks());
         for (int i = 0; i < 62; i++) controller.onAck(600, 20_000_000L, 0);
 
         controller.onLoss(600, false);
@@ -183,6 +185,11 @@ public class AdaptiveTransportControllerTest {
         Assertions.assertEquals(AdaptiveTransportController.LossType.RATE_LIMIT, controller.lossType());
         Assertions.assertFalse(controller.shouldUseFec());
         Assertions.assertEquals(1_500, controller.smallWriteCoalesceMicros());
+        Assertions.assertEquals(8_000_000L, controller.ackFlushDelayNanos());
+        Assertions.assertTrue(controller.shouldProtectAcks());
+        Assertions.assertEquals(10_000_000L, controller.ackRepeatDelayNanos());
+        Assertions.assertEquals(12_000_000L,
+                controller.adjustNackReorderDelayNanos(3_000_000L));
     }
 
     @Test

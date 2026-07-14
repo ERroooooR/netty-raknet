@@ -30,6 +30,10 @@ final class AdaptiveTransportController {
     private static final long MIN_BANDWIDTH_PROBE_COOLDOWN_NANOS = TimeUnit.SECONDS.toNanos(5);
     private static final long MIN_DELIVERY_SAMPLE_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
     private static final long MAX_DELIVERY_SAMPLE_NANOS = TimeUnit.MILLISECONDS.toNanos(500);
+    private static final long NORMAL_ACK_FLUSH_NANOS = TimeUnit.MILLISECONDS.toNanos(2);
+    private static final long MIN_POLICER_ACK_FLUSH_NANOS = TimeUnit.MILLISECONDS.toNanos(8);
+    private static final long MAX_POLICER_ACK_FLUSH_NANOS = TimeUnit.MILLISECONDS.toNanos(25);
+    private static final long MIN_POLICER_NACK_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(12);
 
     private final RakNet.Config config;
     private DplpmtudController pathMtu;
@@ -285,6 +289,33 @@ final class AdaptiveTransportController {
         if (lossType == LossType.RATE_LIMIT) return Math.max(base, 1_500);
         if (lossType == LossType.QUEUE || lossType == LossType.BURST) return Math.max(base, 750);
         return base;
+    }
+
+    long ackFlushDelayNanos() {
+        if (lossType == LossType.RATE_LIMIT) {
+            return clampNanos(smoothedRtt / 4L,
+                    MIN_POLICER_ACK_FLUSH_NANOS, MAX_POLICER_ACK_FLUSH_NANOS);
+        }
+        if (lossType == LossType.BURST || lossType == LossType.QUEUE) {
+            return Math.max(NORMAL_ACK_FLUSH_NANOS,
+                    Math.min(TimeUnit.MILLISECONDS.toNanos(8), smoothedRtt / 8L));
+        }
+        return NORMAL_ACK_FLUSH_NANOS;
+    }
+
+    boolean shouldProtectAcks() {
+        return lossType == LossType.RATE_LIMIT && lossRatio() >= 0.03D;
+    }
+
+    long ackRepeatDelayNanos() {
+        return clampNanos(smoothedRtt / 4L,
+                TimeUnit.MILLISECONDS.toNanos(10), MAX_POLICER_ACK_FLUSH_NANOS);
+    }
+
+    long adjustNackReorderDelayNanos(long baseDelayNanos) {
+        if (lossType != LossType.RATE_LIMIT) return baseDelayNanos;
+        return Math.max(baseDelayNanos, clampNanos(smoothedRtt / 4L,
+                MIN_POLICER_NACK_DELAY_NANOS, MAX_POLICER_ACK_FLUSH_NANOS));
     }
 
     int probeCandidate() { return pathMtu.nextProbe(System.nanoTime()); }
@@ -622,6 +653,8 @@ final class AdaptiveTransportController {
     private void publishMetrics() {
         config.getMetrics().adaptivePacingRate(packetsPerSecond);
         config.getMetrics().adaptiveBytePacingRate((long) bytePacingRateBytesPerSecond());
+        config.getMetrics().adaptiveAckPolicy(shouldProtectAcks(),
+                ackFlushDelayNanos(), ackRepeatDelayNanos());
         config.getMetrics().adaptiveDeliveryRate(deliveryRateBytesPerSecond);
         long acknowledgements = 0, losses = 0;
         for (int i = 0; i < WINDOW_BUCKETS; i++) { acknowledgements += acked[i]; losses += lost[i]; }
@@ -654,6 +687,10 @@ final class AdaptiveTransportController {
 
     private static long saturatedAdd(long a, long b) {
         return a > Long.MAX_VALUE - b ? Long.MAX_VALUE : a + b;
+    }
+
+    private static long clampNanos(long value, long minimum, long maximum) {
+        return Math.max(minimum, Math.min(maximum, value));
     }
 
     private static long saturatedMultiply(long a, long b) {

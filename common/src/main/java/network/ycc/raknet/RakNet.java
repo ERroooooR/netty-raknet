@@ -104,6 +104,8 @@ public class RakNet {
         default void orderedQueuePending(int frames, long oldestAgeNanos) {}
         default void orderedQueueRelease(int frames, long oldestWaitNanos) {}
         default void applicationBatch(int bytes) {}
+        default void ackRepeated(int acknowledgedFrameSets) {}
+        default void adaptiveAckPolicy(boolean protectedMode, long flushDelayNanos, long repeatDelayNanos) {}
         default void frameError(int delta) {}
         default void bytesIn(int delta) {}
         default void packetsOut(int delta) {}

@@ -55,12 +55,15 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected int coalescedFrames;
     protected long coalesceStartedNanos;
     protected ScheduledFuture<?> deferredNackFuture;
+    protected ScheduledFuture<?> ackFlushFuture;
+    protected ScheduledFuture<?> ackRepeatFuture;
+    protected long lastAckRepeatNanos;
 
     // Item 3: track when first ACK was queued for time-based flush
     protected long firstAckNanos = 0;
-    private static final long ACK_FLUSH_DELAY_NANOS = 2_000_000; // 2ms
     private static final long MIN_NACK_REORDER_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(3);
     private static final long MAX_NACK_REORDER_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(12);
+    private static final long ACK_REPEAT_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
     // Item 7: guard against recursive flush from recallFrameSet
     protected boolean flushing = false;
 
@@ -86,6 +89,10 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     public void handlerRemoved(ChannelHandlerContext ctx) {
         if (deferredNackFuture != null) deferredNackFuture.cancel(false);
         deferredNackFuture = null;
+        if (ackFlushFuture != null) ackFlushFuture.cancel(false);
+        ackFlushFuture = null;
+        if (ackRepeatFuture != null) ackRepeatFuture.cancel(false);
+        ackRepeatFuture = null;
         deferredNacks.clear();
         clearQueue(null);
     }
@@ -206,9 +213,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             firstAckNanos = System.nanoTime();
             // Schedule guaranteed ACK flush so low-traffic connections
             // don't wait until the 50ms flush tick or next FrameSet arrival.
-            ctx.channel().eventLoop().schedule(() -> {
-                trySendResponses(ctx);
-            }, ACK_FLUSH_DELAY_NANOS + 500_000L, TimeUnit.NANOSECONDS);
+            scheduleAckFlush(ctx, adaptive.ackFlushDelayNanos());
         }
         ackSet.add(packetSeqId);
         if (config.isNACKEnabled()) {
@@ -330,11 +335,35 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     }
 
     protected void sendResponses(ChannelHandlerContext ctx) {
-        if (!ackSet.isEmpty()) {
-            ctx.write(new Reliability.ACK(ackSet)).addListener(RakNet.INTERNAL_WRITE_LISTENER);
-            config.getMetrics().acksSent(ackSet.size());
+        final long ackDelayNanos = adaptive.ackFlushDelayNanos();
+        final boolean ackReady = !ackSet.isEmpty()
+                && (ackSet.size() >= config.getDefaultPendingFrameSets() - 1
+                || System.nanoTime() - firstAckNanos >= ackDelayNanos);
+        if (ackReady) {
+            final int acknowledgedFrameSets = ackSet.size();
+            final Reliability.ACK ack = new Reliability.ACK(ackSet);
+            final long now = System.nanoTime();
+            final boolean repeat = adaptive.shouldProtectAcks()
+                    && now - lastAckRepeatNanos >= ACK_REPEAT_INTERVAL_NANOS;
+            final Reliability.ACK repeatedAck = repeat ? new Reliability.ACK(ackSet) : null;
+            ctx.write(ack).addListener(RakNet.INTERNAL_WRITE_LISTENER);
+            config.getMetrics().acksSent(acknowledgedFrameSets);
             ackSet.clear();
             firstAckNanos = 0;
+            cancelAckFlush();
+            if (repeatedAck != null) {
+                lastAckRepeatNanos = now;
+                ackRepeatFuture = ctx.executor().schedule(() -> {
+                    ackRepeatFuture = null;
+                    if (!ctx.channel().isOpen()) return;
+                    ctx.write(repeatedAck).addListener(RakNet.INTERNAL_WRITE_LISTENER);
+                    ctx.flush();
+                    config.getMetrics().ackRepeated(acknowledgedFrameSets);
+                }, adaptive.ackRepeatDelayNanos(), TimeUnit.NANOSECONDS);
+            }
+        } else if (!ackSet.isEmpty()) {
+            scheduleAckFlush(ctx, Math.max(0L,
+                    ackDelayNanos - (System.nanoTime() - firstAckNanos)));
         }
         if (config.isNACKEnabled() && !nackSet.isEmpty() && config.isAutoRead()) { //only nack if we can read
             ctx.write(new Reliability.NACK(nackSet)).addListener(RakNet.INTERNAL_WRITE_LISTENER);
@@ -344,13 +373,38 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     }
 
     protected void trySendResponses(ChannelHandlerContext ctx) {
-        // Item 3: send ACKs on count OR time threshold (2ms), whichever comes first
+        // Send ACKs on count or an adaptive time threshold, whichever comes first.
+        // A policer episode uses a longer aggregation window so duplicate data
+        // does not turn into an ACK packet storm.
         final boolean countTrigger = ackSet.size() >= config.getDefaultPendingFrameSets() - 1;
         final boolean timeTrigger = !ackSet.isEmpty()
-                && System.nanoTime() - firstAckNanos > ACK_FLUSH_DELAY_NANOS;
+                && System.nanoTime() - firstAckNanos >= adaptive.ackFlushDelayNanos();
         if (countTrigger || timeTrigger) {
             sendResponses(ctx);
             ctx.flush();
+        }
+    }
+
+    private void scheduleAckFlush(ChannelHandlerContext ctx, long delayNanos) {
+        if (ackFlushFuture != null) return;
+        ackFlushFuture = ctx.executor().schedule(() -> {
+            ackFlushFuture = null;
+            if (!ctx.channel().isOpen() || ackSet.isEmpty()) return;
+            final long remaining = adaptive.ackFlushDelayNanos()
+                    - (System.nanoTime() - firstAckNanos);
+            if (remaining > 0) {
+                scheduleAckFlush(ctx, remaining);
+            } else {
+                sendResponses(ctx);
+                ctx.flush();
+            }
+        }, Math.max(0L, delayNanos), TimeUnit.NANOSECONDS);
+    }
+
+    private void cancelAckFlush() {
+        if (ackFlushFuture != null) {
+            ackFlushFuture.cancel(false);
+            ackFlushFuture = null;
         }
     }
 
@@ -409,7 +463,8 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 
     private void deferNack(ChannelHandlerContext ctx, int sequenceId) {
         final long now = System.nanoTime();
-        final long delay = nackReorderDelayNanos(config.getRTTNanos());
+        final long delay = adaptive.adjustNackReorderDelayNanos(
+                nackReorderDelayNanos(config.getRTTNanos()));
         if (deferredNacks.defer(sequenceId, now + delay)) {
             config.getMetrics().nackDeferred(1);
         }
