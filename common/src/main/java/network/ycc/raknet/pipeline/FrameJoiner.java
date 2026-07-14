@@ -30,6 +30,7 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
     protected final Int2ObjectOpenHashMap<Builder> pendingPackets = new Int2ObjectOpenHashMap<>();
     protected long lastCleanupNanos = 0;
     protected long totalPendingBytes = 0;
+    protected long lastMetricsPublishNanos = 0;
     protected ScheduledFuture<?> cleanupTask = null;
     private static final long CLEANUP_INTERVAL_MILLIS = 500;
     private static final long CLEANUP_INTERVAL_NANOS = TimeUnit.NANOSECONDS.convert(CLEANUP_INTERVAL_MILLIS, TimeUnit.MILLISECONDS);
@@ -57,6 +58,8 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
         pendingPackets.values().forEach(Builder::release);
         pendingPackets.clear();
         totalPendingBytes = 0;
+        final RakNet.MetricsLogger metrics = metrics(ctx);
+        if (metrics != null) metrics.fragmentReassemblyPending(0, 0, 0);
     }
 
     @Override
@@ -93,8 +96,16 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
                     throw e;
                 }
                 final Builder builder = Builder.create(ctx.alloc(), frame);
-                pendingPackets.put(splitID, builder);
-                totalPendingBytes += builder.actualBytes;
+                if (builder.isDone()) {
+                    final int bytes = Math.toIntExact(builder.actualBytes);
+                    final long age = System.nanoTime() - builder.firstCreatedAt;
+                    list.add(builder.finish());
+                    final RakNet.MetricsLogger metrics = metrics(ctx);
+                    if (metrics != null) metrics.fragmentReassemblyComplete(bytes, age);
+                } else {
+                    pendingPackets.put(splitID, builder);
+                    totalPendingBytes += builder.actualBytes;
+                }
             } else {
                 partial.validate(frame);
                 final long before = partial.actualBytes;
@@ -103,10 +114,15 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
                 if (partial.isDone()) {
                     pendingPackets.remove(splitID);
                     totalPendingBytes -= partial.actualBytes;
+                    final int bytes = Math.toIntExact(partial.actualBytes);
+                    final long age = System.nanoTime() - partial.firstCreatedAt;
                     list.add(partial.finish());
+                    final RakNet.MetricsLogger metrics = metrics(ctx);
+                    if (metrics != null) metrics.fragmentReassemblyComplete(bytes, age);
                 }
             }
             Constants.packetLossCheck(pendingPackets.size(), "pending frame joins");
+            publishMetrics(ctx, false);
         }
     }
 
@@ -170,6 +186,27 @@ public class FrameJoiner extends MessageToMessageDecoder<Frame> {
                 it.remove();
             }
         }
+        publishMetrics(ctx, true);
+    }
+
+    private void publishMetrics(ChannelHandlerContext ctx, boolean force) {
+        final long now = System.nanoTime();
+        if (!force && now - lastMetricsPublishNanos < TimeUnit.MILLISECONDS.toNanos(100)) return;
+        lastMetricsPublishNanos = now;
+        long oldestCreatedAt = now;
+        for (Builder builder : pendingPackets.values()) {
+            oldestCreatedAt = Math.min(oldestCreatedAt, builder.firstCreatedAt);
+        }
+        final long oldestAge = pendingPackets.isEmpty() ? 0 : Math.max(0, now - oldestCreatedAt);
+        final RakNet.MetricsLogger metrics = metrics(ctx);
+        if (metrics != null) {
+            metrics.fragmentReassemblyPending(pendingPackets.size(), totalPendingBytes, oldestAge);
+        }
+    }
+
+    private static RakNet.MetricsLogger metrics(ChannelHandlerContext ctx) {
+        return ctx.channel().config() instanceof RakNet.Config
+                ? ((RakNet.Config) ctx.channel().config()).getMetrics() : null;
     }
 
     private static int positiveIntProperty(String name, int fallback) {

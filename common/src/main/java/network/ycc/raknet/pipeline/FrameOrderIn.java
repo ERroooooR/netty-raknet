@@ -15,6 +15,7 @@ import java.util.Arrays;
 import java.util.List;
 
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
+import it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap;
 
 public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
 
@@ -46,11 +47,27 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
             frame.touch("No order");
             list.add(frame.retainedFrameData());
         }
+        publishMetrics(ctx);
+    }
+
+    private void publishMetrics(ChannelHandlerContext ctx) {
+        final long now = System.nanoTime();
+        int pending = 0;
+        long oldestQueuedAt = now;
+        for (OrderedChannelPacketQueue channel : channels) {
+            pending += channel.queue.size();
+            for (long queuedAt : channel.queuedAt.values()) {
+                oldestQueuedAt = Math.min(oldestQueuedAt, queuedAt);
+            }
+        }
+        RakNet.config(ctx).getMetrics().orderedQueuePending(
+                pending, pending == 0 ? 0 : Math.max(0, now - oldestQueuedAt));
     }
 
     protected static class OrderedChannelPacketQueue {
 
         protected final Int2ObjectOpenHashMap<FramedPacket> queue = new Int2ObjectOpenHashMap<>();
+        protected final Int2LongOpenHashMap queuedAt = new Int2LongOpenHashMap();
         protected int lastOrderIndex = -1;
         protected int lastSequenceIndex = -1;
 
@@ -68,6 +85,7 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
                 //remove earlier packets from queue
                 while (UINT.B3.minusWrap(frame.getOrderIndex(), lastOrderIndex) > 1) {
                     ReferenceCountUtil.release(queue.remove(lastOrderIndex));
+                    queuedAt.remove(lastOrderIndex);
                     lastOrderIndex = UINT.B3.plus(lastOrderIndex, 1);
                 }
             }
@@ -84,11 +102,22 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
             if (indexDiff == 1) { //got next packet in line
                 cancelGapTask();
                 FramedPacket data = frame.retainedFrameData();
+                int released = 0;
+                long oldestWait = 0;
                 do { //process this packet, and any queued packets following in sequence
                     list.add(data);
                     lastOrderIndex = UINT.B3.plus(lastOrderIndex, 1);
-                    data = queue.remove(UINT.B3.plus(lastOrderIndex, 1));
+                    final int nextIndex = UINT.B3.plus(lastOrderIndex, 1);
+                    data = queue.remove(nextIndex);
+                    if (data != null) {
+                        final long queuedNanos = queuedAt.remove(nextIndex);
+                        if (queuedNanos > 0) oldestWait = Math.max(oldestWait, System.nanoTime() - queuedNanos);
+                        released++;
+                    }
                 } while (data != null);
+                if (released > 0 && ctx != null) {
+                    RakNet.config(ctx).getMetrics().orderedQueueRelease(released, oldestWait);
+                }
             } else if (indexDiff > 1 && !queue.containsKey(frame.getOrderIndex())) {
                 // only new future data goes in the queue
                 // Gap timeout only applies to unreliable frames — reliable frames
@@ -107,10 +136,15 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
                     cancelGapTask();
                 }
                 queue.put(frame.getOrderIndex(), frame.retainedFrameData());
+                queuedAt.put(frame.getOrderIndex(), System.nanoTime());
                 if (isUnreliable && gapStartNanos > 0) {
                     final long gapTimeoutNanos = rttNanos * GAP_TIMEOUT_MULTIPLIER;
                     if (System.nanoTime() - gapStartNanos > gapTimeoutNanos && !queue.isEmpty()) {
-                        flushGap(list);
+                        final QueueRelease release = flushGap(list);
+                        if (release.frames > 0 && ctx != null) {
+                            RakNet.config(ctx).getMetrics().orderedQueueRelease(
+                                    release.frames, release.oldestWaitNanos);
+                        }
                     }
                 }
             }
@@ -120,7 +154,10 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
         private void flushGap(ChannelHandlerContext ctx) {
             if (!gapIsSkippable || queue.isEmpty() || !ctx.channel().isOpen()) return;
             final java.util.ArrayList<Object> out = new java.util.ArrayList<>();
-            flushGap(out);
+            final QueueRelease release = flushGap(out);
+            if (release.frames > 0) {
+                RakNet.config(ctx).getMetrics().orderedQueueRelease(release.frames, release.oldestWaitNanos);
+            }
             for (Object msg : out) ctx.fireChannelRead(msg);
             if (!out.isEmpty()) ctx.fireChannelReadComplete();
         }
@@ -140,17 +177,27 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
 
         // Item 2: skip over the missing packet(s) and deliver all queued data
         // that follows the gap. Handles consecutive gaps by scanning forward.
-        private void flushGap(List<Object> list) {
+        private QueueRelease flushGap(List<Object> list) {
+            int released = 0;
+            long oldestWait = 0;
             int nextIdx = UINT.B3.plus(lastOrderIndex, 1);
             while (true) {
                 FramedPacket data = queue.remove(nextIdx);
                 if (data != null) {
+                    final long queuedNanos = queuedAt.remove(nextIdx);
+                    if (queuedNanos > 0) oldestWait = Math.max(oldestWait, System.nanoTime() - queuedNanos);
+                    released++;
                     // Found a packet past the gap(s) — deliver it and continue
                     // delivering everything consecutive that follows
                     list.add(data);
                     lastOrderIndex = nextIdx;
                     nextIdx = UINT.B3.plus(nextIdx, 1);
                     while ((data = queue.remove(nextIdx)) != null) {
+                        final long followingQueuedNanos = queuedAt.remove(nextIdx);
+                        if (followingQueuedNanos > 0) {
+                            oldestWait = Math.max(oldestWait, System.nanoTime() - followingQueuedNanos);
+                        }
+                        released++;
                         list.add(data);
                         lastOrderIndex = nextIdx;
                         nextIdx = UINT.B3.plus(nextIdx, 1);
@@ -165,12 +212,24 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
             gapStartNanos = 0;
             gapIsSkippable = false;
             gapTask = null;
+            return new QueueRelease(released, oldestWait);
+        }
+
+        private static final class QueueRelease {
+            private final int frames;
+            private final long oldestWaitNanos;
+
+            private QueueRelease(int frames, long oldestWaitNanos) {
+                this.frames = frames;
+                this.oldestWaitNanos = oldestWaitNanos;
+            }
         }
 
         protected void clear() {
             cancelGapTask();
             queue.values().forEach(ReferenceCountUtil::release);
             queue.clear();
+            queuedAt.clear();
         }
 
     }

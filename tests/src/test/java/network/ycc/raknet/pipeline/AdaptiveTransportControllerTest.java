@@ -59,10 +59,21 @@ public class AdaptiveTransportControllerTest {
         final AdaptiveTransportController controller = new AdaptiveTransportController(config);
         final long now = System.nanoTime();
         Assertions.assertEquals(1, controller.sendBudget(now));
-        Assertions.assertEquals(1, controller.sendBudget(now));
         Assertions.assertEquals(0, controller.sendBudget(now));
-        Assertions.assertEquals(1, controller.sendBudget(now + 2_000_000L));
+        Assertions.assertEquals(0, controller.sendBudget(now + 2_000_000L));
+        Assertions.assertEquals(1, controller.sendBudget(now + 3_000_000L));
         Assertions.assertTrue(controller.nanosUntilSend(now) >= 0);
+    }
+
+    @Test
+    public void actualDatagramSizeCreatesByteDebtAfterSmallEstimate() {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        final long now = System.nanoTime();
+        Assertions.assertEquals(1, controller.sendBudget(now, 0, 100));
+        controller.onDatagramSent(1_400);
+
+        Assertions.assertEquals(0, controller.sendBudget(now + 1_000_000L, 0, 100));
+        Assertions.assertEquals(1, controller.sendBudget(now + 3_000_000L, 0, 100));
     }
 
     @Test

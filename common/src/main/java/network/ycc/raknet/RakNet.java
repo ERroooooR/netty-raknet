@@ -99,6 +99,11 @@ public class RakNet {
         default void reorderedPacket(int delta) {}
         default void nackRetransmit(int bytes) {}
         default void timeoutRetransmit(int bytes) {}
+        default void fragmentReassemblyPending(int builders, long bytes, long oldestAgeNanos) {}
+        default void fragmentReassemblyComplete(int bytes, long ageNanos) {}
+        default void orderedQueuePending(int frames, long oldestAgeNanos) {}
+        default void orderedQueueRelease(int frames, long oldestWaitNanos) {}
+        default void applicationBatch(int bytes) {}
         default void frameError(int delta) {}
         default void bytesIn(int delta) {}
         default void packetsOut(int delta) {}
@@ -113,6 +118,7 @@ public class RakNet {
         default void measureRTTnsStdDev(long n) {}
         default void measureBurstTokens(int n) {}
         default void adaptivePacingRate(double packetsPerSecond) {}
+        default void adaptiveBytePacingRate(long bytesPerSecond) {}
         default void adaptiveDeliveryRate(long bytesPerSecond) {}
         default void adaptiveLoss(double ratio, long acknowledged, long lost) {}
         default void adaptiveLossType(String type) {}

@@ -36,6 +36,8 @@ final class AdaptiveTransportController {
     private long nextSendNanos;
     private long tokenUpdatedNanos;
     private double pacingTokens = 1D;
+    private double bytePacingTokens;
+    private int reservedDatagramBytes;
     private final long[] acked = new long[WINDOW_BUCKETS];
     private final long[] lost = new long[WINDOW_BUCKETS];
     private final long[] ackedBytes = new long[WINDOW_BUCKETS];
@@ -85,6 +87,7 @@ final class AdaptiveTransportController {
         this.pathMtu = new DplpmtudController(config.getMTU(), config.getPlpmtudMaxMtu());
         this.packetsPerSecond = clampPps(500D);
         this.averagePacketBytes = Math.max(256D, config.getMTU() * 0.75D);
+        this.bytePacingTokens = config.getMTU();
         this.congestionWindowBytes = minimumCongestionWindow();
         config.getMetrics().adaptiveMTU(pathMtu.confirmedMtu());
         publishMetrics();
@@ -94,6 +97,7 @@ final class AdaptiveTransportController {
         pathMtu = new DplpmtudController(mtu, config.getPlpmtudMaxMtu());
         congestionWindowBytes = minimumCongestionWindow();
         averagePacketBytes = Math.max(256D, mtu * 0.75D);
+        bytePacingTokens = Math.min(bytePacingTokens, mtu);
         config.getMetrics().adaptiveMTU(mtu);
         publishPathMtuMetrics();
     }
@@ -111,31 +115,44 @@ final class AdaptiveTransportController {
             publishCongestionMetrics();
             return 0;
         }
-        final int burst = lossType == LossType.BURST || lossType == LossType.QUEUE
-                || lossType == LossType.RATE_LIMIT ? 1 : 4;
+        final boolean congested = lossType == LossType.BURST || lossType == LossType.QUEUE
+                || lossType == LossType.RATE_LIMIT;
+        final int burst = congested ? 1 : 4;
+        final int byteBurstPackets = congested ? 1 : 2;
+        final int datagramBytes = Math.max(1, nextDatagramBytes);
+        final double byteRate = bytePacingRateBytesPerSecond();
         if (tokenUpdatedNanos == 0) {
             tokenUpdatedNanos = nowNanos;
         } else if (nowNanos > tokenUpdatedNanos) {
-            pacingTokens = Math.min(burst, pacingTokens
-                    + (nowNanos - tokenUpdatedNanos) * packetsPerSecond / 1_000_000_000D);
+            final long elapsed = nowNanos - tokenUpdatedNanos;
+            pacingTokens = Math.min(burst, pacingTokens + elapsed * packetsPerSecond / 1_000_000_000D);
+            bytePacingTokens = Math.min((double) byteBurstPackets * config.getMTU(),
+                    bytePacingTokens + elapsed * byteRate / 1_000_000_000D);
             tokenUpdatedNanos = nowNanos;
         }
         pacingTokens = Math.min(burst, pacingTokens);
-        int budget = Math.max(0, (int) pacingTokens);
-        if (budget > 0) {
-            final long cwndBudget = Math.max(1L,
-                    (congestionWindowBytes - inFlightBytes + nextDatagramBytes - 1L) / nextDatagramBytes);
-            budget = (int) Math.min(budget, cwndBudget);
-            pacingTokens -= budget;
-        } else if (pacingTokens >= 0D && inFlightBytes == 0) {
-            budget = 1;
+        bytePacingTokens = Math.min((double) byteBurstPackets * config.getMTU(), bytePacingTokens);
+        int budget = pacingTokens >= 1D && bytePacingTokens >= datagramBytes ? 1 : 0;
+        if (budget != 0) {
             pacingTokens -= 1D;
+            bytePacingTokens -= datagramBytes;
+            reservedDatagramBytes = datagramBytes;
         }
-        final double missing = Math.max(0D, -pacingTokens);
+        final double packetWait = Math.max(0D, 1D - pacingTokens) / packetsPerSecond;
+        final double byteWait = Math.max(0D, datagramBytes - bytePacingTokens) / byteRate;
         nextSendNanos = nowNanos + Math.max(10_000L,
-                (long) Math.ceil(missing * 1_000_000_000D / packetsPerSecond));
+                (long) Math.ceil(Math.max(packetWait, byteWait) * 1_000_000_000D));
         publishCongestionMetrics();
         return budget;
+    }
+
+    void onDatagramSent(int actualBytes) {
+        if (!config.isAdaptiveTransportEnabled()) return;
+        bytePacingTokens += reservedDatagramBytes - Math.max(1, actualBytes);
+        reservedDatagramBytes = 0;
+        final int burstPackets = lossType == LossType.BURST || lossType == LossType.QUEUE
+                || lossType == LossType.RATE_LIMIT ? 1 : 2;
+        bytePacingTokens = Math.min((double) burstPackets * config.getMTU(), bytePacingTokens);
     }
 
     long nanosUntilSend(long nowNanos) {
@@ -254,6 +271,7 @@ final class AdaptiveTransportController {
     long congestionWindowBytes() { return congestionWindowBytes; }
     double packetsPerSecond() { return packetsPerSecond; }
     long bandwidthEstimateBytesPerSecond() { return maxBandwidth(); }
+    long bytePacingRateBytesPerSecondMetric() { return (long) bytePacingRateBytesPerSecond(); }
 
     boolean shouldUseFec() {
         final double ratio = lossRatio();
@@ -386,6 +404,12 @@ final class AdaptiveTransportController {
         // filters ACK-compression spikes without delaying immediate reductions.
         final double growthExponent = elapsed / 1_000_000_000D;
         return Math.min(targetRate, packetsPerSecond * Math.pow(2D, growthExponent));
+    }
+
+    private double bytePacingRateBytesPerSecond() {
+        final double minimumPacketBytes = Math.max(512D, config.getMTU() * 0.5D);
+        return Math.max(1D, packetsPerSecond
+                * Math.max(minimumPacketBytes, Math.min(config.getMTU(), averagePacketBytes)));
     }
 
     private boolean enterCongestion(long now) {
@@ -597,6 +621,7 @@ final class AdaptiveTransportController {
 
     private void publishMetrics() {
         config.getMetrics().adaptivePacingRate(packetsPerSecond);
+        config.getMetrics().adaptiveBytePacingRate((long) bytePacingRateBytesPerSecond());
         config.getMetrics().adaptiveDeliveryRate(deliveryRateBytesPerSecond);
         long acknowledgements = 0, losses = 0;
         for (int i = 0; i < WINDOW_BUCKETS; i++) { acknowledgements += acked[i]; losses += lost[i]; }

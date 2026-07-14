@@ -492,6 +492,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             nextSendSeqId = UINT.B3.plus(nextSendSeqId, 1);
             pendingFrameSets.put(frameSet.getSeqId(), frameSet);
             inFlightBytes += frameSet.getRoughSize();
+            adaptive.onDatagramSent(frameSet.getRoughSize());
             frameSet.touch("Added to pending FrameSet list");
             ctx.write(frameSet.retain()).addListener(RakNet.INTERNAL_WRITE_LISTENER);
             config.getMetrics().packetsOut(1);
@@ -511,7 +512,11 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         final int mtu = config.getMTU();
         final int maxSize = mtu - FrameSet.HEADER_SIZE - Frame.HEADER_SIZE;
         final int maxPendingFrameSets = config.getDefaultPendingFrameSets() + burstTokens;
-        int pacingBudget = adaptive.sendBudget(System.nanoTime(), inFlightBytes, mtu);
+        final Frame nextFrame = frameQueue.peek();
+        final int estimatedDatagramBytes = nextFrame == null ? mtu
+                : Math.min(mtu, FrameSet.HEADER_SIZE + nextFrame.getRoughPacketSize());
+        int pacingBudget = pendingFrameSets.size() < maxPendingFrameSets
+                ? adaptive.sendBudget(System.nanoTime(), inFlightBytes, estimatedDatagramBytes) : 0;
         while (pacingBudget-- > 0 && pendingFrameSets.size() < maxPendingFrameSets && !frameQueue.isEmpty()) {
             produceFrameSet(ctx, maxSize);
         }
