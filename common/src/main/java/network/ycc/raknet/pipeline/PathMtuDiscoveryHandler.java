@@ -44,14 +44,18 @@ public final class PathMtuDiscoveryHandler extends ChannelDuplexHandler {
             return;
         }
         final ByteBuf in = (ByteBuf) msg;
-        if (in.readableBytes() >= 11) {
-            final int id = in.getUnsignedByte(in.readerIndex());
-            if (id == PROBE_ID || id == ACK_ID) {
-                if (id == PROBE_ID && enabled(ctx)) {
+        final int id = in.isReadable() ? in.getUnsignedByte(in.readerIndex()) : -1;
+        if (id == PROBE_ID || id == ACK_ID) {
+            try {
+                if (in.readableBytes() < 11 || !enabled(ctx)) return;
+                if (id == PROBE_ID) {
                     final long token = in.getLong(in.readerIndex() + 1);
                     final int mtu = in.getUnsignedShort(in.readerIndex() + 9);
-                    ctx.writeAndFlush(ctx.alloc().ioBuffer(11).writeByte(ACK_ID).writeLong(token).writeShort(mtu));
-                } else if (id == ACK_ID && enabled(ctx)) {
+                    if (validProbeLength(in.readableBytes(), mtu)) {
+                        ctx.writeAndFlush(ctx.alloc().ioBuffer(11).writeByte(ACK_ID)
+                                .writeLong(token).writeShort(mtu));
+                    }
+                } else if (in.readableBytes() == 11) {
                     final long token = in.getLong(in.readerIndex() + 1);
                     final int mtu = in.getUnsignedShort(in.readerIndex() + 9);
                     if (token == pendingToken && mtu == pendingMtu) {
@@ -65,9 +69,10 @@ public final class PathMtuDiscoveryHandler extends ChannelDuplexHandler {
                         probeTimeout = null;
                     }
                 }
+            } finally {
                 ReferenceCountUtil.release(msg);
-                return;
             }
+            return;
         }
         ctx.fireChannelRead(msg);
     }
@@ -118,5 +123,9 @@ public final class PathMtuDiscoveryHandler extends ChannelDuplexHandler {
         final Long features = ctx.channel().attr(RakNet.TRANSPORT_FEATURES).get();
         return RakNet.config(ctx).isAdaptiveTransportEnabled()
                 && features != null && (features & TransportFeatures.PLPMTUD) != 0;
+    }
+
+    static boolean validProbeLength(int readableBytes, int advertisedMtu) {
+        return advertisedMtu >= 11 && advertisedMtu == readableBytes;
     }
 }

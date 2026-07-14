@@ -1,5 +1,7 @@
 package network.ycc.raknet.pipeline;
 
+import io.netty.buffer.Unpooled;
+import io.netty.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -27,5 +29,20 @@ public class DplpmtudControllerTest {
         controller.onPacketTooBig(1280, 1400);
         Assertions.assertEquals(1280, controller.confirmedMtu());
         Assertions.assertEquals(DplpmtudController.State.BASE, controller.state());
+    }
+
+    @Test
+    public void onlyAcknowledgesProbeWhenAdvertisedAndActualSizesMatch() {
+        Assertions.assertTrue(PathMtuDiscoveryHandler.validProbeLength(1400, 1400));
+        Assertions.assertFalse(PathMtuDiscoveryHandler.validProbeLength(11, 1400));
+        Assertions.assertFalse(PathMtuDiscoveryHandler.validProbeLength(10, 10));
+    }
+
+    @Test
+    public void dropsShortExtensionPacketsBeforeGenericDecoding() {
+        final EmbeddedChannel channel = new EmbeddedChannel(new PathMtuDiscoveryHandler());
+        Assertions.assertFalse(channel.writeInbound(Unpooled.wrappedBuffer(new byte[]{0x20, 1, 2})));
+        Assertions.assertNull(channel.readInbound());
+        channel.finishAndReleaseAll();
     }
 }

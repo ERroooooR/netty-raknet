@@ -30,6 +30,7 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
     private static final int MAX_GROUP_SIZE = 12;
     private static final int LEGACY_MAX_PROTECTED_BYTES = 512;
     private static final int MAX_CACHE = 512;
+    private static final int MAX_PENDING_GROUPS = 64;
 
     private final List<Entry> outbound = new ArrayList<>(MAX_GROUP_SIZE);
     private final Int2ObjectLinkedOpenHashMap<byte[]> received = new Int2ObjectLinkedOpenHashMap<>();
@@ -45,7 +46,13 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
 
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) {
-        cleanupTask = ctx.executor().scheduleAtFixedRate(() -> tryRecover(ctx), 1, 1, TimeUnit.SECONDS);
+        cleanupTask = ctx.executor().scheduleAtFixedRate(() -> {
+            try {
+                tryRecover(ctx);
+            } catch (RuntimeException ignored) {
+                // A malformed cached group must not cancel periodic cleanup permanently.
+            }
+        }, 1, 1, TimeUnit.SECONDS);
     }
 
     @Override
@@ -99,7 +106,7 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
                 buf.skipBytes(1);
                 buf.readInt(); // group id, reserved for future per-group accounting
                 final int recovered = buf.readUnsignedByte();
-                if (buf.isReadable()) throw new IllegalArgumentException("trailing FEC feedback bytes");
+                if (recovered > 2 || buf.isReadable()) throw new IllegalArgumentException("invalid FEC feedback");
                 feedbackGroups++;
                 feedbackRecovered += recovered;
                 if (feedbackGroups >= 128) {
@@ -117,7 +124,10 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
             try {
                 if (id == LEGACY_FEC_PACKET_ID) {
                     final LegacyParity parity = readLegacyParity(buf);
-                    if (!recentGroups.contains(parity.id)) legacyPending.add(parity);
+                    if (!recentGroups.contains(parity.id)) {
+                        legacyPending.add(parity);
+                        while (legacyPending.size() > MAX_PENDING_GROUPS) legacyPending.remove(0);
+                    }
                 } else if (reedSolomonEnabled(ctx)) {
                     mergeReedSolomonParity(readReedSolomonParity(buf));
                 }
@@ -208,11 +218,16 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
             if (expired(ctx, group.createdAt)) { legacy.remove(); continue; }
             Entry missing = null;
             int missingCount = 0;
+            boolean inconsistent = false;
             final byte[] data = Arrays.copyOf(group.parity, group.parity.length);
             for (Entry entry : group.entries) {
                 final byte[] value = received.get(entry.seq);
                 if (value == null) { missing = entry; missingCount++; }
+                else if (value.length != entry.length) { inconsistent = true; break; }
                 else xorInto(data, value);
+            }
+            if (inconsistent) {
+                legacy.remove(); rememberGroup(group.id); continue;
             }
             if (missingCount == 0) {
                 legacy.remove(); rememberGroup(group.id);
@@ -230,10 +245,15 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
             final byte[][] data = new byte[group.entries.length][];
             final int[] lengths = new int[group.entries.length];
             int missing = 0;
+            boolean inconsistent = false;
             for (int i = 0; i < group.entries.length; i++) {
                 data[i] = received.get(group.entries[i].seq);
                 lengths[i] = group.entries[i].length;
                 if (data[i] == null) missing++;
+                else if (data[i].length != lengths[i]) { inconsistent = true; break; }
+            }
+            if (inconsistent) {
+                rs.remove(); rememberGroup(group.id); continue;
             }
             if (missing == 0) {
                 sendFeedback(ctx, group.id, 0);
@@ -326,6 +346,7 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
         final Entry[] entries = readEntries(in, in.readUnsignedByte(), LEGACY_MAX_PROTECTED_BYTES);
         final int size = in.readUnsignedShort();
         if (size > LEGACY_MAX_PROTECTED_BYTES || in.readableBytes() != size) throw new IllegalArgumentException("invalid XOR parity size");
+        for (Entry entry : entries) if (entry.length > size) throw new IllegalArgumentException("FEC entry exceeds parity");
         final byte[] parity = new byte[size]; in.readBytes(parity);
         return new LegacyParity(id, entries, parity, System.nanoTime());
     }

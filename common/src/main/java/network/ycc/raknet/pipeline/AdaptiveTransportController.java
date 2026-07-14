@@ -126,6 +126,11 @@ final class AdaptiveTransportController {
         return delay;
     }
 
+    boolean congestionWindowBlocked(long inFlightBytes, int nextDatagramBytes) {
+        return config.isAdaptiveTransportEnabled() && inFlightBytes > 0
+                && nextDatagramBytes > Math.max(0L, congestionWindowBytes - inFlightBytes);
+    }
+
     void onAck(int bytes, long rttNanos) {
         onAck(bytes, rttNanos, lastInFlightBytes);
     }

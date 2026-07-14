@@ -63,6 +63,8 @@ public class AdaptiveTransportControllerTest {
         when(config.getMaxQueuedBytes()).thenReturn(3 * 1024 * 1024);
         when(config.getMetrics()).thenReturn(mock(RakNet.MetricsLogger.class));
         final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        Assertions.assertTrue(controller.congestionWindowBlocked(controller.congestionWindowBytes(), 1400));
+        Assertions.assertFalse(controller.congestionWindowBlocked(0, 1400));
         Assertions.assertEquals(0, controller.sendBudget(System.nanoTime(), controller.congestionWindowBytes(), 1400));
         for (int i = 0; i < 4; i++) controller.onAck(1200, 20_000_000L, 0);
         for (int i = 0; i < 2; i++) controller.onEcnCe();

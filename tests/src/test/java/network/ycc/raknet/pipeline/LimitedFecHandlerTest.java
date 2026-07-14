@@ -1,8 +1,12 @@
 package network.ycc.raknet.pipeline;
 
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.List;
 
@@ -74,6 +78,23 @@ public class LimitedFecHandlerTest {
                 Assertions.assertArrayEquals(packets.get(first), recovered[0]);
                 Assertions.assertArrayEquals(packets.get(second), recovered[1]);
             }
+        }
+    }
+
+    @Test
+    public void rejectsLegacyMetadataLongerThanParityShard() throws Exception {
+        final ByteBuf packet = Unpooled.buffer();
+        packet.writeByte(0x1e).writeInt(1).writeByte(4);
+        for (int i = 0; i < 4; i++) packet.writeMediumLE(i).writeShort(5);
+        packet.writeShort(4).writeZero(4);
+        final Method read = LimitedFecHandler.class.getDeclaredMethod("readLegacyParity", ByteBuf.class);
+        read.setAccessible(true);
+        try {
+            final InvocationTargetException error = Assertions.assertThrows(
+                    InvocationTargetException.class, () -> read.invoke(null, packet));
+            Assertions.assertTrue(error.getCause() instanceof IllegalArgumentException);
+        } finally {
+            packet.release();
         }
     }
 }
