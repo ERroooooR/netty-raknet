@@ -125,6 +125,8 @@ public class RakNet {
         default void congestionControl(String mode, long congestionWindowBytes, long inFlightBytes,
                                        long bandwidthBytesPerSecond, long ackAggregationBytes,
                                        double ecnCeRatio) {}
+        default void congestionDiagnostics(String reason, double rttInflation, boolean pacingCapped,
+                                           boolean bandwidthProbeSuppressed) {}
         default void pathMtuState(String state, int confirmedMtu, int probeMtu, int maximumMtu) {}
 
         default void currentQueuedBytes(int bytes) {}

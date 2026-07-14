@@ -105,7 +105,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                         flush(ctx);
                     }
                     coalescedFrames = 0;
-                }, config.getSmallWriteCoalesceMicros(), TimeUnit.MICROSECONDS);
+                }, adaptive.smallWriteCoalesceMicros(), TimeUnit.MICROSECONDS);
             } else if (coalesceScheduled) {
                 coalescedFrames++;
             }
@@ -339,16 +339,13 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 
     protected void recallExpiredFrameSets() {
         final ObjectIterator<FrameSet> packetItr = pendingFrameSets.values().iterator();
-        //2 sd from mean RTT is about 97% coverage
-        final long baseTimeout = saturatedAdd(
-                saturatedAdd(Math.max(1, config.getRTTNanos()), saturatedMultiply(Math.max(0, config.getRTTStdDevNanos()), 2)),
-                Math.max(0, config.getRetryDelayNanos()));
         final long now = System.nanoTime();
         while (packetItr.hasNext()) {
             final FrameSet frameSet = packetItr.next();
             // exponential backoff: 1x, 2x, 4x, 8x (max)
-            final long multiplier = 1L << Math.min(frameSet.getRetryCount(), 3);
-            final long timeout = saturatedMultiply(baseTimeout, multiplier);
+            final long timeout = retransmissionTimeoutNanos(
+                    config.getRTTNanos(), config.getRTTStdDevNanos(), config.getRetryDelayNanos(),
+                    frameSet.getRetryCount());
             if (now - frameSet.getSentTime() > timeout) {
                 packetItr.remove();
                 inFlightBytes = Math.max(0, inFlightBytes - frameSet.getRoughSize());
@@ -369,6 +366,21 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 
     private static long saturatedMultiply(long value, long multiplier) {
         return value > Long.MAX_VALUE / multiplier ? Long.MAX_VALUE : value * multiplier;
+    }
+
+    static long retransmissionTimeoutNanos(long rttNanos, long rttStdDevNanos,
+                                           long retryDelayNanos, int retryCount) {
+        final long rtt = Math.max(1, rttNanos);
+        final long deviation = Math.max(0, rttStdDevNanos);
+        final long delay = Math.max(0, retryDelayNanos);
+        // NACKs provide fast recovery for observed gaps, so the timeout is a
+        // conservative fallback. A two-RTT floor prevents delayed ACKs and
+        // ordinary Internet jitter from creating duplicate reliable frames.
+        final long jitterTimeout = saturatedAdd(saturatedAdd(rtt,
+                saturatedMultiply(deviation, 4)), delay);
+        final long roundTripFloor = saturatedAdd(saturatedMultiply(rtt, 2), delay);
+        final long base = Math.max(jitterTimeout, roundTripFloor);
+        return saturatedMultiply(base, 1L << Math.min(Math.max(0, retryCount), 3));
     }
 
     protected void produceFrameSet(ChannelHandlerContext ctx, int maxSize) {

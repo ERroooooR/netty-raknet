@@ -12,7 +12,7 @@ import java.util.concurrent.atomic.LongAdder;
 
 /** Event-loop confined model-based congestion, loss and DPLPMTUD controller. */
 final class AdaptiveTransportController {
-    enum LossType { NONE, RANDOM, BURST, MTU_BLACK_HOLE, QUEUE }
+    enum LossType { NONE, RANDOM, BURST, RATE_LIMIT, MTU_BLACK_HOLE, QUEUE }
     enum CongestionMode { STARTUP, DRAIN, PROBE_BW, PROBE_RTT }
 
     private static final long DSCP_COOLDOWN = TimeUnit.SECONDS.toNanos(30);
@@ -22,10 +22,11 @@ final class AdaptiveTransportController {
     private static final LongAdder CONGESTED_VOTES = new LongAdder();
     private static final int WINDOW_BUCKETS = 10;
     private static final double[] PROBE_BW_GAINS = {1.25D, 0.75D, 1D, 1D, 1D, 1D, 1D, 1D};
-    private static final long MIN_RTT_FILTER_NANOS = TimeUnit.SECONDS.toNanos(10);
+    private static final long MIN_RTT_FILTER_NANOS = TimeUnit.SECONDS.toNanos(30);
     private static final long PROBE_RTT_NANOS = TimeUnit.MILLISECONDS.toNanos(200);
     private static final long MIN_CONGESTION_RESPONSE_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(250);
     private static final long MIN_LOSS_RECOVERY_QUIET_NANOS = TimeUnit.MILLISECONDS.toNanos(500);
+    private static final long MIN_BANDWIDTH_PROBE_COOLDOWN_NANOS = TimeUnit.SECONDS.toNanos(5);
 
     private final RakNet.Config config;
     private DplpmtudController pathMtu;
@@ -68,6 +69,10 @@ final class AdaptiveTransportController {
     private long lastCongestionResponseNanos;
     private long lossRecoveryUpdatedNanos;
     private double lossPacingCeiling = Double.POSITIVE_INFINITY;
+    private long bandwidthProbeSuppressedUntil;
+    private String congestionReason = "NONE";
+    private boolean pacingCapped;
+    private long pacingRateUpdatedNanos = System.nanoTime();
 
     AdaptiveTransportController(RakNet.Config config) {
         this.config = config;
@@ -100,7 +105,8 @@ final class AdaptiveTransportController {
             publishCongestionMetrics();
             return 0;
         }
-        final int burst = lossType == LossType.BURST || lossType == LossType.QUEUE ? 1 : 4;
+        final int burst = lossType == LossType.BURST || lossType == LossType.QUEUE
+                || lossType == LossType.RATE_LIMIT ? 1 : 4;
         if (tokenUpdatedNanos == 0) {
             tokenUpdatedNanos = nowNanos;
         } else if (nowNanos > tokenUpdatedNanos) {
@@ -165,9 +171,11 @@ final class AdaptiveTransportController {
         final double recentLoss = lossRatio();
         if (queueInflated() && recentLoss >= 0.01D) {
             lossType = LossType.QUEUE;
+            congestionReason = "RTT_INFLATION_LOSS";
             enterCongestion(now);
         } else if (recentLoss < 0.005D && lossQuiet(now)) {
             lossType = LossType.NONE;
+            congestionReason = "NONE";
         }
         updateCongestionModel(now, inFlightBytes, bytes);
         publishMetrics();
@@ -180,26 +188,39 @@ final class AdaptiveTransportController {
         consecutiveLosses++;
         final long now = System.nanoTime();
         lastLossNanos = now;
-        if (timeout && !queueInflated() && bytes >= config.getMTU() - 64 && recordLargeLoss(now) >= 3) {
+        if (timeout && !queueInflated() && (lossSampleCount() < 64 || lossRatio() < 0.02D)
+                && bytes >= config.getMTU() - 64 && recordLargeLoss(now) >= 3) {
             lossType = LossType.MTU_BLACK_HOLE;
+            congestionReason = "MTU_BLACK_HOLE";
             pathMtu.onBlackHole();
             largeLosses = 0;
         } else if (queueInflated() && (timeout || lossRatio() >= 0.01D)) {
             lossType = LossType.QUEUE;
-        } else if (timeout && lossRatio() > 0.05D) {
-            lossType = LossType.QUEUE;
+            congestionReason = "RTT_INFLATION_LOSS";
+        } else if (nonCongestiveHighLoss()) {
+            lossType = LossType.RATE_LIMIT;
+            congestionReason = "NON_CONGESTIVE_HIGH_LOSS";
         } else if (consecutiveLosses >= 3) {
             lossType = LossType.BURST;
+            congestionReason = "CONSECUTIVE_LOSS";
         } else {
             lossType = LossType.RANDOM;
+            congestionReason = "ISOLATED_LOSS";
         }
-        if (lossType == LossType.QUEUE || lossType == LossType.BURST) {
-            enterCongestion(now);
+        final boolean severeLoss = lossType == LossType.QUEUE || lossType == LossType.BURST
+                || lossType == LossType.RATE_LIMIT;
+        final boolean newCongestionResponse = !severeLoss || enterCongestion(now);
+        final double reduction = lossType == LossType.RATE_LIMIT ? 0.70D
+                : lossType == LossType.QUEUE || lossType == LossType.BURST ? 0.75D : 0.85D;
+        // A NACK range or one expired FrameSet can report many losses in the
+        // same event-loop turn. The congestion window already responds at most
+        // once per RTT; apply the pacing reduction at that same cadence instead
+        // of multiplying the rate down to the configured floor immediately.
+        if (newCongestionResponse) {
+            packetsPerSecond = clampPps(packetsPerSecond * reduction);
+            lossPacingCeiling = Math.min(lossPacingCeiling, packetsPerSecond);
+            lossRecoveryUpdatedNanos = now;
         }
-        final double reduction = lossType == LossType.QUEUE || lossType == LossType.BURST ? 0.75D : 0.85D;
-        packetsPerSecond = clampPps(packetsPerSecond * reduction);
-        lossPacingCeiling = Math.min(lossPacingCeiling, packetsPerSecond);
-        lossRecoveryUpdatedNanos = now;
         publishMetrics();
     }
 
@@ -209,6 +230,7 @@ final class AdaptiveTransportController {
         ecnMarks[bucket]++;
         if (ecnCeRatio() >= 0.10D) {
             lossType = LossType.QUEUE;
+            congestionReason = "ECN_CE";
             congestionMode = CongestionMode.DRAIN;
             congestionWindowBytes = Math.max(minimumCongestionWindow(), congestionWindowBytes * 7L / 8L);
             packetsPerSecond = clampPps(packetsPerSecond * 0.90D);
@@ -228,7 +250,15 @@ final class AdaptiveTransportController {
     boolean shouldUseFec() {
         final double ratio = lossRatio();
         return config.isAdaptiveTransportEnabled() && lossType == LossType.RANDOM
-                && ratio >= 0.005D && ratio <= 0.15D;
+                && ratio >= 0.005D && ratio <= 0.03D;
+    }
+
+    int smallWriteCoalesceMicros() {
+        final int base = config.getSmallWriteCoalesceMicros();
+        if (!config.isAdaptiveTransportEnabled()) return base;
+        if (lossType == LossType.RATE_LIMIT) return Math.max(base, 1_500);
+        if (lossType == LossType.QUEUE || lossType == LossType.BURST) return Math.max(base, 750);
+        return base;
     }
 
     int probeCandidate() { return pathMtu.nextProbe(System.nanoTime()); }
@@ -278,7 +308,8 @@ final class AdaptiveTransportController {
         if (!config.isAdaptiveDscpEnabled() || channel == null) return;
         final long now = System.nanoTime();
         if (now - lastDscpVote >= TimeUnit.SECONDS.toNanos(1)) {
-            if (lossType == LossType.BURST || lossType == LossType.QUEUE) CONGESTED_VOTES.increment();
+            if (lossType == LossType.BURST || lossType == LossType.QUEUE
+                    || lossType == LossType.RATE_LIMIT) CONGESTED_VOTES.increment();
             else HEALTHY_VOTES.increment();
             lastDscpVote = now;
         }
@@ -327,18 +358,37 @@ final class AdaptiveTransportController {
                     (congestionWindowBytes * 7L + target) / 8L);
         }
         updateMode(now, inFlightBytes);
-        final double gain = pacingGain();
+        final double gain = pacingGain(now);
         if (bandwidth > 0) {
             final double modelRate = (bandwidth * gain) / Math.max(64D, averagePacketBytes);
-            packetsPerSecond = clampPps(applyLossPacingCeiling(now, modelRate));
+            final double lossLimitedRate = applyLossPacingCeiling(now, modelRate);
+            packetsPerSecond = clampPps(applyPacingSlew(now, lossLimitedRate));
         }
     }
 
-    private void enterCongestion(long now) {
+    private double applyPacingSlew(long now, double targetRate) {
+        if (targetRate <= packetsPerSecond) {
+            pacingRateUpdatedNanos = now;
+            return targetRate;
+        }
+        final long elapsed = Math.min(TimeUnit.SECONDS.toNanos(1),
+                Math.max(0L, now - pacingRateUpdatedNanos));
+        pacingRateUpdatedNanos = now;
+        // In steady state, at most double the pacing rate per second. This
+        // filters ACK-compression spikes without delaying immediate reductions.
+        final double growthExponent = elapsed / 1_000_000_000D;
+        return Math.min(targetRate, packetsPerSecond * Math.pow(2D, growthExponent));
+    }
+
+    private boolean enterCongestion(long now) {
         congestionMode = CongestionMode.DRAIN;
         final long responseInterval = Math.max(MIN_CONGESTION_RESPONSE_INTERVAL_NANOS, smoothedRtt);
-        if (lastCongestionResponseNanos != 0 && now - lastCongestionResponseNanos < responseInterval) return;
+        if (lastCongestionResponseNanos != 0 && now - lastCongestionResponseNanos < responseInterval) return false;
         lastCongestionResponseNanos = now;
+        bandwidthProbeSuppressedUntil = Math.max(bandwidthProbeSuppressedUntil,
+                now + Math.max(MIN_BANDWIDTH_PROBE_COOLDOWN_NANOS,
+                        saturatedMultiply(smoothedRtt, 8L)));
+        gainCycle = 2; // resume at 1.0 rather than immediately probing at 1.25
         congestionWindowBytes = Math.max(minimumCongestionWindow(), congestionWindowBytes * 3L / 4L);
         // A policer/queue event makes the old max-bandwidth samples unsafe. Keep
         // some history for quick recovery, but do not let the next ACK restore
@@ -347,10 +397,14 @@ final class AdaptiveTransportController {
             bandwidthFilter[i] = bandwidthFilter[i] * 3L / 4L;
         }
         deliveryRateBytesPerSecond = maxBandwidth();
+        return true;
     }
 
     private double applyLossPacingCeiling(long now, double modelRate) {
-        if (Double.isInfinite(lossPacingCeiling)) return modelRate;
+        if (Double.isInfinite(lossPacingCeiling)) {
+            pacingCapped = false;
+            return modelRate;
+        }
         final long quietPeriod = Math.max(MIN_LOSS_RECOVERY_QUIET_NANOS,
                 saturatedMultiply(smoothedRtt, 2L));
         if (now - lastLossNanos > quietPeriod) {
@@ -364,9 +418,11 @@ final class AdaptiveTransportController {
             if (lossPacingCeiling >= modelRate || (lossRatio() < 0.005D
                     && now - lastLossNanos > TimeUnit.SECONDS.toNanos(5))) {
                 lossPacingCeiling = Double.POSITIVE_INFINITY;
+                pacingCapped = false;
                 return modelRate;
             }
         }
+        pacingCapped = modelRate > lossPacingCeiling;
         return Math.min(modelRate, lossPacingCeiling);
     }
 
@@ -379,6 +435,7 @@ final class AdaptiveTransportController {
         final long rtt = minRtt == Long.MAX_VALUE ? Math.max(1, smoothedRtt) : minRtt;
         final long bdp = Math.max(minimumCongestionWindow(), saturatedMultiply(maxBandwidth(), rtt) / 1_000_000_000L);
         if (minRttStamp != 0 && now - minRttStamp > MIN_RTT_FILTER_NANOS
+                && canProbeRtt(now)
                 && congestionMode != CongestionMode.PROBE_RTT) {
             congestionMode = CongestionMode.PROBE_RTT;
             probeRttStarted = 0;
@@ -402,11 +459,17 @@ final class AdaptiveTransportController {
         }
     }
 
-    private double pacingGain() {
+    private boolean canProbeRtt(long now) {
+        return lossType == LossType.NONE && lossRatio() < 0.005D && lossQuiet(now)
+                && now >= bandwidthProbeSuppressedUntil;
+    }
+
+    private double pacingGain(long now) {
         if (congestionMode == CongestionMode.STARTUP) return 2D;
         if (congestionMode == CongestionMode.DRAIN) return 0.75D;
         if (congestionMode == CongestionMode.PROBE_RTT) return 0.5D;
-        return PROBE_BW_GAINS[gainCycle];
+        final double gain = PROBE_BW_GAINS[gainCycle];
+        return now < bandwidthProbeSuppressedUntil ? Math.min(1D, gain) : gain;
     }
 
     private void updateAckAggregation(long now, int bytes) {
@@ -475,7 +538,18 @@ final class AdaptiveTransportController {
         return max;
     }
 
-    private boolean queueInflated() { return minRtt != Long.MAX_VALUE && smoothedRtt > minRtt * 2; }
+    private boolean queueInflated() {
+        return minRtt != Long.MAX_VALUE && smoothedRtt > minRtt * 3L / 2L;
+    }
+    private boolean nonCongestiveHighLoss() {
+        return lossSampleCount() >= 64 && lossRatio() >= 0.03D
+                && minRtt != Long.MAX_VALUE && smoothedRtt < minRtt * 3L / 2L;
+    }
+    private long lossSampleCount() {
+        long samples = 0;
+        for (int i = 0; i < WINDOW_BUCKETS; i++) samples += acked[i] + lost[i];
+        return samples;
+    }
     private long minimumCongestionWindow() { return Math.max(4L * config.getMTU(), 4L * 576L); }
     private long maximumCongestionWindow() { return Math.max(minimumCongestionWindow(), config.getMaxQueuedBytes()); }
 
@@ -494,6 +568,10 @@ final class AdaptiveTransportController {
     private void publishCongestionMetrics() {
         config.getMetrics().congestionControl(congestionMode.name(), congestionWindowBytes,
                 lastInFlightBytes, maxBandwidth(), ackAggregationBytes, ecnCeRatio());
+        final double inflation = minRtt == Long.MAX_VALUE || minRtt <= 0 ? 1D
+                : Math.max(1D, smoothedRtt / (double) minRtt);
+        config.getMetrics().congestionDiagnostics(congestionReason, inflation, pacingCapped,
+                System.nanoTime() < bandwidthProbeSuppressedUntil);
     }
 
     private void publishPathMtuMetrics() {

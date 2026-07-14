@@ -104,6 +104,91 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
+    public void probeRttIsDeferredWhileLossIsActive() throws Exception {
+        final RakNet.Config config = adaptiveConfig();
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        controller.onAck(1200, 20_000_000L, 0);
+        setLong(controller, "minRttStamp", System.nanoTime() - 31_000_000_000L);
+
+        controller.onLoss(600, false);
+        controller.sendBudget(System.nanoTime(), 0, 1400);
+
+        Assertions.assertNotEquals(AdaptiveTransportController.CongestionMode.PROBE_RTT,
+                controller.congestionMode());
+    }
+
+    @Test
+    public void healthyStaleMinRttStillStartsProbeRtt() throws Exception {
+        final RakNet.Config config = adaptiveConfig();
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        controller.onAck(1200, 20_000_000L, 0);
+        setLong(controller, "minRttStamp", System.nanoTime() - 31_000_000_000L);
+
+        controller.sendBudget(System.nanoTime(), 0, 1400);
+
+        Assertions.assertEquals(AdaptiveTransportController.CongestionMode.PROBE_RTT,
+                controller.congestionMode());
+    }
+
+    @Test
+    public void sustainedHighLossWithoutRttInflationUsesRateLimitMode() {
+        final RakNet.Config config = adaptiveConfig();
+        when(config.getSmallWriteCoalesceMicros()).thenReturn(500);
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        for (int i = 0; i < 62; i++) controller.onAck(600, 20_000_000L, 0);
+
+        controller.onLoss(600, false);
+        controller.onAck(600, 20_000_000L, 0);
+        controller.onLoss(600, false);
+
+        Assertions.assertEquals(AdaptiveTransportController.LossType.RATE_LIMIT, controller.lossType());
+        Assertions.assertFalse(controller.shouldUseFec());
+        Assertions.assertEquals(1_500, controller.smallWriteCoalesceMicros());
+    }
+
+    @Test
+    public void oneLossBurstCannotRepeatedlyCollapsePacingWithinOneRtt() {
+        final RakNet.Config config = adaptiveConfig();
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        for (int i = 0; i < 64; i++) controller.onAck(600, 20_000_000L, 0);
+
+        controller.onLoss(600, false);
+        controller.onLoss(600, false);
+        final double firstCongestionResponseRate = controller.packetsPerSecond();
+        for (int i = 0; i < 20; i++) controller.onLoss(600, false);
+
+        Assertions.assertEquals(AdaptiveTransportController.LossType.RATE_LIMIT, controller.lossType());
+        Assertions.assertEquals(firstCongestionResponseRate, controller.packetsPerSecond(), 0.01D);
+        Assertions.assertTrue(controller.packetsPerSecond() > config.getAdaptiveMinPps());
+    }
+
+    @Test
+    public void retransmissionTimeoutUsesTwoRttFloorAndExponentialBackoff() {
+        final long millis = 1_000_000L;
+        Assertions.assertEquals(200 * millis,
+                ReliabilityHandler.retransmissionTimeoutNanos(75 * millis, 5 * millis, 50 * millis, 0));
+        Assertions.assertEquals(400 * millis,
+                ReliabilityHandler.retransmissionTimeoutNanos(75 * millis, 5 * millis, 50 * millis, 1));
+        Assertions.assertEquals(205 * millis,
+                ReliabilityHandler.retransmissionTimeoutNanos(75 * millis, 20 * millis, 50 * millis, 0));
+    }
+
+    @Test
+    public void ackCompressionCannotInstantlyJumpToMaximumPacing() throws Exception {
+        final RakNet.Config config = adaptiveConfig();
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        final Field bandwidth = AdaptiveTransportController.class.getDeclaredField("bandwidthFilter");
+        bandwidth.setAccessible(true);
+        Arrays.fill((long[]) bandwidth.get(controller), 1_000_000L);
+        setLong(controller, "pacingRateUpdatedNanos", System.nanoTime() - 100_000_000L);
+
+        controller.onAck(1200, 20_000_000L, 0);
+
+        Assertions.assertTrue(controller.packetsPerSecond() < 600D,
+                "100ms of growth must not jump from 500pps to the 2000pps maximum");
+    }
+
+    @Test
     public void ecnFeedbackIsIgnoredWhenAdaptiveTransportIsDisabled() {
         final RakNet.Config config = mock(RakNet.Config.class);
         when(config.isAdaptiveTransportEnabled()).thenReturn(false);
@@ -150,5 +235,11 @@ public class AdaptiveTransportControllerTest {
         when(config.getMaxQueuedBytes()).thenReturn(3 * 1024 * 1024);
         when(config.getMetrics()).thenReturn(mock(RakNet.MetricsLogger.class));
         return config;
+    }
+
+    private static void setLong(Object target, String name, long value) throws Exception {
+        final Field field = target.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        field.setLong(target, value);
     }
 }
