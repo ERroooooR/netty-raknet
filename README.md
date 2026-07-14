@@ -42,9 +42,9 @@ room for extension with any plugins or custom behavior.
 
 ## Adaptive transport
 
-Protocol version 11 is the default and remains compatible with maintained Mojang RakNet
-implementations. Versions 9 and 10 are still accepted. This fork adds protocol version 12 for
-explicitly negotiated transport extensions; v9-v11 never emit extension packets.
+Protocol version 12 is preferred by default so peers can explicitly negotiate this fork's
+transport extensions. Clients automatically retry with version 11 when a server rejects v12;
+versions 9-11 remain accepted and never emit extension packets.
 
 Adaptive pacing, rolling-window loss classification, idle-boundary MTU fallback/recovery and
 PPS-aware batching are enabled by default. Configure them through Netty channel options:

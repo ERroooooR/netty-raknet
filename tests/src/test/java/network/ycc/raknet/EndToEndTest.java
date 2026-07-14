@@ -19,6 +19,7 @@ import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.PromiseCombiner;
 import network.ycc.raknet.channel.DatagramChannelProxy;
+import network.ycc.raknet.client.channel.RakNetClientChannel;
 import network.ycc.raknet.client.channel.RakNetClientThreadedChannel;
 import network.ycc.raknet.config.DefaultCodec;
 import network.ycc.raknet.frame.FrameData;
@@ -134,7 +135,25 @@ public class EndToEndTest {
     public void protocol12NegotiatesAdaptiveFeatures() throws Throwable {
         final Channel server = newServer(null, null, null);
         final Channel client = newClient(null, null, 12);
+        Assertions.assertTrue(client instanceof RakNetClientThreadedChannel);
+        Assertions.assertTrue(client.parent() instanceof RakNetClientChannel);
         Assertions.assertEquals(TransportFeatures.SUPPORTED,
+                client.parent().attr(RakNet.TRANSPORT_FEATURES).get().longValue());
+        client.close().sync();
+        server.close().sync();
+    }
+
+    @Test
+    public void protocol12FallsBackToLegacyServer() throws Throwable {
+        final Channel server = newServer(new ChannelInitializer<Channel>() {
+            @Override
+            protected void initChannel(Channel ch) {
+                RakNet.config(ch).setprotocolVersions(new int[]{9, 10, 11});
+            }
+        }, null, null);
+        final Channel client = newClient(null, null, 12);
+        Assertions.assertEquals(11, RakNet.config(client.parent()).getProtocolVersion());
+        Assertions.assertEquals(0L,
                 client.parent().attr(RakNet.TRANSPORT_FEATURES).get().longValue());
         client.close().sync();
         server.close().sync();

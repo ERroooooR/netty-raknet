@@ -35,6 +35,7 @@ public class TransportFeatureTest {
         decoded.decode(encoded);
         Assertions.assertEquals(3, decoded.getnExtraAddresses());
         Assertions.assertEquals(TransportFeatures.FEC, decoded.getTransportFeatures());
+        Assertions.assertEquals(1234L, decoded.getTimestamp());
         encoded.release();
     }
 }

@@ -182,6 +182,7 @@ final class AdaptiveTransportController {
     }
 
     void onEcnCe() {
+        if (!config.isAdaptiveTransportEnabled()) return;
         rotate();
         ecnMarks[bucket]++;
         if (ecnCeRatio() >= 0.10D) {

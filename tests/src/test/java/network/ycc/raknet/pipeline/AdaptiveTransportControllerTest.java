@@ -71,6 +71,26 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
+    public void ecnFeedbackIsIgnoredWhenAdaptiveTransportIsDisabled() {
+        final RakNet.Config config = mock(RakNet.Config.class);
+        when(config.isAdaptiveTransportEnabled()).thenReturn(false);
+        when(config.getMTU()).thenReturn(1400);
+        when(config.getAdaptiveMinPps()).thenReturn(50);
+        when(config.getAdaptiveMaxPps()).thenReturn(2000);
+        when(config.getPlpmtudMaxMtu()).thenReturn(1500);
+        when(config.getMaxQueuedBytes()).thenReturn(3 * 1024 * 1024);
+        when(config.getMetrics()).thenReturn(mock(RakNet.MetricsLogger.class));
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        final long initialWindow = controller.congestionWindowBytes();
+
+        for (int i = 0; i < 10; i++) controller.onEcnCe();
+
+        Assertions.assertEquals(AdaptiveTransportController.LossType.NONE, controller.lossType());
+        Assertions.assertEquals(AdaptiveTransportController.CongestionMode.STARTUP, controller.congestionMode());
+        Assertions.assertEquals(initialWindow, controller.congestionWindowBytes());
+    }
+
+    @Test
     public void adaptiveTuningOptionsRoundTripAndValidate() {
         final EmbeddedChannel channel = new EmbeddedChannel();
         final DefaultConfig config = new DefaultConfig(channel);

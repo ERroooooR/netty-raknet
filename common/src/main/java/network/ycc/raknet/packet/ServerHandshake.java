@@ -60,7 +60,7 @@ public class ServerHandshake extends SimpleFramedPacket {
             readAddress(buf);
         }
         timestamp = buf.readLong();
-        timestamp = buf.readLong();
+        buf.readLong(); // server timestamp; the echoed client timestamp above is used by ClientHandshake
     }
 
     public InetSocketAddress getClientAddr() {

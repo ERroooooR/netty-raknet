@@ -52,6 +52,10 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
                         config.setProtocolVersion(11);
                         cr1Retries = 0;
                         resetRetryCount();
+                    } else if (triedLegacyFallback && config.getProtocolVersion() == 11) {
+                        // A v12 burst can produce more than one rejection. Ignore stale replies
+                        // and let the periodic CR1 sender continue the v11 fallback attempt.
+                        return;
                     } else {
                         fail(new InvalidVersion.InvalidVersionException());
                     }

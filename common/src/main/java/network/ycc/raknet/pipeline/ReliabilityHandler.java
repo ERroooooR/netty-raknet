@@ -408,7 +408,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             produceFrameSet(ctx, maxSize);
         }
         adaptive.applyDscp(ctx.channel().parent());
-        if (!frameQueue.isEmpty() && !pacingScheduled) {
+        if (config.isAdaptiveTransportEnabled() && !frameQueue.isEmpty() && !pacingScheduled) {
             pacingScheduled = true;
             ctx.executor().schedule(() -> {
                 pacingScheduled = false;
