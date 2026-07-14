@@ -61,6 +61,7 @@ final class AdaptiveTransportController {
     private long deliveryRateBytesPerSecond;
     private long deliverySampleStarted;
     private long deliverySampleBytes;
+    private boolean deliverySampleApplicationLimited = true;
     private long robustBandwidthBytesPerSecond;
     private long bandwidthEstimateUpdatedNanos;
     private long lastDscpVote;
@@ -175,13 +176,17 @@ final class AdaptiveTransportController {
     }
 
     void onAck(int bytes, long rttNanos, long inFlightBytes) {
+        onAck(bytes, rttNanos, inFlightBytes, false);
+    }
+
+    void onAck(int bytes, long rttNanos, long inFlightBytes, boolean applicationLimited) {
         if (!config.isAdaptiveTransportEnabled()) return;
         rotate();
         acked[bucket]++;
         ackedBytes[bucket] += bytes;
         final long now = System.nanoTime();
         averagePacketBytes = averagePacketBytes * 0.875D + bytes * 0.125D;
-        updateDeliveryRate(now, bytes);
+        updateDeliveryRate(now, bytes, applicationLimited);
         updateAckAggregation(now, bytes);
         if (rttNanos > 0) {
             if (rttNanos < minRtt || minRttStamp == 0) {
@@ -419,7 +424,13 @@ final class AdaptiveTransportController {
         if (bandwidth > 0) {
             final double modelRate = (bandwidth * gain) / Math.max(64D, averagePacketBytes);
             final double lossLimitedRate = applyLossPacingCeiling(now, modelRate);
-            packetsPerSecond = clampPps(applyPacingSlew(now, lossLimitedRate));
+            // Delivery is self-clocked by this pacer. In the absence of an
+            // explicit loss/ECN reduction, a low observed rate must not lower
+            // the pacer and create a feedback loop that can never probe back
+            // above the configured minimum.
+            final double explicitCongestionFloor = Math.min(packetsPerSecond, lossPacingCeiling);
+            final double demandAwareRate = Math.max(lossLimitedRate, explicitCongestionFloor);
+            packetsPerSecond = clampPps(applyPacingSlew(now, demandAwareRate));
         }
     }
 
@@ -556,7 +567,16 @@ final class AdaptiveTransportController {
     }
 
     void updateDeliveryRate(long now, int bytes) {
-        if (deliverySampleStarted == 0) deliverySampleStarted = now;
+        updateDeliveryRate(now, bytes, false);
+    }
+
+    void updateDeliveryRate(long now, int bytes, boolean applicationLimited) {
+        if (deliverySampleStarted == 0) {
+            deliverySampleStarted = now;
+            deliverySampleApplicationLimited = applicationLimited;
+        } else {
+            deliverySampleApplicationLimited &= applicationLimited;
+        }
         deliverySampleBytes += bytes;
         final long interval = now - deliverySampleStarted;
         // Sub-RTT samples mostly measure ACK batching/compression rather than
@@ -566,11 +586,13 @@ final class AdaptiveTransportController {
                 Math.min(MAX_DELIVERY_SAMPLE_NANOS, Math.max(1L, saturatedMultiply(smoothedRtt, 2L))));
         if (interval < samplingWindow) return;
         final long sample = saturatedMultiply(deliverySampleBytes, 1_000_000_000L) / interval;
-        if (robustBandwidthBytesPerSecond == 0L) {
+        final boolean mayLowerEstimate = !deliverySampleApplicationLimited;
+        if (robustBandwidthBytesPerSecond == 0L && mayLowerEstimate) {
             final long initialCeiling = saturatedMultiply(config.getMTU(),
                     Math.max(1L, config.getAdaptiveMaxPps()));
             robustBandwidthBytesPerSecond = Math.min(sample, initialCeiling);
-        } else {
+        } else if (robustBandwidthBytesPerSecond > 0L
+                && (mayLowerEstimate || sample > robustBandwidthBytesPerSecond)) {
             final long estimateElapsed = bandwidthEstimateUpdatedNanos == 0L ? interval
                     : Math.max(0L, now - bandwidthEstimateUpdatedNanos);
             // A real capacity increase may grow the estimate, but no faster than
@@ -588,10 +610,14 @@ final class AdaptiveTransportController {
             }
         }
         bandwidthEstimateUpdatedNanos = now;
-        bandwidthFilter[bucket] = robustBandwidthBytesPerSecond;
-        deliveryRateBytesPerSecond = robustBandwidthBytesPerSecond;
+        if (robustBandwidthBytesPerSecond > 0L) {
+            bandwidthFilter[bucket] = robustBandwidthBytesPerSecond;
+        }
+        deliveryRateBytesPerSecond = robustBandwidthBytesPerSecond > 0L
+                ? robustBandwidthBytesPerSecond : sample;
         deliverySampleStarted = now;
         deliverySampleBytes = 0;
+        deliverySampleApplicationLimited = true;
     }
 
     private double lossRatio() {

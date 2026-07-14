@@ -38,6 +38,7 @@ public final class FrameSet extends AbstractReferenceCounted implements Packet {
     protected ResourceLeakTracker<FrameSet> tracker;
     protected int size;
     protected int retryCount;
+    protected boolean applicationLimited;
     private FrameSet(Recycler.Handle<FrameSet> handle) {
         this.handle = handle;
         setRefCnt(0);
@@ -51,6 +52,7 @@ public final class FrameSet extends AbstractReferenceCounted implements Packet {
         out.sentTime = System.nanoTime();
         out.seqId = 0;
         out.retryCount = 0;
+        out.applicationLimited = false;
         out.tracker = leakDetector.track(out);
         out.size = HEADER_SIZE;
         out.setRefCnt(1);
@@ -189,6 +191,14 @@ public final class FrameSet extends AbstractReferenceCounted implements Packet {
 
     public void setRetryCount(int retryCount) {
         this.retryCount = retryCount;
+    }
+
+    public boolean isApplicationLimited() {
+        return applicationLimited;
+    }
+
+    public void setApplicationLimited(boolean applicationLimited) {
+        this.applicationLimited = applicationLimited;
     }
 
     public boolean isEmpty() {

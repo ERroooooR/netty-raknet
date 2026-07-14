@@ -260,7 +260,8 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 if (frameSet != null) {
                     ackdBytes += frameSet.getRoughSize();
                     inFlightBytes = Math.max(0, inFlightBytes - frameSet.getRoughSize());
-                    adaptive.onAck(frameSet.getRoughSize(), System.nanoTime() - frameSet.getSentTime(), inFlightBytes);
+                    adaptive.onAck(frameSet.getRoughSize(), System.nanoTime() - frameSet.getSentTime(),
+                            inFlightBytes, frameSet.isApplicationLimited());
                     adjustResendGauge(1);
                     frameSet.succeed();
                     frameSet.release();
@@ -542,6 +543,10 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             frameSet.addPacket(frame);
         }
         if (!frameSet.isEmpty()) {
+            // A delivery sample produced after draining the application queue
+            // measures demand, not path capacity. Carry that information with
+            // the FrameSet until its ACK arrives.
+            frameSet.setApplicationLimited(frameQueue.isEmpty());
             frameSet.setRetryCount(minRetryCount == Integer.MAX_VALUE ? 0 : minRetryCount);
             frameSet.setSeqId(nextSendSeqId);
             nextSendSeqId = UINT.B3.plus(nextSendSeqId, 1);

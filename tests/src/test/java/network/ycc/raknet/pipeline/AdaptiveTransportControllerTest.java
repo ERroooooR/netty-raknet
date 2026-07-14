@@ -286,6 +286,34 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
+    public void applicationLimitedSamplesDoNotSeedAFalseLowCapacity() {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        final long second = 1_000_000_000L;
+
+        controller.updateDeliveryRate(second, 120, true);
+        controller.updateDeliveryRate(second + 100_000_000L, 120, true);
+        Assertions.assertEquals(0L, controller.bandwidthEstimateBytesPerSecond(),
+                "idle/login traffic must not become the path capacity estimate");
+
+        controller.updateDeliveryRate(second + 200_000_000L, 1_200, false);
+        Assertions.assertEquals(12_000L, controller.bandwidthEstimateBytesPerSecond(),
+                "a backlogged delivery sample should seed the estimate");
+    }
+
+    @Test
+    public void healthyLowDeliveryEstimateCannotSelfLockPacingAtMinimum() throws Exception {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        setLong(controller, "robustBandwidthBytesPerSecond", 3_000L);
+
+        controller.onAck(128, 20_000_000L, 0, true);
+
+        Assertions.assertEquals(500D, controller.packetsPerSecond(), 0.01D,
+                "a demand-limited ACK must not collapse the healthy initial pacer");
+        Assertions.assertTrue(controller.bytePacingRateBytesPerSecondMetric() >= 350_000L,
+                "byte pacing must retain enough headroom for a later chunk burst");
+    }
+
+    @Test
     public void ecnFeedbackIsIgnoredWhenAdaptiveTransportIsDisabled() {
         final RakNet.Config config = mock(RakNet.Config.class);
         when(config.isAdaptiveTransportEnabled()).thenReturn(false);
