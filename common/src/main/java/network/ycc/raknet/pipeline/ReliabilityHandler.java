@@ -33,6 +33,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected final IntSortedSet ackSet = new IntRBTreeSet(UINT.B3.COMPARATOR);
     protected final PriorityQueue<Frame> frameQueue = new PriorityQueue<>(Frame.COMPARATOR);
     protected final Int2ObjectLinkedOpenHashMap<FrameSet> pendingFrameSets = new Int2ObjectLinkedOpenHashMap<>();
+    protected final ReliableReceiveWindow reliableReceiveWindow = new ReliableReceiveWindow();
 
     protected int queuedBytes = 0;
     protected long inFlightBytes = 0;
@@ -211,7 +212,19 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         }
         config.getMetrics().packetsIn(1);
         config.getMetrics().framesIn(frameSet.getNumPackets());
-        frameSet.createFrames(ctx::fireChannelRead);
+        frameSet.createFrames(frame -> {
+            if (frame.getReliability().isReliable
+                    && !reliableReceiveWindow.accept(frame.getReliableIndex())) {
+                // Retransmitted FrameSets use a fresh sequence ID, so ACKing the
+                // FrameSet is not enough to suppress duplicate reliable frames.
+                // In particular, a duplicate split fragment can otherwise create
+                // an orphan FrameJoiner builder after the original was completed.
+                config.getMetrics().reliableFrameDuplicate(1);
+                frame.release();
+                return;
+            }
+            ctx.fireChannelRead(frame);
+        });
         trySendResponses(ctx);
         ctx.fireChannelReadComplete();
     }

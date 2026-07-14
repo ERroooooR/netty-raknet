@@ -6,6 +6,9 @@ import io.netty.channel.embedded.EmbeddedChannel;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
+import java.util.Arrays;
+
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -73,6 +76,34 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
+    public void nackDuringRttInflationIsClassifiedAsQueueLoss() {
+        final RakNet.Config config = adaptiveConfig();
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+
+        controller.onAck(1200, 20_000_000L, 0);
+        controller.onAck(1200, 200_000_000L, 0);
+        controller.onLoss(600, false);
+
+        Assertions.assertEquals(AdaptiveTransportController.LossType.QUEUE, controller.lossType());
+        Assertions.assertEquals(AdaptiveTransportController.CongestionMode.DRAIN, controller.congestionMode());
+    }
+
+    @Test
+    public void returningAckCannotImmediatelyUndoLossPacingReduction() throws Exception {
+        final RakNet.Config config = adaptiveConfig();
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        controller.onLoss(600, false);
+        final double reducedRate = controller.packetsPerSecond();
+
+        final Field bandwidth = AdaptiveTransportController.class.getDeclaredField("bandwidthFilter");
+        bandwidth.setAccessible(true);
+        Arrays.fill((long[]) bandwidth.get(controller), 1_000_000L);
+        controller.onAck(1200, 20_000_000L, 0);
+
+        Assertions.assertEquals(reducedRate, controller.packetsPerSecond(), 0.01D);
+    }
+
+    @Test
     public void ecnFeedbackIsIgnoredWhenAdaptiveTransportIsDisabled() {
         final RakNet.Config config = mock(RakNet.Config.class);
         when(config.isAdaptiveTransportEnabled()).thenReturn(false);
@@ -107,5 +138,17 @@ public class AdaptiveTransportControllerTest {
         Assertions.assertThrows(IllegalArgumentException.class,
                 () -> config.setOption(RakNet.SMALL_WRITE_COALESCE_MICROS, -1));
         channel.finishAndReleaseAll();
+    }
+
+    private static RakNet.Config adaptiveConfig() {
+        final RakNet.Config config = mock(RakNet.Config.class);
+        when(config.isAdaptiveTransportEnabled()).thenReturn(true);
+        when(config.getMTU()).thenReturn(1400);
+        when(config.getAdaptiveMinPps()).thenReturn(50);
+        when(config.getAdaptiveMaxPps()).thenReturn(2000);
+        when(config.getPlpmtudMaxMtu()).thenReturn(1500);
+        when(config.getMaxQueuedBytes()).thenReturn(3 * 1024 * 1024);
+        when(config.getMetrics()).thenReturn(mock(RakNet.MetricsLogger.class));
+        return config;
     }
 }

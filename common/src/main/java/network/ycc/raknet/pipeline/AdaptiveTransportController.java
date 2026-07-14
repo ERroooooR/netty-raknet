@@ -24,6 +24,8 @@ final class AdaptiveTransportController {
     private static final double[] PROBE_BW_GAINS = {1.25D, 0.75D, 1D, 1D, 1D, 1D, 1D, 1D};
     private static final long MIN_RTT_FILTER_NANOS = TimeUnit.SECONDS.toNanos(10);
     private static final long PROBE_RTT_NANOS = TimeUnit.MILLISECONDS.toNanos(200);
+    private static final long MIN_CONGESTION_RESPONSE_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(250);
+    private static final long MIN_LOSS_RECOVERY_QUIET_NANOS = TimeUnit.MILLISECONDS.toNanos(500);
 
     private final RakNet.Config config;
     private DplpmtudController pathMtu;
@@ -62,6 +64,10 @@ final class AdaptiveTransportController {
     private int gainCycle;
     private long gainCycleStarted;
     private long lastInFlightBytes;
+    private long lastLossNanos;
+    private long lastCongestionResponseNanos;
+    private long lossRecoveryUpdatedNanos;
+    private double lossPacingCeiling = Double.POSITIVE_INFINITY;
 
     AdaptiveTransportController(RakNet.Config config) {
         this.config = config;
@@ -156,7 +162,13 @@ final class AdaptiveTransportController {
             largeLosses = 0;
             lastLargeLossNanos = 0;
         }
-        if (lossRatio() < 0.01D) lossType = LossType.NONE;
+        final double recentLoss = lossRatio();
+        if (queueInflated() && recentLoss >= 0.01D) {
+            lossType = LossType.QUEUE;
+            enterCongestion(now);
+        } else if (recentLoss < 0.005D && lossQuiet(now)) {
+            lossType = LossType.NONE;
+        }
         updateCongestionModel(now, inFlightBytes, bytes);
         publishMetrics();
     }
@@ -167,11 +179,14 @@ final class AdaptiveTransportController {
         lost[bucket]++;
         consecutiveLosses++;
         final long now = System.nanoTime();
-        if (bytes >= config.getMTU() - 64 && recordLargeLoss(now) >= 3) {
+        lastLossNanos = now;
+        if (timeout && !queueInflated() && bytes >= config.getMTU() - 64 && recordLargeLoss(now) >= 3) {
             lossType = LossType.MTU_BLACK_HOLE;
             pathMtu.onBlackHole();
             largeLosses = 0;
-        } else if (timeout && (lossRatio() > 0.05D || queueInflated())) {
+        } else if (queueInflated() && (timeout || lossRatio() >= 0.01D)) {
+            lossType = LossType.QUEUE;
+        } else if (timeout && lossRatio() > 0.05D) {
             lossType = LossType.QUEUE;
         } else if (consecutiveLosses >= 3) {
             lossType = LossType.BURST;
@@ -179,10 +194,12 @@ final class AdaptiveTransportController {
             lossType = LossType.RANDOM;
         }
         if (lossType == LossType.QUEUE || lossType == LossType.BURST) {
-            congestionWindowBytes = Math.max(minimumCongestionWindow(), congestionWindowBytes * 3L / 4L);
-            congestionMode = CongestionMode.DRAIN;
+            enterCongestion(now);
         }
-        packetsPerSecond = clampPps(packetsPerSecond * 0.85D);
+        final double reduction = lossType == LossType.QUEUE || lossType == LossType.BURST ? 0.75D : 0.85D;
+        packetsPerSecond = clampPps(packetsPerSecond * reduction);
+        lossPacingCeiling = Math.min(lossPacingCeiling, packetsPerSecond);
+        lossRecoveryUpdatedNanos = now;
         publishMetrics();
     }
 
@@ -195,6 +212,10 @@ final class AdaptiveTransportController {
             congestionMode = CongestionMode.DRAIN;
             congestionWindowBytes = Math.max(minimumCongestionWindow(), congestionWindowBytes * 7L / 8L);
             packetsPerSecond = clampPps(packetsPerSecond * 0.90D);
+            final long now = System.nanoTime();
+            lastLossNanos = now;
+            lossPacingCeiling = Math.min(lossPacingCeiling, packetsPerSecond);
+            lossRecoveryUpdatedNanos = now;
         }
         publishMetrics();
     }
@@ -202,6 +223,7 @@ final class AdaptiveTransportController {
     LossType lossType() { return lossType; }
     CongestionMode congestionMode() { return congestionMode; }
     long congestionWindowBytes() { return congestionWindowBytes; }
+    double packetsPerSecond() { return packetsPerSecond; }
 
     boolean shouldUseFec() {
         final double ratio = lossRatio();
@@ -307,8 +329,50 @@ final class AdaptiveTransportController {
         updateMode(now, inFlightBytes);
         final double gain = pacingGain();
         if (bandwidth > 0) {
-            packetsPerSecond = clampPps((bandwidth * gain) / Math.max(64D, averagePacketBytes));
+            final double modelRate = (bandwidth * gain) / Math.max(64D, averagePacketBytes);
+            packetsPerSecond = clampPps(applyLossPacingCeiling(now, modelRate));
         }
+    }
+
+    private void enterCongestion(long now) {
+        congestionMode = CongestionMode.DRAIN;
+        final long responseInterval = Math.max(MIN_CONGESTION_RESPONSE_INTERVAL_NANOS, smoothedRtt);
+        if (lastCongestionResponseNanos != 0 && now - lastCongestionResponseNanos < responseInterval) return;
+        lastCongestionResponseNanos = now;
+        congestionWindowBytes = Math.max(minimumCongestionWindow(), congestionWindowBytes * 3L / 4L);
+        // A policer/queue event makes the old max-bandwidth samples unsafe. Keep
+        // some history for quick recovery, but do not let the next ACK restore
+        // the exact pre-loss pacing rate immediately.
+        for (int i = 0; i < bandwidthFilter.length; i++) {
+            bandwidthFilter[i] = bandwidthFilter[i] * 3L / 4L;
+        }
+        deliveryRateBytesPerSecond = maxBandwidth();
+    }
+
+    private double applyLossPacingCeiling(long now, double modelRate) {
+        if (Double.isInfinite(lossPacingCeiling)) return modelRate;
+        final long quietPeriod = Math.max(MIN_LOSS_RECOVERY_QUIET_NANOS,
+                saturatedMultiply(smoothedRtt, 2L));
+        if (now - lastLossNanos > quietPeriod) {
+            final long elapsed = Math.max(0L, now - lossRecoveryUpdatedNanos);
+            if (elapsed > 0) {
+                // Double the allowed rate per second after a quiet period. This
+                // cannot jump back to a stale pre-QoS estimate on the first ACK.
+                lossPacingCeiling *= Math.pow(2D, elapsed / 1_000_000_000D);
+                lossRecoveryUpdatedNanos = now;
+            }
+            if (lossPacingCeiling >= modelRate || (lossRatio() < 0.005D
+                    && now - lastLossNanos > TimeUnit.SECONDS.toNanos(5))) {
+                lossPacingCeiling = Double.POSITIVE_INFINITY;
+                return modelRate;
+            }
+        }
+        return Math.min(modelRate, lossPacingCeiling);
+    }
+
+    private boolean lossQuiet(long now) {
+        return lastLossNanos == 0 || now - lastLossNanos
+                > Math.max(TimeUnit.SECONDS.toNanos(1), saturatedMultiply(smoothedRtt, 4L));
     }
 
     private void updateMode(long now, long inFlightBytes) {
