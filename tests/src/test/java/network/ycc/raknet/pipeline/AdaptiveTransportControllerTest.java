@@ -7,9 +7,7 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
-import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.List;
 
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -17,7 +15,7 @@ import static org.mockito.Mockito.when;
 
 public class AdaptiveTransportControllerTest {
     @Test
-    public void defaultConfigUsesPublicInternetPpsCeiling() {
+    public void rollbackKeepsConservativePublicInternetPpsCeiling() {
         final EmbeddedChannel channel = new EmbeddedChannel();
         final DefaultConfig config = new DefaultConfig(channel);
         Assertions.assertEquals(600, config.getAdaptiveMaxPps());
@@ -59,21 +57,10 @@ public class AdaptiveTransportControllerTest {
         final AdaptiveTransportController controller = new AdaptiveTransportController(config);
         final long now = System.nanoTime();
         Assertions.assertEquals(1, controller.sendBudget(now));
+        Assertions.assertEquals(1, controller.sendBudget(now));
         Assertions.assertEquals(0, controller.sendBudget(now));
-        Assertions.assertEquals(0, controller.sendBudget(now + 2_000_000L));
-        Assertions.assertEquals(1, controller.sendBudget(now + 3_000_000L));
+        Assertions.assertEquals(1, controller.sendBudget(now + 2_000_000L));
         Assertions.assertTrue(controller.nanosUntilSend(now) >= 0);
-    }
-
-    @Test
-    public void actualDatagramSizeCreatesByteDebtAfterSmallEstimate() {
-        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
-        final long now = System.nanoTime();
-        Assertions.assertEquals(1, controller.sendBudget(now, 0, 100));
-        controller.onDatagramSent(1_400);
-
-        Assertions.assertEquals(0, controller.sendBudget(now + 1_000_000L, 0, 100));
-        Assertions.assertEquals(1, controller.sendBudget(now + 3_000_000L, 0, 100));
     }
 
     @Test
@@ -125,24 +112,6 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
-    public void severeLossCeilingDoesNotRecoverDuringTwentySecondQuietPeriod() throws Exception {
-        final RakNet.Config config = adaptiveConfig();
-        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
-        for (int i = 0; i < 64; i++) controller.onAck(600, 20_000_000L, 0);
-        controller.onLoss(600, false);
-        controller.onLoss(600, false);
-        final double reducedRate = controller.packetsPerSecond();
-
-        final Field bandwidth = AdaptiveTransportController.class.getDeclaredField("bandwidthFilter");
-        bandwidth.setAccessible(true);
-        Arrays.fill((long[]) bandwidth.get(controller), 1_000_000L);
-        setLong(controller, "lastLossNanos", System.nanoTime() - 10_000_000_000L);
-        controller.onAck(1200, 20_000_000L, 0);
-
-        Assertions.assertEquals(reducedRate, controller.packetsPerSecond(), 0.01D);
-    }
-
-    @Test
     public void probeRttIsDeferredWhileLossIsActive() throws Exception {
         final RakNet.Config config = adaptiveConfig();
         final AdaptiveTransportController controller = new AdaptiveTransportController(config);
@@ -174,8 +143,6 @@ public class AdaptiveTransportControllerTest {
         final RakNet.Config config = adaptiveConfig();
         when(config.getSmallWriteCoalesceMicros()).thenReturn(500);
         final AdaptiveTransportController controller = new AdaptiveTransportController(config);
-        Assertions.assertEquals(2_000_000L, controller.ackFlushDelayNanos());
-        Assertions.assertFalse(controller.shouldProtectAcks());
         for (int i = 0; i < 62; i++) controller.onAck(600, 20_000_000L, 0);
 
         controller.onLoss(600, false);
@@ -185,11 +152,6 @@ public class AdaptiveTransportControllerTest {
         Assertions.assertEquals(AdaptiveTransportController.LossType.RATE_LIMIT, controller.lossType());
         Assertions.assertFalse(controller.shouldUseFec());
         Assertions.assertEquals(1_500, controller.smallWriteCoalesceMicros());
-        Assertions.assertEquals(8_000_000L, controller.ackFlushDelayNanos());
-        Assertions.assertTrue(controller.shouldProtectAcks());
-        Assertions.assertEquals(10_000_000L, controller.ackRepeatDelayNanos());
-        Assertions.assertEquals(12_000_000L,
-                controller.adjustNackReorderDelayNanos(3_000_000L));
     }
 
     @Test
@@ -220,40 +182,6 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
-    public void nackReorderDelayScalesWithRttAndIsBounded() {
-        final long millis = 1_000_000L;
-        Assertions.assertEquals(3 * millis, ReliabilityHandler.nackReorderDelayNanos(0));
-        Assertions.assertEquals(5 * millis, ReliabilityHandler.nackReorderDelayNanos(40 * millis));
-        Assertions.assertEquals(12 * millis, ReliabilityHandler.nackReorderDelayNanos(200 * millis));
-    }
-
-    @Test
-    public void deferredNackIsCancelledByReorderedArrivalBeforeDeadline() {
-        final ReliabilityHandler.DeferredNackTracker tracker =
-                new ReliabilityHandler.DeferredNackTracker();
-        final List<Integer> due = new ArrayList<>();
-        Assertions.assertTrue(tracker.defer(10, 5_000L));
-        Assertions.assertTrue(tracker.cancel(10));
-        Assertions.assertEquals(-1L, tracker.drainDue(10_000L, due::add));
-        Assertions.assertTrue(due.isEmpty());
-    }
-
-    @Test
-    public void deferredNackPromotesOnlyExpiredSequenceGaps() {
-        final ReliabilityHandler.DeferredNackTracker tracker =
-                new ReliabilityHandler.DeferredNackTracker();
-        final List<Integer> due = new ArrayList<>();
-        tracker.defer(10, 5_000L);
-        tracker.defer(11, 8_000L);
-
-        Assertions.assertEquals(3_000L, tracker.drainDue(5_000L, due::add));
-        Assertions.assertEquals(Arrays.asList(10), due);
-        due.clear();
-        Assertions.assertEquals(-1L, tracker.drainDue(8_000L, due::add));
-        Assertions.assertEquals(Arrays.asList(11), due);
-    }
-
-    @Test
     public void ackCompressionCannotInstantlyJumpToMaximumPacing() throws Exception {
         final RakNet.Config config = adaptiveConfig();
         final AdaptiveTransportController controller = new AdaptiveTransportController(config);
@@ -266,87 +194,6 @@ public class AdaptiveTransportControllerTest {
 
         Assertions.assertTrue(controller.packetsPerSecond() < 600D,
                 "100ms of growth must not jump from 500pps to the 2000pps maximum");
-    }
-
-    @Test
-    public void deliveryEstimatorAggregatesForOneHundredMillisecondsAndRejectsAckSpike() {
-        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
-        final long second = 1_000_000_000L;
-        controller.updateDeliveryRate(second, 1_200);
-        controller.updateDeliveryRate(second + 50_000_000L, 1_200);
-        Assertions.assertEquals(0L, controller.bandwidthEstimateBytesPerSecond());
-
-        controller.updateDeliveryRate(second + 100_000_000L, 1_200);
-        final long baseline = controller.bandwidthEstimateBytesPerSecond();
-        Assertions.assertEquals(36_000L, baseline);
-
-        controller.updateDeliveryRate(second + 200_000_000L, 1_000_000);
-        Assertions.assertTrue(controller.bandwidthEstimateBytesPerSecond() < baseline * 1.05D,
-                "a compressed ACK burst must not become the sustained bandwidth estimate");
-    }
-
-    @Test
-    public void applicationLimitedSamplesDoNotSeedAFalseLowCapacity() {
-        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
-        final long second = 1_000_000_000L;
-
-        controller.updateDeliveryRate(second, 120, true);
-        controller.updateDeliveryRate(second + 100_000_000L, 120, true);
-        Assertions.assertEquals(0L, controller.bandwidthEstimateBytesPerSecond(),
-                "idle/login traffic must not become the path capacity estimate");
-
-        controller.updateDeliveryRate(second + 200_000_000L, 1_200, false);
-        Assertions.assertEquals(12_000L, controller.bandwidthEstimateBytesPerSecond(),
-                "a backlogged delivery sample should seed the estimate");
-    }
-
-    @Test
-    public void healthyLowDeliveryEstimateCannotSelfLockPacingAtMinimum() throws Exception {
-        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
-        setLong(controller, "robustBandwidthBytesPerSecond", 3_000L);
-
-        controller.onAck(128, 20_000_000L, 0, true);
-
-        Assertions.assertEquals(500D, controller.packetsPerSecond(), 0.01D,
-                "a demand-limited ACK must not collapse the healthy initial pacer");
-        Assertions.assertTrue(controller.bytePacingRateBytesPerSecondMetric() >= 350_000L,
-                "byte pacing must retain enough headroom for a later chunk burst");
-    }
-
-    @Test
-    public void sustainedHealthyBacklogProbesUpAtBoundedIntervals() {
-        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
-        final long second = 1_000_000_000L;
-
-        controller.sendBudget(second, 0, 1_200, 64 * 1024);
-        Assertions.assertEquals(AdaptiveTransportController.BacklogState.WARMUP,
-                controller.backlogState());
-        controller.sendBudget(second + 100_000_000L, 0, 1_200, 64 * 1024);
-        Assertions.assertEquals(AdaptiveTransportController.BacklogState.BULK,
-                controller.backlogState());
-        Assertions.assertEquals(625D, controller.packetsPerSecond(), 0.01D);
-        Assertions.assertEquals(1L, controller.backlogProbes());
-
-        controller.sendBudget(second + 200_000_000L, 0, 1_200, 64 * 1024);
-        Assertions.assertEquals(1L, controller.backlogProbes(),
-                "bulk demand must not create sub-500ms probe bursts");
-        controller.sendBudget(second + 600_000_000L, 0, 1_200, 64 * 1024);
-        Assertions.assertEquals(781.25D, controller.packetsPerSecond(), 0.01D);
-        Assertions.assertEquals(2L, controller.backlogProbes());
-    }
-
-    @Test
-    public void congestionEvidenceSuppressesBacklogProbing() {
-        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
-        controller.onLoss(1_200, false);
-        final double reducedRate = controller.packetsPerSecond();
-        final long second = 1_000_000_000L;
-
-        controller.sendBudget(second, 0, 1_200, 128 * 1024);
-        controller.sendBudget(second + 600_000_000L, 0, 1_200, 128 * 1024);
-
-        Assertions.assertEquals(reducedRate, controller.packetsPerSecond(), 0.01D);
-        Assertions.assertEquals(0L, controller.backlogProbes());
     }
 
     @Test
