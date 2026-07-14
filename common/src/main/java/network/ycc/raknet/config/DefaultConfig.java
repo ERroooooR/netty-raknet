@@ -49,7 +49,9 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
     private volatile int adaptiveMinPps = 50;
     private volatile int adaptiveMaxPps = 2000;
     private volatile int smallWriteCoalesceMicros = 250;
-    private volatile int plpmtudMaxMtu = 1500;
+    // UDP payload ceiling for a conventional 1500-byte path. 1452 leaves
+    // room for the larger IPv6 (40-byte) plus UDP (8-byte) headers.
+    private volatile int plpmtudMaxMtu = 1452;
 
     public DefaultConfig(Channel channel) {
         super(channel);
