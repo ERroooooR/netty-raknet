@@ -19,6 +19,7 @@ import java.lang.reflect.Field;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.PriorityQueue;
 
 /**
  * Tests for latency and recovery optimizations introduced in the 7-item patch set.
@@ -168,6 +169,25 @@ public class HandlerOptimizationsTest {
 
         Assertions.assertEquals(9, getLastOrderIndex(queue),
                 "lastOrderIndex should be 9 after 10 in-order frames");
+    }
+
+    @Test
+    public void testLatencySensitiveReliableFrameBypassesChunkBacklog() {
+        final Frame bulk = makeFrame(ByteBufAllocator.DEFAULT, 0, 0,
+                FramedPacket.Reliability.RELIABLE_ORDERED, 7);
+        final Frame control = makeFrame(ByteBufAllocator.DEFAULT, 0, 0,
+                FramedPacket.Reliability.RELIABLE_ORDERED, 1);
+        bulk.setReliableIndex(0);
+        control.setReliableIndex(1);
+        final PriorityQueue<Frame> queue = new PriorityQueue<>(Frame.COMPARATOR);
+        queue.add(bulk);
+        queue.add(control);
+
+        Assertions.assertSame(control, queue.poll(),
+                "control channels must not wait behind older channel-7 chunk fragments");
+        Assertions.assertSame(bulk, queue.poll());
+        control.release();
+        bulk.release();
     }
 
     // ─── FrameJoiner: periodic cleanup timer ────────────────────────────────────

@@ -314,6 +314,42 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
+    public void sustainedHealthyBacklogProbesUpAtBoundedIntervals() {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        final long second = 1_000_000_000L;
+
+        controller.sendBudget(second, 0, 1_200, 64 * 1024);
+        Assertions.assertEquals(AdaptiveTransportController.BacklogState.WARMUP,
+                controller.backlogState());
+        controller.sendBudget(second + 100_000_000L, 0, 1_200, 64 * 1024);
+        Assertions.assertEquals(AdaptiveTransportController.BacklogState.BULK,
+                controller.backlogState());
+        Assertions.assertEquals(625D, controller.packetsPerSecond(), 0.01D);
+        Assertions.assertEquals(1L, controller.backlogProbes());
+
+        controller.sendBudget(second + 200_000_000L, 0, 1_200, 64 * 1024);
+        Assertions.assertEquals(1L, controller.backlogProbes(),
+                "bulk demand must not create sub-500ms probe bursts");
+        controller.sendBudget(second + 600_000_000L, 0, 1_200, 64 * 1024);
+        Assertions.assertEquals(781.25D, controller.packetsPerSecond(), 0.01D);
+        Assertions.assertEquals(2L, controller.backlogProbes());
+    }
+
+    @Test
+    public void congestionEvidenceSuppressesBacklogProbing() {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        controller.onLoss(1_200, false);
+        final double reducedRate = controller.packetsPerSecond();
+        final long second = 1_000_000_000L;
+
+        controller.sendBudget(second, 0, 1_200, 128 * 1024);
+        controller.sendBudget(second + 600_000_000L, 0, 1_200, 128 * 1024);
+
+        Assertions.assertEquals(reducedRate, controller.packetsPerSecond(), 0.01D);
+        Assertions.assertEquals(0L, controller.backlogProbes());
+    }
+
+    @Test
     public void ecnFeedbackIsIgnoredWhenAdaptiveTransportIsDisabled() {
         final RakNet.Config config = mock(RakNet.Config.class);
         when(config.isAdaptiveTransportEnabled()).thenReturn(false);

@@ -323,6 +323,12 @@ public final class Frame extends AbstractReferenceCounted {
             } else if (!b.getReliability().isReliable) {
                 return 1;
             }
+            // Channel 7 carries world/chunk bulk traffic in Raknetify. Keep
+            // latency-sensitive reliable channels ahead of an existing chunk
+            // backlog; ordered delivery remains independent per channel.
+            final boolean aBulk = a.getReliability().isOrdered && a.getOrderChannel() == 7;
+            final boolean bBulk = b.getReliability().isOrdered && b.getOrderChannel() == 7;
+            if (aBulk != bBulk) return aBulk ? 1 : -1;
             return UINT.B3.minusWrap(a.reliableIndex, b.reliableIndex) < 0 ? -1 : 1;
         }
     }

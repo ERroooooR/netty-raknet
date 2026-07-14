@@ -14,6 +14,7 @@ import java.util.concurrent.atomic.LongAdder;
 final class AdaptiveTransportController {
     enum LossType { NONE, RANDOM, BURST, RATE_LIMIT, MTU_BLACK_HOLE, QUEUE }
     enum CongestionMode { STARTUP, DRAIN, PROBE_BW, PROBE_RTT }
+    enum BacklogState { IDLE, WARMUP, BULK }
 
     private static final long DSCP_COOLDOWN = TimeUnit.SECONDS.toNanos(30);
     private static final AtomicLong LAST_DSCP_CHANGE = new AtomicLong();
@@ -34,6 +35,10 @@ final class AdaptiveTransportController {
     private static final long MIN_POLICER_ACK_FLUSH_NANOS = TimeUnit.MILLISECONDS.toNanos(8);
     private static final long MAX_POLICER_ACK_FLUSH_NANOS = TimeUnit.MILLISECONDS.toNanos(25);
     private static final long MIN_POLICER_NACK_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(12);
+    private static final int BULK_BACKLOG_BYTES = 64 * 1024;
+    private static final long BULK_BACKLOG_AGE_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
+    private static final long MIN_BACKLOG_PROBE_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(500);
+    private static final double BACKLOG_PROBE_GAIN = 1.25D;
 
     private final RakNet.Config config;
     private DplpmtudController pathMtu;
@@ -62,6 +67,7 @@ final class AdaptiveTransportController {
     private long deliverySampleStarted;
     private long deliverySampleBytes;
     private boolean deliverySampleApplicationLimited = true;
+    private boolean lastDeliverySampleApplicationLimited = true;
     private long robustBandwidthBytesPerSecond;
     private long bandwidthEstimateUpdatedNanos;
     private long lastDscpVote;
@@ -86,6 +92,11 @@ final class AdaptiveTransportController {
     private String congestionReason = "NONE";
     private boolean pacingCapped;
     private long pacingRateUpdatedNanos = System.nanoTime();
+    private BacklogState backlogState = BacklogState.IDLE;
+    private long backlogStartedNanos;
+    private long backlogAgeNanos;
+    private long lastBacklogProbeNanos;
+    private long backlogProbes;
 
     AdaptiveTransportController(RakNet.Config config) {
         this.config = config;
@@ -112,8 +123,13 @@ final class AdaptiveTransportController {
     }
 
     int sendBudget(long nowNanos, long inFlightBytes, int nextDatagramBytes) {
+        return sendBudget(nowNanos, inFlightBytes, nextDatagramBytes, 0);
+    }
+
+    int sendBudget(long nowNanos, long inFlightBytes, int nextDatagramBytes, int queuedBytes) {
         if (!config.isAdaptiveTransportEnabled()) return Integer.MAX_VALUE;
         lastInFlightBytes = Math.max(0, inFlightBytes);
+        updateBacklog(nowNanos, queuedBytes);
         updateMode(nowNanos, inFlightBytes);
         if (inFlightBytes > 0 && inFlightBytes + nextDatagramBytes > congestionWindowBytes) {
             nextSendNanos = nowNanos + Math.max(100_000L, smoothedRtt / 8L);
@@ -281,6 +297,8 @@ final class AdaptiveTransportController {
     double packetsPerSecond() { return packetsPerSecond; }
     long bandwidthEstimateBytesPerSecond() { return maxBandwidth(); }
     long bytePacingRateBytesPerSecondMetric() { return (long) bytePacingRateBytesPerSecond(); }
+    BacklogState backlogState() { return backlogState; }
+    long backlogProbes() { return backlogProbes; }
 
     boolean shouldUseFec() {
         final double ratio = lossRatio();
@@ -448,6 +466,45 @@ final class AdaptiveTransportController {
         return Math.min(targetRate, packetsPerSecond * Math.pow(2D, growthExponent));
     }
 
+    private void updateBacklog(long now, int queuedBytes) {
+        if (queuedBytes <= 0) {
+            backlogState = BacklogState.IDLE;
+            backlogStartedNanos = 0L;
+            backlogAgeNanos = 0L;
+            publishDemandMetrics();
+            return;
+        }
+        if (backlogStartedNanos == 0L) backlogStartedNanos = now;
+        final long backlogAge = Math.max(0L, now - backlogStartedNanos);
+        backlogAgeNanos = backlogAge;
+        backlogState = queuedBytes >= BULK_BACKLOG_BYTES && backlogAge >= BULK_BACKLOG_AGE_NANOS
+                ? BacklogState.BULK : BacklogState.WARMUP;
+        if (backlogState != BacklogState.BULK || !canProbeBacklog(now)) {
+            publishDemandMetrics();
+            return;
+        }
+        final long interval = Math.max(MIN_BACKLOG_PROBE_INTERVAL_NANOS, smoothedRtt);
+        if (lastBacklogProbeNanos != 0L && now - lastBacklogProbeNanos < interval) {
+            publishDemandMetrics();
+            return;
+        }
+        final double target = Math.min(config.getAdaptiveMaxPps(), packetsPerSecond * BACKLOG_PROBE_GAIN);
+        if (target > packetsPerSecond) {
+            packetsPerSecond = clampPps(target);
+            pacingRateUpdatedNanos = now;
+            backlogProbes++;
+        }
+        lastBacklogProbeNanos = now;
+        publishDemandMetrics();
+    }
+
+    private boolean canProbeBacklog(long now) {
+        return lossType == LossType.NONE && lossRatio() < 0.005D && lossQuiet(now)
+                && !queueInflated() && ecnCeRatio() < 0.02D
+                && Double.isInfinite(lossPacingCeiling)
+                && now >= bandwidthProbeSuppressedUntil;
+    }
+
     private double bytePacingRateBytesPerSecond() {
         final double minimumPacketBytes = Math.max(512D, config.getMTU() * 0.5D);
         return Math.max(1D, packetsPerSecond
@@ -587,6 +644,7 @@ final class AdaptiveTransportController {
         if (interval < samplingWindow) return;
         final long sample = saturatedMultiply(deliverySampleBytes, 1_000_000_000L) / interval;
         final boolean mayLowerEstimate = !deliverySampleApplicationLimited;
+        lastDeliverySampleApplicationLimited = deliverySampleApplicationLimited;
         if (robustBandwidthBytesPerSecond == 0L && mayLowerEstimate) {
             final long initialCeiling = saturatedMultiply(config.getMTU(),
                     Math.max(1L, config.getAdaptiveMaxPps()));
@@ -681,6 +739,7 @@ final class AdaptiveTransportController {
         config.getMetrics().adaptiveBytePacingRate((long) bytePacingRateBytesPerSecond());
         config.getMetrics().adaptiveAckPolicy(shouldProtectAcks(),
                 ackFlushDelayNanos(), ackRepeatDelayNanos());
+        publishDemandMetrics();
         config.getMetrics().adaptiveDeliveryRate(deliveryRateBytesPerSecond);
         long acknowledgements = 0, losses = 0;
         for (int i = 0; i < WINDOW_BUCKETS; i++) { acknowledgements += acked[i]; losses += lost[i]; }
@@ -689,6 +748,11 @@ final class AdaptiveTransportController {
         config.getMetrics().adaptiveLossType(lossType.name());
         publishCongestionMetrics();
         publishPathMtuMetrics();
+    }
+
+    private void publishDemandMetrics() {
+        config.getMetrics().adaptiveDemand(lastDeliverySampleApplicationLimited,
+                backlogState.name(), backlogAgeNanos, backlogProbes);
     }
 
     private void publishCongestionMetrics() {

@@ -576,7 +576,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         final int estimatedDatagramBytes = nextFrame == null ? mtu
                 : Math.min(mtu, FrameSet.HEADER_SIZE + nextFrame.getRoughPacketSize());
         int pacingBudget = pendingFrameSets.size() < maxPendingFrameSets
-                ? adaptive.sendBudget(System.nanoTime(), inFlightBytes, estimatedDatagramBytes) : 0;
+                ? adaptive.sendBudget(System.nanoTime(), inFlightBytes, estimatedDatagramBytes, queuedBytes) : 0;
         while (pacingBudget-- > 0 && pendingFrameSets.size() < maxPendingFrameSets && !frameQueue.isEmpty()) {
             produceFrameSet(ctx, maxSize);
         }

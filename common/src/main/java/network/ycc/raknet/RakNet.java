@@ -106,6 +106,8 @@ public class RakNet {
         default void applicationBatch(int bytes) {}
         default void ackRepeated(int acknowledgedFrameSets) {}
         default void adaptiveAckPolicy(boolean protectedMode, long flushDelayNanos, long repeatDelayNanos) {}
+        default void adaptiveDemand(boolean applicationLimited, String backlogState,
+                                    long backlogAgeNanos, long backlogProbes) {}
         default void frameError(int delta) {}
         default void bytesIn(int delta) {}
         default void packetsOut(int delta) {}
