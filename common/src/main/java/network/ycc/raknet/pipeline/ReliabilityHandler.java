@@ -6,6 +6,9 @@ import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.CodecException;
 import io.netty.handler.codec.CorruptedFrameException;
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.concurrent.ScheduledFuture;
+import it.unimi.dsi.fastutil.ints.Int2LongMap;
+import it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap;
 import it.unimi.dsi.fastutil.ints.Int2ObjectLinkedOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntRBTreeSet;
 import it.unimi.dsi.fastutil.ints.IntSortedSet;
@@ -21,6 +24,7 @@ import network.ycc.raknet.utils.UINT;
 
 import java.util.PriorityQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.function.IntConsumer;
 
 /**
  * This handler handles the bulk of reliable (framed) transport.
@@ -34,6 +38,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected final PriorityQueue<Frame> frameQueue = new PriorityQueue<>(Frame.COMPARATOR);
     protected final Int2ObjectLinkedOpenHashMap<FrameSet> pendingFrameSets = new Int2ObjectLinkedOpenHashMap<>();
     protected final ReliableReceiveWindow reliableReceiveWindow = new ReliableReceiveWindow();
+    protected final DeferredNackTracker deferredNacks = new DeferredNackTracker();
 
     protected int queuedBytes = 0;
     protected long inFlightBytes = 0;
@@ -49,10 +54,15 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected boolean coalesceScheduled;
     protected int coalescedFrames;
     protected long coalesceStartedNanos;
+    protected ScheduledFuture<?> deferredNackFuture;
+    protected long deferredNackDeadlineNanos = Long.MAX_VALUE;
 
     // Item 3: track when first ACK was queued for time-based flush
     protected long firstAckNanos = 0;
     private static final long ACK_FLUSH_DELAY_NANOS = 2_000_000; // 2ms
+    private static final long MIN_NACK_REORDER_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(4);
+    private static final long MAX_NACK_REORDER_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(25);
+    private static final int MAX_DEFERRED_NACK_GAP = 2;
     // Item 7: guard against recursive flush from recallFrameSet
     protected boolean flushing = false;
 
@@ -76,6 +86,8 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) {
+        cancelDeferredNackTask();
+        deferredNacks.clear();
         clearQueue(null);
     }
 
@@ -200,13 +212,24 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             }, ACK_FLUSH_DELAY_NANOS + 500_000L, TimeUnit.NANOSECONDS);
         }
         ackSet.add(packetSeqId);
-        if (config.isNACKEnabled())
+        if (config.isNACKEnabled()) {
             nackSet.remove(packetSeqId);
+            if (deferredNacks.cancel(packetSeqId)) {
+                config.getMetrics().reorderedPacket(1);
+            }
+        }
         if (UINT.B3.minusWrap(packetSeqId, lastReceivedSeqId) > 0) {
+            final int missingCount = UINT.B3.minusWrap(packetSeqId, lastReceivedSeqId) - 1;
+            final boolean deferGap = config.isNACKEnabled() && shouldDeferNackGap(missingCount);
+            if (config.isNACKEnabled() && missingCount > MAX_DEFERRED_NACK_GAP) {
+                confirmDeferredNacks();
+            }
             lastReceivedSeqId = UINT.B3.plus(lastReceivedSeqId, 1);
             while (lastReceivedSeqId != packetSeqId) { //nack any missed packets before this one
-                if (config.isNACKEnabled())
-                    nackSet.add(lastReceivedSeqId); //add missing packets to nack set
+                if (config.isNACKEnabled()) {
+                    if (deferGap) deferNack(ctx, lastReceivedSeqId);
+                    else nackSet.add(lastReceivedSeqId);
+                }
                 lastReceivedSeqId = UINT.B3.plus(lastReceivedSeqId, 1);
             }
         }
@@ -383,6 +406,107 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         final long roundTripFloor = saturatedAdd(saturatedMultiply(rtt, 2), delay);
         final long base = Math.max(jitterTimeout, roundTripFloor);
         return saturatedMultiply(base, 1L << Math.min(Math.max(0, retryCount), 3));
+    }
+
+    static boolean shouldDeferNackGap(int missingCount) {
+        return missingCount > 0 && missingCount <= MAX_DEFERRED_NACK_GAP;
+    }
+
+    static long nackReorderDelayNanos(long rttNanos, long rttStdDevNanos) {
+        final long rttDelay = Math.max(0L, rttNanos) / 8L;
+        final long jitterDelay = Math.max(0L, rttStdDevNanos) / 2L;
+        final long candidate = Math.max(rttDelay, jitterDelay);
+        return Math.max(MIN_NACK_REORDER_DELAY_NANOS,
+                Math.min(MAX_NACK_REORDER_DELAY_NANOS, candidate));
+    }
+
+    private void deferNack(ChannelHandlerContext ctx, int sequenceId) {
+        final long now = System.nanoTime();
+        final long delay = nackReorderDelayNanos(config.getRTTNanos(), config.getRTTStdDevNanos());
+        if (deferredNacks.defer(sequenceId, now + delay)) {
+            config.getMetrics().nackDeferred(1);
+        }
+        scheduleDeferredNacks(ctx, delay);
+    }
+
+    private void scheduleDeferredNacks(ChannelHandlerContext ctx, long delayNanos) {
+        final long delay = Math.max(0L, delayNanos);
+        final long deadline = System.nanoTime() + delay;
+        if (deferredNackFuture != null && !deferredNackFuture.isDone()) {
+            if (deadline >= deferredNackDeadlineNanos) return;
+            deferredNackFuture.cancel(false);
+        }
+        deferredNackDeadlineNanos = deadline;
+        deferredNackFuture = ctx.executor().schedule(() -> flushDeferredNacks(ctx),
+                delay, TimeUnit.NANOSECONDS);
+    }
+
+    private void flushDeferredNacks(ChannelHandlerContext ctx) {
+        deferredNackFuture = null;
+        deferredNackDeadlineNanos = Long.MAX_VALUE;
+        if (!ctx.channel().isOpen()) return;
+        if (!config.isNACKEnabled()) {
+            deferredNacks.clear();
+            return;
+        }
+        final long nextDelay = deferredNacks.drainDue(System.nanoTime(), id -> nackSet.add(id));
+        if (!nackSet.isEmpty() && config.isAutoRead()) {
+            sendResponses(ctx);
+            ctx.flush();
+        }
+        if (nextDelay >= 0L) scheduleDeferredNacks(ctx, nextDelay);
+    }
+
+    private void confirmDeferredNacks() {
+        cancelDeferredNackTask();
+        deferredNacks.drainAll(id -> nackSet.add(id));
+    }
+
+    private void cancelDeferredNackTask() {
+        if (deferredNackFuture != null) deferredNackFuture.cancel(false);
+        deferredNackFuture = null;
+        deferredNackDeadlineNanos = Long.MAX_VALUE;
+    }
+
+    static final class DeferredNackTracker {
+        private final Int2LongOpenHashMap deadlines = new Int2LongOpenHashMap();
+
+        boolean defer(int sequenceId, long deadlineNanos) {
+            if (deadlines.containsKey(sequenceId)) return false;
+            deadlines.put(sequenceId, deadlineNanos);
+            return true;
+        }
+
+        boolean cancel(int sequenceId) {
+            return deadlines.remove(sequenceId) != 0L;
+        }
+
+        long drainDue(long nowNanos, IntConsumer consumer) {
+            long nextDeadline = Long.MAX_VALUE;
+            final ObjectIterator<Int2LongMap.Entry> iterator = deadlines.int2LongEntrySet().fastIterator();
+            while (iterator.hasNext()) {
+                final Int2LongMap.Entry entry = iterator.next();
+                if (entry.getLongValue() <= nowNanos) {
+                    consumer.accept(entry.getIntKey());
+                    iterator.remove();
+                } else {
+                    nextDeadline = Math.min(nextDeadline, entry.getLongValue());
+                }
+            }
+            return nextDeadline == Long.MAX_VALUE ? -1L : Math.max(0L, nextDeadline - nowNanos);
+        }
+
+        void drainAll(IntConsumer consumer) {
+            final ObjectIterator<Int2LongMap.Entry> iterator = deadlines.int2LongEntrySet().fastIterator();
+            while (iterator.hasNext()) {
+                consumer.accept(iterator.next().getIntKey());
+                iterator.remove();
+            }
+        }
+
+        void clear() {
+            deadlines.clear();
+        }
     }
 
     protected void produceFrameSet(ChannelHandlerContext ctx, int maxSize) {
