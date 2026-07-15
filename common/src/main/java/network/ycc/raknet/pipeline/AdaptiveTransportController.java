@@ -27,6 +27,10 @@ final class AdaptiveTransportController {
     private static final long MIN_CONGESTION_RESPONSE_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(250);
     private static final long MIN_LOSS_RECOVERY_QUIET_NANOS = TimeUnit.MILLISECONDS.toNanos(500);
     private static final long MIN_BANDWIDTH_PROBE_COOLDOWN_NANOS = TimeUnit.SECONDS.toNanos(5);
+    private static final int BURST_DRAIN_ENTER_BYTES = 48 * 1024;
+    private static final int BURST_DRAIN_EXIT_BYTES = 16 * 1024;
+    private static final int BURST_DRAIN_MAX_PPS = 300;
+    private static final double BURST_DRAIN_TARGET_SECONDS = 2D;
 
     private final RakNet.Config config;
     private DplpmtudController pathMtu;
@@ -73,6 +77,9 @@ final class AdaptiveTransportController {
     private String congestionReason = "NONE";
     private boolean pacingCapped;
     private long pacingRateUpdatedNanos = System.nanoTime();
+    private boolean burstDrainActive;
+    private long burstDrainStartedNanos;
+    private double burstDrainFloorPps;
 
     AdaptiveTransportController(RakNet.Config config) {
         this.config = config;
@@ -97,7 +104,13 @@ final class AdaptiveTransportController {
     }
 
     int sendBudget(long nowNanos, long inFlightBytes, int nextDatagramBytes) {
+        return sendBudget(nowNanos, inFlightBytes, nextDatagramBytes, 0);
+    }
+
+    int sendBudget(long nowNanos, long inFlightBytes, int nextDatagramBytes, int queuedBytes) {
         if (!config.isAdaptiveTransportEnabled()) return Integer.MAX_VALUE;
+        final long outstandingBytes = Math.max(0L, inFlightBytes) + Math.max(0, queuedBytes);
+        onOutstandingBytes(nowNanos, outstandingBytes);
         lastInFlightBytes = Math.max(0, inFlightBytes);
         updateMode(nowNanos, inFlightBytes);
         if (inFlightBytes > 0 && inFlightBytes + nextDatagramBytes > congestionWindowBytes) {
@@ -130,6 +143,13 @@ final class AdaptiveTransportController {
                 (long) Math.ceil(missing * 1_000_000_000D / packetsPerSecond));
         publishCongestionMetrics();
         return budget;
+    }
+
+    void onOutstandingBytes(long nowNanos, long outstandingBytes) {
+        if (!config.isAdaptiveTransportEnabled()) return;
+        final boolean wasActive = burstDrainActive;
+        updateBurstDrain(nowNanos, outstandingBytes);
+        if (wasActive != burstDrainActive) publishMetrics();
     }
 
     long nanosUntilSend(long nowNanos) {
@@ -217,7 +237,7 @@ final class AdaptiveTransportController {
         // once per RTT; apply the pacing reduction at that same cadence instead
         // of multiplying the rate down to the configured floor immediately.
         if (newCongestionResponse) {
-            packetsPerSecond = clampPps(packetsPerSecond * reduction);
+            packetsPerSecond = applyBurstDrainFloor(clampPps(packetsPerSecond * reduction));
             lossPacingCeiling = Math.min(lossPacingCeiling, packetsPerSecond);
             lossRecoveryUpdatedNanos = now;
         }
@@ -362,8 +382,43 @@ final class AdaptiveTransportController {
         if (bandwidth > 0) {
             final double modelRate = (bandwidth * gain) / Math.max(64D, averagePacketBytes);
             final double lossLimitedRate = applyLossPacingCeiling(now, modelRate);
-            packetsPerSecond = clampPps(applyPacingSlew(now, lossLimitedRate));
+            packetsPerSecond = applyBurstDrainFloor(clampPps(applyPacingSlew(now, lossLimitedRate)));
         }
+    }
+
+    private void updateBurstDrain(long now, long outstandingBytes) {
+        if (burstDrainActive) {
+            if (outstandingBytes <= BURST_DRAIN_EXIT_BYTES) {
+                burstDrainActive = false;
+                burstDrainStartedNanos = 0;
+                burstDrainFloorPps = 0D;
+                return;
+            }
+        } else if (outstandingBytes >= BURST_DRAIN_ENTER_BYTES) {
+            burstDrainActive = true;
+            burstDrainStartedNanos = now;
+        } else {
+            return;
+        }
+
+        final double estimatedPayloadBytes = Math.max(512D, config.getMTU() * 0.75D);
+        double target = outstandingBytes / estimatedPayloadBytes / BURST_DRAIN_TARGET_SECONDS;
+        target = Math.max(100D, target);
+        final double recentLoss = lossRatio();
+        if (recentLoss >= 0.10D) target *= 0.50D;
+        else if (recentLoss >= 0.05D) target *= 0.75D;
+        if (minRtt != Long.MAX_VALUE && smoothedRtt >= minRtt * 2L) target *= 0.85D;
+        if (recentLoss < 0.10D) target = Math.max(100D, target);
+        final double ceiling = Math.min(BURST_DRAIN_MAX_PPS, config.getAdaptiveMaxPps());
+        burstDrainFloorPps = Math.max(config.getAdaptiveMinPps(), Math.min(ceiling, target));
+        packetsPerSecond = applyBurstDrainFloor(packetsPerSecond);
+        if (!Double.isInfinite(lossPacingCeiling)) {
+            lossPacingCeiling = Math.max(lossPacingCeiling, burstDrainFloorPps);
+        }
+    }
+
+    private double applyBurstDrainFloor(double rate) {
+        return burstDrainActive ? Math.max(rate, burstDrainFloorPps) : rate;
     }
 
     private double applyPacingSlew(long now, double targetRate) {
@@ -555,11 +610,12 @@ final class AdaptiveTransportController {
 
     private void publishMetrics() {
         config.getMetrics().adaptivePacingRate(packetsPerSecond);
-        // These active experiments are intentionally disabled after the public-network
+        // Byte pacing and adaptive ACK policy remain disabled after the public-network
         // rollback. Keep publishing neutral values so telemetry remains schema-stable.
         config.getMetrics().adaptiveBytePacingRate(0L);
         config.getMetrics().adaptiveAckPolicy(false, 0L, 0L);
-        config.getMetrics().adaptiveDemand(true, "IDLE", 0L, 0L);
+        config.getMetrics().adaptiveDemand(!burstDrainActive, burstDrainActive ? "BULK" : "IDLE",
+                burstDrainActive ? Math.max(0L, System.nanoTime() - burstDrainStartedNanos) : 0L, 0L);
         config.getMetrics().adaptiveDeliveryRate(deliveryRateBytesPerSecond);
         long acknowledgements = 0, losses = 0;
         for (int i = 0; i < WINDOW_BUCKETS; i++) { acknowledgements += acked[i]; losses += lost[i]; }

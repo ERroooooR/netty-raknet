@@ -424,13 +424,14 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 
     protected void produceFrameSets(ChannelHandlerContext ctx) {
         if (frameQueue.isEmpty()) {
+            adaptive.onOutstandingBytes(System.nanoTime(), inFlightBytes);
             if (pendingFrameSets.isEmpty()) adaptive.applyPendingMtu();
             return;
         }
         final int mtu = config.getMTU();
         final int maxSize = mtu - FrameSet.HEADER_SIZE - Frame.HEADER_SIZE;
         final int maxPendingFrameSets = config.getDefaultPendingFrameSets() + burstTokens;
-        int pacingBudget = adaptive.sendBudget(System.nanoTime(), inFlightBytes, mtu);
+        int pacingBudget = adaptive.sendBudget(System.nanoTime(), inFlightBytes, mtu, queuedBytes);
         while (pacingBudget-- > 0 && pendingFrameSets.size() < maxPendingFrameSets && !frameQueue.isEmpty()) {
             produceFrameSet(ctx, maxSize);
         }

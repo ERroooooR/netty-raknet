@@ -64,6 +64,48 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
+    public void largeLocalBacklogGetsBoundedDrainFloor() throws Exception {
+        final RakNet.Config config = adaptiveConfig();
+        when(config.getAdaptiveMaxPps()).thenReturn(600);
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        setDouble(controller, "packetsPerSecond", 50D);
+
+        controller.sendBudget(System.nanoTime(), 0, 1400, 400 * 1024);
+
+        Assertions.assertTrue(controller.packetsPerSecond() >= 150D);
+        Assertions.assertTrue(controller.packetsPerSecond() <= 300D);
+    }
+
+    @Test
+    public void tinyQueueCannotKeepBurstDrainActive() throws Exception {
+        final RakNet.Config config = adaptiveConfig();
+        when(config.getAdaptiveMaxPps()).thenReturn(600);
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        setDouble(controller, "packetsPerSecond", 50D);
+
+        controller.sendBudget(System.nanoTime(), 0, 1400, 400 * 1024);
+        setDouble(controller, "packetsPerSecond", 50D);
+        controller.sendBudget(System.nanoTime(), 0, 1400, 33);
+
+        Assertions.assertEquals(50D, controller.packetsPerSecond(), 0.01D);
+    }
+
+    @Test
+    public void zstdSizedBurstRemainsProtectedAfterMovingInFlight() throws Exception {
+        final RakNet.Config config = adaptiveConfig();
+        when(config.getAdaptiveMaxPps()).thenReturn(600);
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        setDouble(controller, "packetsPerSecond", 50D);
+
+        controller.sendBudget(System.nanoTime(), 0, 1400, 64 * 1024);
+        Assertions.assertTrue(controller.packetsPerSecond() >= 100D);
+
+        setDouble(controller, "packetsPerSecond", 50D);
+        controller.sendBudget(System.nanoTime(), 64 * 1024, 1400, 0);
+        Assertions.assertTrue(controller.packetsPerSecond() >= 100D);
+    }
+
+    @Test
     public void congestionWindowAndEcnGateSending() {
         final RakNet.Config config = mock(RakNet.Config.class);
         when(config.isAdaptiveTransportEnabled()).thenReturn(true);
@@ -249,5 +291,11 @@ public class AdaptiveTransportControllerTest {
         final Field field = target.getClass().getDeclaredField(name);
         field.setAccessible(true);
         field.setLong(target, value);
+    }
+
+    private static void setDouble(Object target, String name, double value) throws Exception {
+        final Field field = target.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        field.setDouble(target, value);
     }
 }
