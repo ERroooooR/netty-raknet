@@ -15,10 +15,10 @@ import static org.mockito.Mockito.when;
 
 public class AdaptiveTransportControllerTest {
     @Test
-    public void rollbackKeepsConservativePublicInternetPpsCeiling() {
+    public void defaultPpsCeilingAllowsHealthyMinecraftBursts() {
         final EmbeddedChannel channel = new EmbeddedChannel();
         final DefaultConfig config = new DefaultConfig(channel);
-        Assertions.assertEquals(600, config.getAdaptiveMaxPps());
+        Assertions.assertEquals(2000, config.getAdaptiveMaxPps());
         channel.finishAndReleaseAll();
     }
 
@@ -64,16 +64,29 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
-    public void largeLocalBacklogGetsBoundedDrainFloor() throws Exception {
+    public void learnedHealthyBacklogCanExceedLegacyCeiling() throws Exception {
         final RakNet.Config config = adaptiveConfig();
-        when(config.getAdaptiveMaxPps()).thenReturn(600);
+        when(config.getAdaptiveMaxPps()).thenReturn(2000);
         final AdaptiveTransportController controller = new AdaptiveTransportController(config);
-        setDouble(controller, "packetsPerSecond", 50D);
+        for (int i = 0; i < 64; i++) controller.onAck(1200, 40_000_000L, 0);
+        setDouble(controller, "packetsPerSecond", 400D);
 
         controller.sendBudget(System.nanoTime(), 0, 1400, 400 * 1024);
 
-        Assertions.assertTrue(controller.packetsPerSecond() >= 500D);
-        Assertions.assertTrue(controller.packetsPerSecond() <= 600D);
+        Assertions.assertTrue(controller.packetsPerSecond() >= 700D);
+        Assertions.assertTrue(controller.packetsPerSecond() <= 900D);
+    }
+
+    @Test
+    public void newConnectionCannotJumpStraightToTwoThousandPps() throws Exception {
+        final RakNet.Config config = adaptiveConfig();
+        when(config.getAdaptiveMaxPps()).thenReturn(2000);
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        setDouble(controller, "packetsPerSecond", 50D);
+
+        controller.sendBudget(System.nanoTime(), 0, 1400, 4 * 1024 * 1024);
+
+        Assertions.assertEquals(600D, controller.packetsPerSecond(), 0.01D);
     }
 
     @Test
@@ -119,7 +132,7 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
-    public void severeLossHalvesLargeBatchDrainFloor() throws Exception {
+    public void activeSevereLossDisablesBacklogDrainFloor() throws Exception {
         final RakNet.Config config = adaptiveConfig();
         when(config.getAdaptiveMaxPps()).thenReturn(600);
         final AdaptiveTransportController controller = new AdaptiveTransportController(config);
@@ -129,8 +142,22 @@ public class AdaptiveTransportControllerTest {
 
         controller.sendBudget(System.nanoTime(), 0, 1400, 211 * 1024);
 
-        Assertions.assertTrue(controller.packetsPerSecond() >= 180D);
-        Assertions.assertTrue(controller.packetsPerSecond() <= 250D);
+        Assertions.assertEquals(50D, controller.packetsPerSecond(), 0.01D);
+    }
+
+    @Test
+    public void quietRateLimitRecoveryRampsInsteadOfJumpingToHealthyCeiling() throws Exception {
+        final RakNet.Config config = adaptiveConfig();
+        when(config.getAdaptiveMaxPps()).thenReturn(2000);
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        setDouble(controller, "packetsPerSecond", 30D);
+        setLong(controller, "lastLossNanos", System.nanoTime() - 1_600_000_000L);
+        setObject(controller, "lossType", AdaptiveTransportController.LossType.RATE_LIMIT);
+
+        controller.sendBudget(System.nanoTime(), 0, 1400, 1024 * 1024);
+
+        Assertions.assertTrue(controller.packetsPerSecond() >= 200D);
+        Assertions.assertTrue(controller.packetsPerSecond() <= 300D);
     }
 
     @Test
@@ -325,5 +352,11 @@ public class AdaptiveTransportControllerTest {
         final Field field = target.getClass().getDeclaredField(name);
         field.setAccessible(true);
         field.setDouble(target, value);
+    }
+
+    private static void setObject(Object target, String name, Object value) throws Exception {
+        final Field field = target.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        field.set(target, value);
     }
 }

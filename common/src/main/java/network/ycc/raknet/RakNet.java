@@ -220,7 +220,7 @@ public class RakNet {
         void setAdaptiveDscpEnabled(boolean value);
         default int getAdaptiveMinPps() { return 50; }
         default void setAdaptiveMinPps(int value) {}
-        default int getAdaptiveMaxPps() { return 600; }
+        default int getAdaptiveMaxPps() { return 2000; }
         default void setAdaptiveMaxPps(int value) {}
         default int getSmallWriteCoalesceMicros() { return 250; }
         default void setSmallWriteCoalesceMicros(int value) {}

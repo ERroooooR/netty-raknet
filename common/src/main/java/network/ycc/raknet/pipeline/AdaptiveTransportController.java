@@ -29,7 +29,9 @@ final class AdaptiveTransportController {
     private static final long MIN_BANDWIDTH_PROBE_COOLDOWN_NANOS = TimeUnit.SECONDS.toNanos(5);
     private static final int BURST_DRAIN_ENTER_BYTES = 48 * 1024;
     private static final int BURST_DRAIN_EXIT_BYTES = 16 * 1024;
-    private static final int BURST_DRAIN_MAX_PPS = 600;
+    private static final int DEGRADED_BURST_MAX_PPS = 600;
+    private static final int QOS_RECOVERY_BASE_PPS = 100;
+    private static final long QOS_RECOVERY_STEP_NANOS = TimeUnit.MILLISECONDS.toNanos(500);
     private static final double BURST_DRAIN_TARGET_SECONDS = 0.5D;
 
     private final RakNet.Config config;
@@ -405,11 +407,26 @@ final class AdaptiveTransportController {
         double target = outstandingBytes / estimatedPayloadBytes / BURST_DRAIN_TARGET_SECONDS;
         target = Math.max(100D, target);
         final double recentLoss = lossRatio();
-        if (recentLoss >= 0.10D) target *= 0.50D;
-        else if (recentLoss >= 0.05D) target *= 0.75D;
+        final boolean severe = lossType == LossType.RATE_LIMIT || lossType == LossType.QUEUE
+                || lossType == LossType.MTU_BLACK_HOLE || recentLoss >= 0.03D;
+        final double ceiling;
+        if (severe) {
+            if (!lossQuiet(now)) {
+                // A large application backlog is not evidence of available network capacity.
+                // Do not let multi-megabyte chunk queues override an active policer/queue signal.
+                burstDrainFloorPps = 0D;
+                return;
+            }
+            ceiling = Math.min(config.getAdaptiveMaxPps(), qosRecoveryCeiling(now));
+        } else if (lossType != LossType.NONE || recentLoss >= 0.005D || !lossQuiet(now)) {
+            // Isolated/reordered losses may coexist with useful delivery. Permit only a bounded
+            // step above the current rate instead of jumping to the healthy burst ceiling.
+            ceiling = Math.min(Math.min(DEGRADED_BURST_MAX_PPS, config.getAdaptiveMaxPps()),
+                    Math.max(QOS_RECOVERY_BASE_PPS, packetsPerSecond * 1.25D));
+        } else {
+            ceiling = healthyBurstCeiling();
+        }
         if (minRtt != Long.MAX_VALUE && smoothedRtt >= minRtt * 2L) target *= 0.85D;
-        if (recentLoss < 0.10D) target = Math.max(100D, target);
-        final double ceiling = Math.min(BURST_DRAIN_MAX_PPS, config.getAdaptiveMaxPps());
         burstDrainFloorPps = Math.max(config.getAdaptiveMinPps(), Math.min(ceiling, target));
         packetsPerSecond = applyBurstDrainFloor(packetsPerSecond);
         if (!Double.isInfinite(lossPacingCeiling)) {
@@ -419,6 +436,26 @@ final class AdaptiveTransportController {
 
     private double applyBurstDrainFloor(double rate) {
         return burstDrainActive ? Math.max(rate, burstDrainFloorPps) : rate;
+    }
+
+    private double qosRecoveryCeiling(long now) {
+        final long quietThreshold = Math.max(TimeUnit.SECONDS.toNanos(1),
+                saturatedMultiply(smoothedRtt, 4L));
+        final long recoveryNanos = Math.max(0L, now - lastLossNanos - quietThreshold);
+        final double steps = recoveryNanos / (double) QOS_RECOVERY_STEP_NANOS;
+        final double base = Math.max(QOS_RECOVERY_BASE_PPS, config.getAdaptiveMinPps());
+        return Math.min(DEGRADED_BURST_MAX_PPS, base * Math.pow(2D, steps));
+    }
+
+    private double healthyBurstCeiling() {
+        // A new connection has no evidence that the path can absorb a multi-megabyte join burst.
+        // Keep the old ceiling until at least one useful ACK window has been observed, then permit
+        // at most a 2x demand-driven step toward the configured healthy ceiling.
+        if (lossSampleCount() < 64) {
+            return Math.min(DEGRADED_BURST_MAX_PPS, config.getAdaptiveMaxPps());
+        }
+        return Math.min(config.getAdaptiveMaxPps(),
+                Math.max(DEGRADED_BURST_MAX_PPS, packetsPerSecond * 2D));
     }
 
     private double applyPacingSlew(long now, double targetRate) {
