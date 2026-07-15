@@ -72,8 +72,8 @@ public class AdaptiveTransportControllerTest {
 
         controller.sendBudget(System.nanoTime(), 0, 1400, 400 * 1024);
 
-        Assertions.assertTrue(controller.packetsPerSecond() >= 150D);
-        Assertions.assertTrue(controller.packetsPerSecond() <= 300D);
+        Assertions.assertTrue(controller.packetsPerSecond() >= 500D);
+        Assertions.assertTrue(controller.packetsPerSecond() <= 600D);
     }
 
     @Test
@@ -98,11 +98,39 @@ public class AdaptiveTransportControllerTest {
         setDouble(controller, "packetsPerSecond", 50D);
 
         controller.sendBudget(System.nanoTime(), 0, 1400, 64 * 1024);
-        Assertions.assertTrue(controller.packetsPerSecond() >= 100D);
+        Assertions.assertTrue(controller.packetsPerSecond() >= 120D);
 
         setDouble(controller, "packetsPerSecond", 50D);
         controller.sendBudget(System.nanoTime(), 64 * 1024, 1400, 0);
-        Assertions.assertTrue(controller.packetsPerSecond() >= 100D);
+        Assertions.assertTrue(controller.packetsPerSecond() >= 120D);
+    }
+
+    @Test
+    public void observedLargeZstdBatchGetsSubSecondDrainRate() throws Exception {
+        final RakNet.Config config = adaptiveConfig();
+        when(config.getAdaptiveMaxPps()).thenReturn(600);
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        setDouble(controller, "packetsPerSecond", 50D);
+
+        controller.sendBudget(System.nanoTime(), 0, 1400, 211 * 1024);
+
+        Assertions.assertTrue(controller.packetsPerSecond() >= 400D);
+        Assertions.assertTrue(controller.packetsPerSecond() <= 600D);
+    }
+
+    @Test
+    public void severeLossHalvesLargeBatchDrainFloor() throws Exception {
+        final RakNet.Config config = adaptiveConfig();
+        when(config.getAdaptiveMaxPps()).thenReturn(600);
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        for (int i = 0; i < 9; i++) controller.onAck(1200, 40_000_000L, 0);
+        controller.onLoss(1200, false);
+        setDouble(controller, "packetsPerSecond", 50D);
+
+        controller.sendBudget(System.nanoTime(), 0, 1400, 211 * 1024);
+
+        Assertions.assertTrue(controller.packetsPerSecond() >= 180D);
+        Assertions.assertTrue(controller.packetsPerSecond() <= 250D);
     }
 
     @Test

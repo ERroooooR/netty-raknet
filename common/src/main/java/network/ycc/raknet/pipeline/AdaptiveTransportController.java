@@ -29,8 +29,8 @@ final class AdaptiveTransportController {
     private static final long MIN_BANDWIDTH_PROBE_COOLDOWN_NANOS = TimeUnit.SECONDS.toNanos(5);
     private static final int BURST_DRAIN_ENTER_BYTES = 48 * 1024;
     private static final int BURST_DRAIN_EXIT_BYTES = 16 * 1024;
-    private static final int BURST_DRAIN_MAX_PPS = 300;
-    private static final double BURST_DRAIN_TARGET_SECONDS = 2D;
+    private static final int BURST_DRAIN_MAX_PPS = 600;
+    private static final double BURST_DRAIN_TARGET_SECONDS = 0.5D;
 
     private final RakNet.Config config;
     private DplpmtudController pathMtu;
