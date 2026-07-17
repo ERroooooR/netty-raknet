@@ -10,6 +10,7 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelInitializer;
+import io.netty.channel.ChannelOutboundHandlerAdapter;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.DefaultEventLoopGroup;
 import io.netty.channel.EventLoop;
@@ -25,7 +26,9 @@ import network.ycc.raknet.config.DefaultCodec;
 import network.ycc.raknet.frame.FrameData;
 import network.ycc.raknet.packet.FramedPacket;
 import network.ycc.raknet.packet.Ping;
+import network.ycc.raknet.packet.Reliability;
 import network.ycc.raknet.pipeline.UserDataCodec;
+import network.ycc.raknet.pipeline.RawPacketCodec;
 import network.ycc.raknet.server.channel.RakNetServerChannel;
 import network.ycc.raknet.utils.EmptyInit;
 import network.ycc.raknet.utils.MockDatagram;
@@ -35,9 +38,12 @@ import org.junit.jupiter.api.Test;
 
 import java.net.InetSocketAddress;
 import java.util.Random;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArraySet;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
 
 public class EndToEndTest {
@@ -182,6 +188,81 @@ public class EndToEndTest {
     @Test
     public void adaptiveV12SurvivesModerateRandomLoss() throws Throwable {
         dataTest(200, 1000, true, true, false, 12, 0.05);
+    }
+
+    @Test
+    public void adaptiveAckProtectionRecoversWhenEveryFirstAckIsLost() throws Throwable {
+        final AtomicReference<Channel> serverChild = new AtomicReference<>();
+        final Channel server = newServer(null, new ChannelInitializer<Channel>() {
+            @Override
+            protected void initChannel(Channel ch) {
+                serverChild.set(ch);
+            }
+        }, null);
+        final Channel client = newClient(null, null, 12);
+        final RecoveryMetrics metrics = new RecoveryMetrics();
+        RakNet.config(client.parent()).setMetrics(metrics);
+
+        final Set<String> seenAcks = new CopyOnWriteArraySet<>();
+        final AtomicInteger droppedFirstAcks = new AtomicInteger();
+        final AtomicInteger passedRepeatedAcks = new AtomicInteger();
+        client.parent().pipeline().addAfter(RawPacketCodec.NAME,
+                "drop-first-ack", new ChannelOutboundHandlerAdapter() {
+            @Override
+            public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise)
+                    throws Exception {
+                if (msg instanceof Reliability.ACK) {
+                    final StringBuilder signatureBuilder = new StringBuilder();
+                    for (Reliability.REntry entry : ((Reliability.ACK) msg).getEntries()) {
+                        signatureBuilder.append(entry.idStart).append(':')
+                                .append(entry.idFinish).append(',');
+                    }
+                    final String signature = signatureBuilder.toString();
+                    if (seenAcks.add(signature)) {
+                        droppedFirstAcks.incrementAndGet();
+                        ReferenceCountUtil.release(msg);
+                        promise.trySuccess();
+                        return;
+                    }
+                    passedRepeatedAcks.incrementAndGet();
+                }
+                super.write(ctx, msg, promise);
+            }
+        });
+
+        for (int i = 0; i < 100 && serverChild.get() == null; i++) {
+            Thread.sleep(10);
+        }
+        final Channel child = serverChild.get();
+        Assertions.assertNotNull(child);
+        final ChannelFuture[] writes = new ChannelFuture[8];
+        for (int i = 0; i < writes.length; i++) {
+            final ByteBuf payload = Unpooled.buffer(8).writeLong(i);
+            final FrameData packet = FrameData.create(child.alloc(), 0xFE, payload);
+            payload.release();
+            packet.setReliability(FramedPacket.Reliability.RELIABLE);
+            writes[i] = child.pipeline().write(packet);
+            child.pipeline().flush();
+            Thread.sleep(30);
+        }
+
+        try {
+            for (ChannelFuture write : writes) {
+                write.get(10, TimeUnit.SECONDS);
+                Assertions.assertTrue(write.isSuccess());
+            }
+            final String diagnostics = "dropped=" + droppedFirstAcks.get()
+                    + ", duplicates=" + metrics.reliableDuplicates.get()
+                    + ", repeatedPackets=" + metrics.ackRepeatedPackets.get()
+                    + ", passedRepeats=" + passedRepeatedAcks.get();
+            Assertions.assertTrue(droppedFirstAcks.get() >= 3, diagnostics);
+            Assertions.assertTrue(metrics.reliableDuplicates.get() >= 3, diagnostics);
+            Assertions.assertTrue(metrics.ackRepeatedPackets.get() > 0, diagnostics);
+            Assertions.assertTrue(passedRepeatedAcks.get() > 0, diagnostics);
+        } finally {
+            client.close().sync();
+            server.close().sync();
+        }
     }
 
     @Test
@@ -435,6 +516,21 @@ public class EndToEndTest {
         {
             server.writeOut = dg -> client.pipeline().fireChannelRead(dg).fireChannelReadComplete();
             client.writeOut = dg -> server.pipeline().fireChannelRead(dg).fireChannelReadComplete();
+        }
+    }
+
+    private static final class RecoveryMetrics implements RakNet.MetricsLogger {
+        final AtomicInteger reliableDuplicates = new AtomicInteger();
+        final AtomicInteger ackRepeatedPackets = new AtomicInteger();
+
+        @Override
+        public void reliableFrameDuplicate(int delta) {
+            reliableDuplicates.addAndGet(delta);
+        }
+
+        @Override
+        public void ackRepeated(int acknowledgedFrameSets) {
+            ackRepeatedPackets.incrementAndGet();
         }
     }
 

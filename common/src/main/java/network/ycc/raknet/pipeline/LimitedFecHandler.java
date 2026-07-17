@@ -31,12 +31,16 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
     private static final int LEGACY_MAX_PROTECTED_BYTES = 512;
     private static final int MAX_CACHE = 512;
     private static final int MAX_PENDING_GROUPS = 64;
+    private static final int TARGETED_WINDOW_SIZE = 4;
+    private static final int TARGETED_ROLLING_CACHE = 8;
 
     private final List<Entry> outbound = new ArrayList<>(MAX_GROUP_SIZE);
+    private final List<Entry> rollingOutbound = new ArrayList<>(TARGETED_ROLLING_CACHE);
     private final Int2ObjectLinkedOpenHashMap<byte[]> received = new Int2ObjectLinkedOpenHashMap<>();
     private final List<LegacyParity> legacyPending = new ArrayList<>();
     private final Int2ObjectLinkedOpenHashMap<RsGroup> rsPending = new Int2ObjectLinkedOpenHashMap<>();
     private final Set<Integer> recentGroups = new LinkedHashSet<>();
+    private final Set<Integer> targetedGroups = new LinkedHashSet<>();
     private int groupId;
     private int outboundDataShards;
     private int outboundParityShards;
@@ -57,31 +61,51 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
 
     @Override
     public void write(ChannelHandlerContext ctx, Object msg, ChannelPromise promise) {
-        if (!enabled(ctx) || !fecUseful(ctx) || !(msg instanceof ByteBuf)) {
+        final boolean enabled = enabled(ctx);
+        if (!enabled || !(msg instanceof ByteBuf)) {
             resetOutbound();
+            if (!enabled) rollingOutbound.clear();
             ctx.write(msg, promise);
             return;
         }
         final boolean reedSolomon = reedSolomonEnabled(ctx);
-        final AdaptiveTransportController.FecParameters parameters = fecParameters(ctx, reedSolomon);
-        if (outboundDataShards != 0 && (outboundDataShards != parameters.dataShards
-                || outboundParityShards != parameters.parityShards)) outbound.clear();
-        outboundDataShards = parameters.dataShards;
-        outboundParityShards = parameters.parityShards;
+        final ReliabilityHandler reliability = ctx.pipeline().get(ReliabilityHandler.class);
+        final boolean normalFec = reliability != null && reliability.adaptiveController().shouldUseFec();
+        final AdaptiveTransportController.FecParameters parameters = normalFec
+                ? fecParameters(ctx, reedSolomon)
+                : new AdaptiveTransportController.FecParameters(TARGETED_WINDOW_SIZE, 1, 0.0D);
+        if (normalFec) {
+            if (outboundDataShards != 0 && (outboundDataShards != parameters.dataShards
+                    || outboundParityShards != parameters.parityShards)) outbound.clear();
+            outboundDataShards = parameters.dataShards;
+            outboundParityShards = parameters.parityShards;
+        } else {
+            resetOutbound();
+        }
 
         final ByteBuf buf = (ByteBuf) msg;
         final int payloadLimit = reedSolomon
                 ? Math.max(256, RakNet.config(ctx).getMTU() - (12 + parameters.dataShards * 5))
                 : LEGACY_MAX_PROTECTED_BYTES;
+        Entry current = null;
         if (isFrameSet(buf) && buf.readableBytes() <= payloadLimit) {
             final byte[] bytes = copy(buf);
-            outbound.add(new Entry(buf.getUnsignedMediumLE(buf.readerIndex() + 1), bytes.length, bytes));
+            current = new Entry(buf.getUnsignedMediumLE(buf.readerIndex() + 1), bytes.length, bytes);
+            if (reedSolomon) rememberRolling(current);
+            if (normalFec) outbound.add(current);
         }
         ctx.write(msg, promise);
-        if (outbound.size() == parameters.dataShards) {
+        boolean wroteNormalParity = false;
+        if (normalFec && outbound.size() == parameters.dataShards) {
             if (reedSolomon) writeReedSolomonParity(ctx, parameters.parityShards);
             else writeLegacyParity(ctx);
             outbound.clear();
+            wroteNormalParity = true;
+        }
+        if (!wroteNormalParity && reedSolomon && current != null && reliability != null) {
+            final long now = System.nanoTime();
+            final int targetSequence = selectTargetedSequence(reliability, now);
+            if (targetSequence >= 0) writeTargetedParity(ctx, reliability, targetSequence, now);
         }
     }
 
@@ -104,11 +128,14 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
         if (id == FEC_FEEDBACK_PACKET_ID) {
             try {
                 buf.skipBytes(1);
-                buf.readInt(); // group id, reserved for future per-group accounting
+                final int feedbackGroupId = buf.readInt();
                 final int recovered = buf.readUnsignedByte();
                 if (recovered > 2 || buf.isReadable()) throw new IllegalArgumentException("invalid FEC feedback");
                 feedbackGroups++;
                 feedbackRecovered += recovered;
+                if (targetedGroups.remove(feedbackGroupId) && recovered > 0) {
+                    RakNet.config(ctx).getMetrics().targetedFecRecovered(recovered);
+                }
                 if (feedbackGroups >= 128) {
                     feedbackGroups /= 2;
                     feedbackRecovered /= 2;
@@ -152,10 +179,12 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
         if (cleanupTask != null) cleanupTask.cancel(false);
         cleanupTask = null;
         resetOutbound();
+        rollingOutbound.clear();
         received.clear();
         legacyPending.clear();
         rsPending.clear();
         recentGroups.clear();
+        targetedGroups.clear();
     }
 
     private void writeLegacyParity(ChannelHandlerContext ctx) {
@@ -189,6 +218,75 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
 
     private void writeEntries(ByteBuf out) {
         for (Entry entry : outbound) out.writeMediumLE(entry.seq).writeShort(entry.length);
+    }
+
+    private static void writeEntries(ByteBuf out, List<Entry> entries) {
+        for (Entry entry : entries) out.writeMediumLE(entry.seq).writeShort(entry.length);
+    }
+
+    private void rememberRolling(Entry entry) {
+        rollingOutbound.removeIf(existing -> existing.seq == entry.seq);
+        rollingOutbound.add(entry);
+        while (rollingOutbound.size() > TARGETED_ROLLING_CACHE) rollingOutbound.remove(0);
+    }
+
+    private int selectTargetedSequence(ReliabilityHandler reliability, long now) {
+        int sequence = -1;
+        double maximumDebt = 0D;
+        for (Entry entry : rollingOutbound) {
+            if (reliability.targetedFecChannel(entry.seq) < 0) continue;
+            final double debt = reliability.recoveryDebtForSequence(entry.seq, now);
+            if (debt >= 2D && debt > maximumDebt) {
+                maximumDebt = debt;
+                sequence = entry.seq;
+            }
+        }
+        return sequence;
+    }
+
+    private void writeTargetedParity(ChannelHandlerContext ctx, ReliabilityHandler reliability,
+                                     int targetSequence, long now) {
+        Entry target = null;
+        for (Entry entry : rollingOutbound) if (entry.seq == targetSequence) target = entry;
+        if (target == null) return;
+        final List<Entry> group = selectTargetedGroup(rollingOutbound, targetSequence);
+        if (group.size() < TARGETED_WINDOW_SIZE) return;
+        final List<byte[]> data = new ArrayList<>(group.size());
+        for (Entry entry : group) data.add(entry.data);
+        final byte[] parity = ReedSolomonCodec.encode(data, 1)[0];
+        final int packetBytes = 10 + group.size() * 5 + parity.length;
+        if (!reliability.tryAcquireTargetedFecBudget(targetSequence, packetBytes, now)) return;
+
+        final int id = groupId++;
+        targetedGroups.add(id);
+        while (targetedGroups.size() > MAX_PENDING_GROUPS) {
+            final Iterator<Integer> iterator = targetedGroups.iterator();
+            iterator.next();
+            iterator.remove();
+        }
+        final ByteBuf out = ctx.alloc().ioBuffer(packetBytes);
+        out.writeByte(RS_FEC_PACKET_ID).writeInt(id).writeByte(group.size())
+                .writeByte(1).writeByte(0);
+        writeEntries(out, group);
+        out.writeShort(parity.length).writeBytes(parity);
+        final int bytes = out.readableBytes();
+        ctx.write(out, ctx.voidPromise());
+        RakNet.config(ctx).getMetrics().fecParity(1, bytes);
+        RakNet.config(ctx).getMetrics().targetedFecRepair(
+                reliability.targetedFecChannel(targetSequence), bytes);
+    }
+
+    static List<Entry> selectTargetedGroup(List<Entry> rolling, int targetSequence) {
+        Entry target = null;
+        for (Entry entry : rolling) if (entry.seq == targetSequence) target = entry;
+        final List<Entry> group = new ArrayList<>(TARGETED_WINDOW_SIZE);
+        if (target == null) return group;
+        group.add(target);
+        for (int i = rolling.size() - 1; i >= 0 && group.size() < TARGETED_WINDOW_SIZE; i--) {
+            final Entry entry = rolling.get(i);
+            if (entry.seq != targetSequence) group.add(entry);
+        }
+        return group;
     }
 
     private List<byte[]> outboundData() {
@@ -316,11 +414,6 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
         return features != null && (features & TransportFeatures.REED_SOLOMON_FEC) != 0;
     }
 
-    private boolean fecUseful(ChannelHandlerContext ctx) {
-        final ReliabilityHandler reliability = ctx.pipeline().get(ReliabilityHandler.class);
-        return reliability != null && reliability.adaptiveController().shouldUseFec();
-    }
-
     private int fecGroupSize(ChannelHandlerContext ctx) {
         final Long features = ctx.channel().attr(RakNet.TRANSPORT_FEATURES).get();
         if (features == null || (features & TransportFeatures.DYNAMIC_FEC) == 0) return MIN_GROUP_SIZE;
@@ -407,7 +500,7 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
         return recovered;
     }
 
-    private static final class Entry {
+    static final class Entry {
         final int seq, length; final byte[] data;
         Entry(int seq, int length, byte[] data) { this.seq = seq; this.length = length; this.data = data; }
     }

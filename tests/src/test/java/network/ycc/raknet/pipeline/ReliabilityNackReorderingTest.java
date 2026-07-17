@@ -66,4 +66,111 @@ public class ReliabilityNackReorderingTest {
         Assertions.assertEquals(2, confirmed.size());
         Assertions.assertEquals(-1L, tracker.drainDue(Long.MAX_VALUE, confirmed::add));
     }
+
+    @Test
+    public void repeatedTrueLossTemporarilyBypassesReorderGrace() {
+        final ReliabilityHandler.AdaptiveNackGrace policy =
+                new ReliabilityHandler.AdaptiveNackGrace();
+        final long rtt = TimeUnit.MILLISECONDS.toNanos(80);
+        for (int i = 0; i < 8; i++) {
+            policy.onLost(i + 1L, rtt);
+        }
+
+        Assertions.assertTrue(policy.isBypassing(9L));
+        Assertions.assertFalse(policy.shouldDefer(9L));
+    }
+
+    @Test
+    public void oneReorderInInitialWindowPreventsPrematureBypass() {
+        final ReliabilityHandler.AdaptiveNackGrace policy =
+                new ReliabilityHandler.AdaptiveNackGrace();
+        final long rtt = TimeUnit.MILLISECONDS.toNanos(80);
+        for (int i = 0; i < 7; i++) policy.onLost(i + 1L, rtt);
+        policy.onReordered(8L);
+
+        Assertions.assertFalse(policy.isBypassing(9L));
+        Assertions.assertTrue(policy.shouldDefer(9L));
+    }
+
+    @Test
+    public void bypassUsesOneProbeAndImmediatelyReentersOnTrueLoss() {
+        final ReliabilityHandler.AdaptiveNackGrace policy =
+                new ReliabilityHandler.AdaptiveNackGrace();
+        final long rtt = TimeUnit.MILLISECONDS.toNanos(80);
+        for (int i = 0; i < 8; i++) policy.onLost(i + 1L, rtt);
+
+        final long afterCooldown = TimeUnit.SECONDS.toNanos(3);
+        Assertions.assertTrue(policy.shouldDefer(afterCooldown));
+        Assertions.assertFalse(policy.shouldDefer(afterCooldown + 1L));
+        policy.onLost(afterCooldown + 2L, rtt);
+
+        Assertions.assertTrue(policy.isBypassing(afterCooldown + 3L));
+        Assertions.assertFalse(policy.shouldDefer(afterCooldown + 3L));
+    }
+
+    @Test
+    public void successfulProbeRestoresReorderGrace() {
+        final ReliabilityHandler.AdaptiveNackGrace policy =
+                new ReliabilityHandler.AdaptiveNackGrace();
+        final long rtt = TimeUnit.MILLISECONDS.toNanos(80);
+        for (int i = 0; i < 8; i++) policy.onLost(i + 1L, rtt);
+
+        final long afterCooldown = TimeUnit.SECONDS.toNanos(3);
+        Assertions.assertTrue(policy.shouldDefer(afterCooldown));
+        policy.onReordered(afterCooldown + 1L);
+
+        Assertions.assertFalse(policy.isBypassing(afterCooldown + 2L));
+        Assertions.assertTrue(policy.shouldDefer(afterCooldown + 2L));
+    }
+
+    @Test
+    public void ackProtectionRequiresDuplicateBurstAndExpires() {
+        final ReliabilityHandler.AdaptiveAckProtection policy =
+                new ReliabilityHandler.AdaptiveAckProtection();
+        final long rtt = TimeUnit.MILLISECONDS.toNanos(80);
+        final long now = TimeUnit.SECONDS.toNanos(1);
+
+        policy.onDuplicateFrameSet(now, rtt);
+        policy.onDuplicateFrameSet(now + 1L, rtt);
+        Assertions.assertFalse(policy.isActive(now + 2L));
+        policy.onDuplicateFrameSet(now + 2L, rtt);
+
+        Assertions.assertTrue(policy.isActive(now + 3L));
+        Assertions.assertEquals(TimeUnit.MILLISECONDS.toNanos(10),
+                policy.repeatDelayNanos(rtt));
+        Assertions.assertFalse(policy.isActive(now + TimeUnit.SECONDS.toNanos(3)));
+    }
+
+    @Test
+    public void sparseDuplicateFrameSetsDoNotActivateAckProtection() {
+        final ReliabilityHandler.AdaptiveAckProtection policy =
+                new ReliabilityHandler.AdaptiveAckProtection();
+        final long rtt = TimeUnit.MILLISECONDS.toNanos(80);
+        policy.onDuplicateFrameSet(1L, rtt);
+        policy.onDuplicateFrameSet(TimeUnit.SECONDS.toNanos(2), rtt);
+        policy.onDuplicateFrameSet(TimeUnit.SECONDS.toNanos(4), rtt);
+
+        Assertions.assertFalse(policy.isActive(TimeUnit.SECONDS.toNanos(4) + 1L));
+        Assertions.assertEquals(TimeUnit.MILLISECONDS.toNanos(5),
+                policy.repeatDelayNanos(TimeUnit.MILLISECONDS.toNanos(10)));
+        Assertions.assertEquals(TimeUnit.MILLISECONDS.toNanos(20),
+                policy.repeatDelayNanos(TimeUnit.SECONDS.toNanos(1)));
+    }
+
+    @Test
+    public void duplicateDuringProtectionExtendsQuietDeadline() {
+        final ReliabilityHandler.AdaptiveAckProtection policy =
+                new ReliabilityHandler.AdaptiveAckProtection();
+        final long rtt = TimeUnit.MILLISECONDS.toNanos(80);
+        final long now = TimeUnit.SECONDS.toNanos(1);
+        policy.onDuplicateFrameSet(now, rtt);
+        policy.onDuplicateFrameSet(now + 1L, rtt);
+        policy.onDuplicateFrameSet(now + 2L, rtt);
+        final long nearOriginalExpiry = now + TimeUnit.MILLISECONDS.toNanos(1900);
+        policy.onDuplicateFrameSet(nearOriginalExpiry, rtt);
+
+        Assertions.assertTrue(policy.isActive(now + TimeUnit.SECONDS.toNanos(3)));
+        Assertions.assertFalse(policy.isActive(nearOriginalExpiry
+                + TimeUnit.SECONDS.toNanos(3)));
+    }
 }

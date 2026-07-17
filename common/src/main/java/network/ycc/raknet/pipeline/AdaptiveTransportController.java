@@ -25,14 +25,17 @@ final class AdaptiveTransportController {
     private static final long MIN_RTT_FILTER_NANOS = TimeUnit.SECONDS.toNanos(30);
     private static final long PROBE_RTT_NANOS = TimeUnit.MILLISECONDS.toNanos(200);
     private static final long MIN_CONGESTION_RESPONSE_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(250);
-    private static final long MIN_LOSS_RECOVERY_QUIET_NANOS = TimeUnit.MILLISECONDS.toNanos(500);
     private static final long MIN_BANDWIDTH_PROBE_COOLDOWN_NANOS = TimeUnit.SECONDS.toNanos(5);
     private static final int BURST_DRAIN_ENTER_BYTES = 48 * 1024;
     private static final int BURST_DRAIN_EXIT_BYTES = 16 * 1024;
     private static final int DEGRADED_BURST_MAX_PPS = 600;
     private static final int QOS_RECOVERY_BASE_PPS = 100;
-    private static final long QOS_RECOVERY_STEP_NANOS = TimeUnit.MILLISECONDS.toNanos(500);
+    private static final long MIN_QOS_RECOVERY_STEP_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
     private static final double BURST_DRAIN_TARGET_SECONDS = 0.5D;
+    private static final long BURST_ADMISSION_INITIAL_BPS = 384L * 1024L;
+    private static final long BURST_ADMISSION_MIN_BPS = 128L * 1024L;
+    private static final double BURST_ADMISSION_GROWTH = 1.25D;
+    private static final int BURST_ADMISSION_TOKEN_DATAGRAMS = 4;
 
     private final RakNet.Config config;
     private DplpmtudController pathMtu;
@@ -82,6 +85,12 @@ final class AdaptiveTransportController {
     private boolean burstDrainActive;
     private long burstDrainStartedNanos;
     private double burstDrainFloorPps;
+    private long burstAdmissionRateBytesPerSecond;
+    private double burstAdmissionTokens;
+    private long burstAdmissionUpdatedNanos;
+    private long burstRampUpdatedNanos;
+    private long lastAckNanos;
+    private long burstRecoveryProbes;
 
     AdaptiveTransportController(RakNet.Config config) {
         this.config = config;
@@ -113,6 +122,7 @@ final class AdaptiveTransportController {
         if (!config.isAdaptiveTransportEnabled()) return Integer.MAX_VALUE;
         final long outstandingBytes = Math.max(0L, inFlightBytes) + Math.max(0, queuedBytes);
         onOutstandingBytes(nowNanos, outstandingBytes);
+        updateBurstAdmission(nowNanos, nextDatagramBytes);
         lastInFlightBytes = Math.max(0, inFlightBytes);
         updateMode(nowNanos, inFlightBytes);
         if (inFlightBytes > 0 && inFlightBytes + nextDatagramBytes > congestionWindowBytes) {
@@ -135,14 +145,27 @@ final class AdaptiveTransportController {
             final long cwndBudget = Math.max(1L,
                     (congestionWindowBytes - inFlightBytes + nextDatagramBytes - 1L) / nextDatagramBytes);
             budget = (int) Math.min(budget, cwndBudget);
-            pacingTokens -= budget;
         } else if (pacingTokens >= 0D && inFlightBytes == 0) {
             budget = 1;
-            pacingTokens -= 1D;
         }
-        final double missing = Math.max(0D, -pacingTokens);
-        nextSendNanos = nowNanos + Math.max(10_000L,
-                (long) Math.ceil(missing * 1_000_000_000D / packetsPerSecond));
+        if (burstDrainActive && burstAdmissionRateBytesPerSecond > 0) {
+            final int byteBudget = Math.max(0, (int) (burstAdmissionTokens / nextDatagramBytes));
+            budget = Math.min(budget, byteBudget);
+        }
+        if (budget > 0) {
+            pacingTokens -= budget;
+            if (burstDrainActive) burstAdmissionTokens -= (double) budget * nextDatagramBytes;
+        }
+        // Preserve the existing one-packet idle credit outside the byte-gated
+        // backlog path; the burst admission bucket is what smooths bulk starts.
+        final double missingPackets = Math.max(0D, -pacingTokens);
+        long pacingDelay = (long) Math.ceil(missingPackets * 1_000_000_000D / packetsPerSecond);
+        if (burstDrainActive && burstAdmissionRateBytesPerSecond > 0) {
+            final double missingBytes = Math.max(0D, nextDatagramBytes - burstAdmissionTokens);
+            pacingDelay = Math.max(pacingDelay, (long) Math.ceil(missingBytes * 1_000_000_000D
+                    / burstAdmissionRateBytesPerSecond));
+        }
+        nextSendNanos = nowNanos + Math.max(10_000L, pacingDelay);
         publishCongestionMetrics();
         return budget;
     }
@@ -165,6 +188,12 @@ final class AdaptiveTransportController {
                 && nextDatagramBytes > Math.max(0L, congestionWindowBytes - inFlightBytes);
     }
 
+    boolean allowsApplicationLimitedRecovery() {
+        return !config.isAdaptiveTransportEnabled()
+                || (!burstDrainActive && !queueInflated()
+                && lossType != LossType.QUEUE && lossType != LossType.MTU_BLACK_HOLE);
+    }
+
     void onAck(int bytes, long rttNanos) {
         onAck(bytes, rttNanos, lastInFlightBytes);
     }
@@ -175,6 +204,7 @@ final class AdaptiveTransportController {
         acked[bucket]++;
         ackedBytes[bucket] += bytes;
         final long now = System.nanoTime();
+        lastAckNanos = now;
         averagePacketBytes = averagePacketBytes * 0.875D + bytes * 0.125D;
         updateDeliveryRate(now, bytes);
         updateAckAggregation(now, bytes);
@@ -242,6 +272,7 @@ final class AdaptiveTransportController {
             packetsPerSecond = applyBurstDrainFloor(clampPps(packetsPerSecond * reduction));
             lossPacingCeiling = Math.min(lossPacingCeiling, packetsPerSecond);
             lossRecoveryUpdatedNanos = now;
+            reduceBurstAdmission(reduction);
         }
         publishMetrics();
     }
@@ -268,6 +299,8 @@ final class AdaptiveTransportController {
     CongestionMode congestionMode() { return congestionMode; }
     long congestionWindowBytes() { return congestionWindowBytes; }
     double packetsPerSecond() { return packetsPerSecond; }
+    long burstAdmissionRateBytesPerSecond() { return burstAdmissionRateBytesPerSecond; }
+    long burstRecoveryProbes() { return burstRecoveryProbes; }
 
     boolean shouldUseFec() {
         final double ratio = lossRatio();
@@ -394,11 +427,13 @@ final class AdaptiveTransportController {
                 burstDrainActive = false;
                 burstDrainStartedNanos = 0;
                 burstDrainFloorPps = 0D;
+                resetBurstAdmission();
                 return;
             }
         } else if (outstandingBytes >= BURST_DRAIN_ENTER_BYTES) {
             burstDrainActive = true;
             burstDrainStartedNanos = now;
+            startBurstAdmission(now);
         } else {
             return;
         }
@@ -442,9 +477,78 @@ final class AdaptiveTransportController {
         final long quietThreshold = Math.max(TimeUnit.SECONDS.toNanos(1),
                 saturatedMultiply(smoothedRtt, 4L));
         final long recoveryNanos = Math.max(0L, now - lastLossNanos - quietThreshold);
-        final double steps = recoveryNanos / (double) QOS_RECOVERY_STEP_NANOS;
+        final long stepNanos = Math.max(MIN_QOS_RECOVERY_STEP_NANOS, smoothedRtt);
+        final double steps = recoveryNanos / (double) stepNanos;
         final double base = Math.max(QOS_RECOVERY_BASE_PPS, config.getAdaptiveMinPps());
-        return Math.min(DEGRADED_BURST_MAX_PPS, base * Math.pow(2D, steps));
+        return Math.min(DEGRADED_BURST_MAX_PPS, base * Math.pow(BURST_ADMISSION_GROWTH, steps));
+    }
+
+    private void startBurstAdmission(long now) {
+        final long observedRate = Math.max(deliveryRateBytesPerSecond, maxBandwidth());
+        final long packetRate = (long) Math.ceil(packetsPerSecond * Math.max(256D, averagePacketBytes));
+        final long initial = Math.max(BURST_ADMISSION_MIN_BPS,
+                Math.min(BURST_ADMISSION_INITIAL_BPS, Math.max(observedRate, packetRate)));
+        burstAdmissionRateBytesPerSecond = initial;
+        burstAdmissionTokens = Math.max(1, config.getMTU());
+        burstAdmissionUpdatedNanos = now;
+        burstRampUpdatedNanos = now;
+    }
+
+    private void resetBurstAdmission() {
+        burstAdmissionRateBytesPerSecond = 0L;
+        burstAdmissionTokens = 0D;
+        burstAdmissionUpdatedNanos = 0L;
+        burstRampUpdatedNanos = 0L;
+    }
+
+    private void updateBurstAdmission(long now, int datagramBytes) {
+        if (!burstDrainActive || burstAdmissionRateBytesPerSecond <= 0L) return;
+        if (burstAdmissionUpdatedNanos == 0L) burstAdmissionUpdatedNanos = now;
+        final long elapsed = Math.max(0L, now - burstAdmissionUpdatedNanos);
+        final double tokenLimit = (double) Math.max(datagramBytes, config.getMTU())
+                * BURST_ADMISSION_TOKEN_DATAGRAMS;
+        burstAdmissionTokens = Math.min(tokenLimit, burstAdmissionTokens
+                + elapsed * burstAdmissionRateBytesPerSecond / 1_000_000_000D);
+        burstAdmissionUpdatedNanos = now;
+
+        final long rtt = Math.max(TimeUnit.MILLISECONDS.toNanos(20),
+                smoothedRtt > 0 ? smoothedRtt : TimeUnit.MILLISECONDS.toNanos(100));
+        final boolean recentAck = lastAckNanos != 0L && now - lastAckNanos <= Math.max(rtt * 2L,
+                TimeUnit.MILLISECONDS.toNanos(250));
+        final boolean healthy = lossRatio() < 0.005D && !queueInflated() && lossQuietForRecovery(now);
+        if (!recentAck || !healthy || now - burstRampUpdatedNanos < rtt) return;
+
+        final long steps = Math.max(1L, (now - burstRampUpdatedNanos) / rtt);
+        final long configuredMaximum = (long) Math.ceil(config.getAdaptiveMaxPps()
+                * Math.max(256D, averagePacketBytes));
+        final long observedTarget = Math.max(BURST_ADMISSION_INITIAL_BPS,
+                (long) Math.ceil(Math.max(deliveryRateBytesPerSecond, maxBandwidth()) * 1.25D));
+        final long target = Math.max(burstAdmissionRateBytesPerSecond,
+                Math.min(configuredMaximum, observedTarget));
+        final double grown = burstAdmissionRateBytesPerSecond
+                * Math.pow(BURST_ADMISSION_GROWTH, Math.min(steps, 8L));
+        final long updated = Math.min(target, Math.max(burstAdmissionRateBytesPerSecond + 1L,
+                (long) Math.ceil(grown)));
+        if (updated > burstAdmissionRateBytesPerSecond) {
+            burstAdmissionRateBytesPerSecond = updated;
+            burstRecoveryProbes += steps;
+        }
+        burstRampUpdatedNanos += steps * rtt;
+    }
+
+    private void reduceBurstAdmission(double reduction) {
+        if (!burstDrainActive || burstAdmissionRateBytesPerSecond <= 0L) return;
+        final long configuredMinimum = (long) Math.ceil(config.getAdaptiveMinPps()
+                * Math.max(256D, averagePacketBytes));
+        burstAdmissionRateBytesPerSecond = Math.max(Math.max(BURST_ADMISSION_MIN_BPS, configuredMinimum),
+                (long) Math.floor(burstAdmissionRateBytesPerSecond * reduction));
+        burstAdmissionTokens = Math.min(burstAdmissionTokens, config.getMTU());
+        burstRampUpdatedNanos = System.nanoTime();
+    }
+
+    private boolean lossQuietForRecovery(long now) {
+        return lastLossNanos == 0L || now - lastLossNanos
+                > Math.max(TimeUnit.MILLISECONDS.toNanos(250), saturatedMultiply(smoothedRtt, 2L));
     }
 
     private double healthyBurstCeiling() {
@@ -466,6 +570,12 @@ final class AdaptiveTransportController {
         final long elapsed = Math.min(TimeUnit.SECONDS.toNanos(1),
                 Math.max(0L, now - pacingRateUpdatedNanos));
         pacingRateUpdatedNanos = now;
+        if (!Double.isInfinite(lossPacingCeiling) && lossQuietForRecovery(now)) {
+            final long recoveryStep = Math.max(MIN_QOS_RECOVERY_STEP_NANOS, smoothedRtt);
+            final double steps = elapsed / (double) recoveryStep;
+            return Math.min(targetRate, packetsPerSecond
+                    * Math.pow(BURST_ADMISSION_GROWTH, Math.min(steps, 8D)));
+        }
         // In steady state, at most double the pacing rate per second. This
         // filters ACK-compression spikes without delaying immediate reductions.
         final double growthExponent = elapsed / 1_000_000_000D;
@@ -497,14 +607,19 @@ final class AdaptiveTransportController {
             pacingCapped = false;
             return modelRate;
         }
-        final long quietPeriod = Math.max(MIN_LOSS_RECOVERY_QUIET_NANOS,
+        final long quietPeriod = Math.max(TimeUnit.MILLISECONDS.toNanos(250),
                 saturatedMultiply(smoothedRtt, 2L));
         if (now - lastLossNanos > quietPeriod) {
             final long elapsed = Math.max(0L, now - lossRecoveryUpdatedNanos);
-            if (elapsed > 0) {
-                // Double the allowed rate per second after a quiet period. This
-                // cannot jump back to a stale pre-QoS estimate on the first ACK.
-                lossPacingCeiling *= Math.pow(2D, elapsed / 1_000_000_000D);
+            final long recoveryStep = Math.max(MIN_QOS_RECOVERY_STEP_NANOS, smoothedRtt);
+            final long steps = elapsed / recoveryStep;
+            if (steps > 0) {
+                // Probe upward once per RTT after a short quiet period. A repeated
+                // loss immediately cuts the ceiling again, while a clean path can
+                // recover useful Minecraft burst throughput in a few RTTs.
+                lossPacingCeiling *= Math.pow(BURST_ADMISSION_GROWTH, Math.min(steps, 2L));
+                // Recovery is ACK-driven: do not accumulate silent time and
+                // spend it as a large rate jump on the first returning ACK.
                 lossRecoveryUpdatedNanos = now;
             }
             if (lossPacingCeiling >= modelRate || (lossRatio() < 0.005D
@@ -647,12 +762,10 @@ final class AdaptiveTransportController {
 
     private void publishMetrics() {
         config.getMetrics().adaptivePacingRate(packetsPerSecond);
-        // Byte pacing and adaptive ACK policy remain disabled after the public-network
-        // rollback. Keep publishing neutral values so telemetry remains schema-stable.
-        config.getMetrics().adaptiveBytePacingRate(0L);
-        config.getMetrics().adaptiveAckPolicy(false, 0L, 0L);
+        config.getMetrics().adaptiveBytePacingRate(burstDrainActive ? burstAdmissionRateBytesPerSecond : 0L);
         config.getMetrics().adaptiveDemand(!burstDrainActive, burstDrainActive ? "BULK" : "IDLE",
-                burstDrainActive ? Math.max(0L, System.nanoTime() - burstDrainStartedNanos) : 0L, 0L);
+                burstDrainActive ? Math.max(0L, System.nanoTime() - burstDrainStartedNanos) : 0L,
+                burstRecoveryProbes);
         config.getMetrics().adaptiveDeliveryRate(deliveryRateBytesPerSecond);
         long acknowledgements = 0, losses = 0;
         for (int i = 0; i < WINDOW_BUCKETS; i++) { acknowledgements += acked[i]; losses += lost[i]; }

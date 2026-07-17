@@ -13,6 +13,7 @@ import io.netty.util.concurrent.ScheduledFuture;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.function.Consumer;
 
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap;
@@ -25,7 +26,7 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
 
     public FrameOrderIn() {
         for (int i = 0; i < channels.length; i++) {
-            channels[i] = new OrderedChannelPacketQueue();
+            channels[i] = new OrderedChannelPacketQueue(i, this::publishMetrics);
         }
     }
 
@@ -33,6 +34,7 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
     public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
         super.handlerRemoved(ctx);
         Arrays.stream(channels).forEach(OrderedChannelPacketQueue::clear);
+        publishMetrics(ctx);
     }
 
     protected void decode(ChannelHandlerContext ctx, Frame frame, List<Object> list) {
@@ -55,10 +57,16 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
         int pending = 0;
         long oldestQueuedAt = now;
         for (OrderedChannelPacketQueue channel : channels) {
-            pending += channel.queue.size();
+            final int channelPending = channel.queue.size();
+            pending += channelPending;
+            long channelOldestQueuedAt = now;
             for (long queuedAt : channel.queuedAt.values()) {
                 oldestQueuedAt = Math.min(oldestQueuedAt, queuedAt);
+                channelOldestQueuedAt = Math.min(channelOldestQueuedAt, queuedAt);
             }
+            RakNet.config(ctx).getMetrics().orderedChannelPending(channel.channelId, channelPending,
+                    channelPending == 0 ? 0L : Math.max(0L, now - channelOldestQueuedAt),
+                    channelPending == 0 ? -1 : UINT.B3.plus(channel.lastOrderIndex, 1));
         }
         RakNet.config(ctx).getMetrics().orderedQueuePending(
                 pending, pending == 0 ? 0 : Math.max(0, now - oldestQueuedAt));
@@ -70,6 +78,14 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
         protected final Int2LongOpenHashMap queuedAt = new Int2LongOpenHashMap();
         protected int lastOrderIndex = -1;
         protected int lastSequenceIndex = -1;
+        protected final int channelId;
+        private final Consumer<ChannelHandlerContext> metricsPublisher;
+
+        protected OrderedChannelPacketQueue(int channelId,
+                                            Consumer<ChannelHandlerContext> metricsPublisher) {
+            this.channelId = channelId;
+            this.metricsPublisher = metricsPublisher;
+        }
 
         // Item 2: gap timeout tracking — when a gap is detected, record the time.
         // If the missing packet doesn't arrive within gapTimeoutNanos, flush queued
@@ -117,6 +133,7 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
                 } while (data != null);
                 if (released > 0 && ctx != null) {
                     RakNet.config(ctx).getMetrics().orderedQueueRelease(released, oldestWait);
+                    RakNet.config(ctx).getMetrics().orderedChannelRelease(channelId, released, oldestWait);
                 }
             } else if (indexDiff > 1 && !queue.containsKey(frame.getOrderIndex())) {
                 // only new future data goes in the queue
@@ -144,6 +161,8 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
                         if (release.frames > 0 && ctx != null) {
                             RakNet.config(ctx).getMetrics().orderedQueueRelease(
                                     release.frames, release.oldestWaitNanos);
+                            RakNet.config(ctx).getMetrics().orderedChannelRelease(
+                                    channelId, release.frames, release.oldestWaitNanos);
                         }
                     }
                 }
@@ -157,9 +176,12 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
             final QueueRelease release = flushGap(out);
             if (release.frames > 0) {
                 RakNet.config(ctx).getMetrics().orderedQueueRelease(release.frames, release.oldestWaitNanos);
+                RakNet.config(ctx).getMetrics().orderedChannelRelease(
+                        channelId, release.frames, release.oldestWaitNanos);
             }
             for (Object msg : out) ctx.fireChannelRead(msg);
             if (!out.isEmpty()) ctx.fireChannelReadComplete();
+            metricsPublisher.accept(ctx);
         }
 
         private static long saturatedMultiply(long value, long multiplier) {

@@ -90,6 +90,48 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
+    public void newBacklogUsesBoundedByteBurstInsteadOfPpsOnly() {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        final long now = System.nanoTime();
+
+        Assertions.assertEquals(1, controller.sendBudget(now, 0, 1400, 1024 * 1024));
+        Assertions.assertEquals(0, controller.sendBudget(now, 0, 1400, 1024 * 1024));
+        Assertions.assertEquals(384L * 1024L, controller.burstAdmissionRateBytesPerSecond());
+        Assertions.assertTrue(controller.sendBudget(now + 10_000_000L, 0, 1400, 1024 * 1024) <= 2,
+                "the first 10ms must not release the full four-datagram PPS burst");
+    }
+
+    @Test
+    public void cleanAcksRampBurstAdmissionAtRttCadence() throws Exception {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        final long now = System.nanoTime();
+        controller.sendBudget(now, 0, 1400, 1024 * 1024);
+        final Field bandwidth = AdaptiveTransportController.class.getDeclaredField("bandwidthFilter");
+        bandwidth.setAccessible(true);
+        Arrays.fill((long[]) bandwidth.get(controller), 2L * 1024L * 1024L);
+        setLong(controller, "smoothedRtt", 40_000_000L);
+        setLong(controller, "lastAckNanos", now);
+        setLong(controller, "burstRampUpdatedNanos", now - 160_000_000L);
+
+        controller.sendBudget(now, 0, 1400, 1024 * 1024);
+
+        Assertions.assertTrue(controller.burstAdmissionRateBytesPerSecond() >= 900L * 1024L);
+        Assertions.assertTrue(controller.burstRecoveryProbes() >= 4L);
+    }
+
+    @Test
+    public void lossImmediatelyCutsActiveBurstAdmission() throws Exception {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        controller.sendBudget(System.nanoTime(), 0, 1400, 1024 * 1024);
+        setLong(controller, "burstAdmissionRateBytesPerSecond", 1024L * 1024L);
+
+        controller.onLoss(1200, false);
+
+        Assertions.assertTrue(controller.burstAdmissionRateBytesPerSecond() < 1024L * 1024L);
+        Assertions.assertTrue(controller.burstAdmissionRateBytesPerSecond() >= 128L * 1024L);
+    }
+
+    @Test
     public void tinyQueueCannotKeepBurstDrainActive() throws Exception {
         final RakNet.Config config = adaptiveConfig();
         when(config.getAdaptiveMaxPps()).thenReturn(600);
@@ -156,8 +198,8 @@ public class AdaptiveTransportControllerTest {
 
         controller.sendBudget(System.nanoTime(), 0, 1400, 1024 * 1024);
 
-        Assertions.assertTrue(controller.packetsPerSecond() >= 200D);
-        Assertions.assertTrue(controller.packetsPerSecond() <= 300D);
+        Assertions.assertTrue(controller.packetsPerSecond() >= 350D);
+        Assertions.assertTrue(controller.packetsPerSecond() <= 450D);
     }
 
     @Test
@@ -206,6 +248,30 @@ public class AdaptiveTransportControllerTest {
         controller.onAck(1200, 20_000_000L, 0);
 
         Assertions.assertEquals(reducedRate, controller.packetsPerSecond(), 0.01D);
+    }
+
+    @Test
+    public void quietPathRecoversLossCeilingWithinSeveralRtts() throws Exception {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        final Field bandwidth = AdaptiveTransportController.class.getDeclaredField("bandwidthFilter");
+        bandwidth.setAccessible(true);
+        Arrays.fill((long[]) bandwidth.get(controller), 1024L * 1024L);
+        final long now = System.nanoTime();
+        setDouble(controller, "packetsPerSecond", 100D);
+        setDouble(controller, "lossPacingCeiling", 100D);
+        setLong(controller, "smoothedRtt", 70_000_000L);
+        setLong(controller, "lastLossNanos", now - 900_000_000L);
+        for (int i = 0; i < 5; i++) {
+            final long ackNow = System.nanoTime();
+            setLong(controller, "lossRecoveryUpdatedNanos", ackNow - 120_000_000L);
+            setLong(controller, "pacingRateUpdatedNanos", ackNow - 120_000_000L);
+            controller.onAck(1200, 70_000_000L, 0);
+        }
+
+        Assertions.assertTrue(controller.packetsPerSecond() >= 300D,
+                "five clean RTTs should recover beyond the old per-second ramp");
+        Assertions.assertTrue(controller.packetsPerSecond() < 500D,
+                "recovery remains a probe and must not restore the stale maximum immediately");
     }
 
     @Test

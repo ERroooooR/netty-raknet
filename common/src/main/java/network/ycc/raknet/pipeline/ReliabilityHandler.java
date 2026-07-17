@@ -9,6 +9,8 @@ import io.netty.util.ReferenceCountUtil;
 import io.netty.util.concurrent.ScheduledFuture;
 import it.unimi.dsi.fastutil.ints.Int2LongMap;
 import it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap;
+import it.unimi.dsi.fastutil.ints.Int2IntOpenHashMap;
+import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
 import it.unimi.dsi.fastutil.ints.Int2ObjectLinkedOpenHashMap;
 import it.unimi.dsi.fastutil.ints.IntRBTreeSet;
 import it.unimi.dsi.fastutil.ints.IntSortedSet;
@@ -22,6 +24,7 @@ import network.ycc.raknet.pipeline.FlushTickHandler.MissedFlushes;
 import network.ycc.raknet.utils.Constants;
 import network.ycc.raknet.utils.UINT;
 
+import java.util.ArrayList;
 import java.util.PriorityQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.function.IntConsumer;
@@ -34,14 +37,24 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     public static final String NAME = "rn-reliability";
 
     protected final IntSortedSet nackSet = new IntRBTreeSet(UINT.B3.COMPARATOR);
+    protected final IntSortedSet nackRepeatSet = new IntRBTreeSet(UINT.B3.COMPARATOR);
     protected final IntSortedSet ackSet = new IntRBTreeSet(UINT.B3.COMPARATOR);
+    protected final IntSortedSet ackRepeatSet = new IntRBTreeSet(UINT.B3.COMPARATOR);
     protected final PriorityQueue<Frame> frameQueue = new PriorityQueue<>(Frame.COMPARATOR);
     protected final Int2ObjectLinkedOpenHashMap<FrameSet> pendingFrameSets = new Int2ObjectLinkedOpenHashMap<>();
+    protected final Int2LongOpenHashMap rackRetiredFrameSets = new Int2LongOpenHashMap();
+    protected final Int2IntOpenHashMap ptoProbeBytesByFrameSet = new Int2IntOpenHashMap();
+    protected final Int2IntOpenHashMap additionalRecoveryBytesByFrameSet = new Int2IntOpenHashMap();
+    protected final Int2LongOpenHashMap additionalRecoveryLastSent = new Int2LongOpenHashMap();
+    protected final IntOpenHashSet additionallyRecoveredThisPeriod = new IntOpenHashSet();
+    protected final Int2IntOpenHashMap targetedFecChannelsByFrameSet = new Int2IntOpenHashMap();
     protected final ReliableReceiveWindow reliableReceiveWindow = new ReliableReceiveWindow();
     protected final DeferredNackTracker deferredNacks = new DeferredNackTracker();
 
     protected int queuedBytes = 0;
     protected long inFlightBytes = 0;
+    protected long ptoProbeBytesInFlight = 0;
+    protected long additionalRecoveryBytesInFlight = 0;
 
     protected int lastReceivedSeqId = 0;
     protected int nextSendSeqId = 0;
@@ -56,13 +69,63 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected long coalesceStartedNanos;
     protected ScheduledFuture<?> deferredNackFuture;
     protected long deferredNackDeadlineNanos = Long.MAX_VALUE;
+    protected ScheduledFuture<?> nackRepeatFuture;
+    protected ScheduledFuture<?> ackRepeatFuture;
+    protected ScheduledFuture<?> rackLossFuture;
+    protected long rackLossDeadlineNanos = Long.MAX_VALUE;
+    protected long latestAckedSentTimeNanos;
+    protected int rackReorderingMultiplierEighths = 10;
+    protected int rackCleanAckCount;
+    protected ScheduledFuture<?> ptoFuture;
+    protected long ptoDeadlineNanos = Long.MAX_VALUE;
+    protected long lastAckProgressNanos;
+    protected long lastPtoProbeSentNanos;
+    protected int ptoCount;
+    protected boolean applicationLimitedRecoveryPeriod;
+    protected long targetedFecWindowStartedNanos;
+    protected int targetedFecBytesInWindow;
+    protected final AdaptiveNackGrace adaptiveNackGrace = new AdaptiveNackGrace();
+    protected final AdaptiveAckProtection adaptiveAckProtection = new AdaptiveAckProtection();
 
     // Item 3: track when first ACK was queued for time-based flush
     protected long firstAckNanos = 0;
     private static final long ACK_FLUSH_DELAY_NANOS = 2_000_000; // 2ms
+    private static final long MIN_ACK_REPEAT_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(5);
+    private static final long MAX_ACK_REPEAT_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(20);
+    private static final long MIN_ACK_PROTECTION_NANOS = TimeUnit.SECONDS.toNanos(2);
+    private static final int ACK_PROTECTION_DUPLICATE_THRESHOLD = 3;
+    private static final long ACK_PROTECTION_TRIGGER_WINDOW_NANOS = TimeUnit.SECONDS.toNanos(1);
     private static final long MIN_NACK_REORDER_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(4);
     private static final long MAX_NACK_REORDER_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(25);
+    private static final long MIN_NACK_REPEAT_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(5);
+    private static final long MAX_NACK_REPEAT_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(20);
     private static final int MAX_DEFERRED_NACK_GAP = 2;
+    private static final int NACK_GRACE_OUTCOME_WINDOW = 32;
+    private static final int NACK_GRACE_MIN_OUTCOMES = 8;
+    private static final int NACK_GRACE_BYPASS_PERCENT = 88;
+    private static final long MIN_NACK_GRACE_BYPASS_NANOS = TimeUnit.SECONDS.toNanos(2);
+    private static final long RACK_TIMER_GRANULARITY_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
+    private static final int RACK_BASE_REORDERING_MULTIPLIER_EIGHTHS = 10; // 1.25 RTT
+    private static final int RACK_MAX_REORDERING_MULTIPLIER_EIGHTHS = 16; // 2 RTT
+    private static final int RACK_CLEAN_ACKS_TO_DECAY = 64;
+    private static final long MIN_RACK_RETIRED_RETENTION_NANOS = TimeUnit.SECONDS.toNanos(1);
+    private static final long PTO_TIMER_GRANULARITY_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
+    private static final int MAX_PTO_BACKOFF_EXPONENT = 6;
+    private static final boolean ADAPTIVE_NACK_GRACE_ENABLED = Boolean.parseBoolean(
+            System.getProperty("raknetify.adaptiveNackGrace", "true"));
+    private static final boolean ADAPTIVE_NACK_PROTECTION_ENABLED = Boolean.parseBoolean(
+            System.getProperty("raknetify.adaptiveNackProtection", "true"));
+    private static final boolean ADAPTIVE_ACK_PROTECTION_ENABLED = Boolean.parseBoolean(
+            System.getProperty("raknetify.adaptiveAckProtection", "true"));
+    private static final boolean RACK_LOSS_DETECTION_ENABLED = Boolean.parseBoolean(
+            System.getProperty("raknetify.rackLossDetection", "true"));
+    private static final boolean PTO_PROBES_ENABLED = Boolean.parseBoolean(
+            System.getProperty("raknetify.ptoProbes", "true"));
+    private static final boolean APPLICATION_LIMITED_RECOVERY_ENABLED = Boolean.parseBoolean(
+            System.getProperty("raknetify.applicationLimitedRecovery", "true"));
+    private static final boolean TARGETED_FEC_ENABLED = Boolean.parseBoolean(
+            System.getProperty("raknetify.targetedFec", "true"));
+    private static final double TARGETED_FEC_MIN_DEBT = 2.0D;
     // Item 7: guard against recursive flush from recallFrameSet
     protected boolean flushing = false;
 
@@ -82,12 +145,30 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         this.adaptive = new AdaptiveTransportController(config);
         ctx.channel().attr(RakNet.WRITABLE).set(true);
         if (config.isIgnoreResendGauge()) this.resendGauge = 2;
+        rackRetiredFrameSets.defaultReturnValue(Long.MIN_VALUE);
+        ptoProbeBytesByFrameSet.defaultReturnValue(0);
+        additionalRecoveryBytesByFrameSet.defaultReturnValue(0);
+        additionalRecoveryLastSent.defaultReturnValue(Long.MIN_VALUE);
+        targetedFecChannelsByFrameSet.defaultReturnValue(-1);
+        publishRecoveryPolicies(System.nanoTime());
     }
 
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) {
         cancelDeferredNackTask();
+        cancelNackRepeatTask();
+        cancelAckRepeatTask();
+        cancelRackLossTask();
+        cancelPtoTask();
         deferredNacks.clear();
+        nackRepeatSet.clear();
+        ackRepeatSet.clear();
+        rackRetiredFrameSets.clear();
+        ptoProbeBytesByFrameSet.clear();
+        additionalRecoveryBytesByFrameSet.clear();
+        additionalRecoveryLastSent.clear();
+        additionallyRecoveredThisPeriod.clear();
+        targetedFecChannelsByFrameSet.clear();
         clearQueue(null);
     }
 
@@ -196,6 +277,15 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         frameQueue.clear();
         this.queuedBytes = 0;
         this.inFlightBytes = 0;
+        this.ptoProbeBytesInFlight = 0;
+        this.additionalRecoveryBytesInFlight = 0;
+        cancelPtoTask();
+        ptoProbeBytesByFrameSet.clear();
+        additionalRecoveryBytesByFrameSet.clear();
+        additionalRecoveryLastSent.clear();
+        additionallyRecoveredThisPeriod.clear();
+        targetedFecChannelsByFrameSet.clear();
+        applicationLimitedRecoveryPeriod = false;
         pendingFrameSets.values().forEach(FrameSet::release);
         pendingFrameSets.clear();
     }
@@ -214,13 +304,20 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         ackSet.add(packetSeqId);
         if (config.isNACKEnabled()) {
             nackSet.remove(packetSeqId);
+            nackRepeatSet.remove(packetSeqId);
+            if (nackRepeatSet.isEmpty()) cancelNackRepeatTask();
             if (deferredNacks.cancel(packetSeqId)) {
                 config.getMetrics().reorderedPacket(1);
+                adaptiveNackGrace.onReordered(System.nanoTime());
             }
         }
         if (UINT.B3.minusWrap(packetSeqId, lastReceivedSeqId) > 0) {
             final int missingCount = UINT.B3.minusWrap(packetSeqId, lastReceivedSeqId) - 1;
-            final boolean deferGap = config.isNACKEnabled() && shouldDeferNackGap(missingCount);
+            final long now = System.nanoTime();
+            final boolean graceEligible = config.isNACKEnabled() && shouldDeferNackGap(missingCount);
+            final boolean deferGap = graceEligible && (!ADAPTIVE_NACK_GRACE_ENABLED
+                    || adaptiveNackGrace.shouldDefer(now));
+            final boolean bypassGrace = graceEligible && !deferGap;
             if (config.isNACKEnabled() && missingCount > MAX_DEFERRED_NACK_GAP) {
                 confirmDeferredNacks();
             }
@@ -228,13 +325,17 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             while (lastReceivedSeqId != packetSeqId) { //nack any missed packets before this one
                 if (config.isNACKEnabled()) {
                     if (deferGap) deferNack(ctx, lastReceivedSeqId);
-                    else nackSet.add(lastReceivedSeqId);
+                    else {
+                        nackSet.add(lastReceivedSeqId);
+                        if (bypassGrace) config.getMetrics().nackGraceBypassed(1);
+                    }
                 }
                 lastReceivedSeqId = UINT.B3.plus(lastReceivedSeqId, 1);
             }
         }
         config.getMetrics().packetsIn(1);
         config.getMetrics().framesIn(frameSet.getNumPackets());
+        final boolean[] duplicateReliableFrameSet = {false};
         frameSet.createFrames(frame -> {
             if (frame.getReliability().isReliable
                     && !reliableReceiveWindow.accept(frame.getReliableIndex())) {
@@ -243,11 +344,17 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 // In particular, a duplicate split fragment can otherwise create
                 // an orphan FrameJoiner builder after the original was completed.
                 config.getMetrics().reliableFrameDuplicate(1);
+                duplicateReliableFrameSet[0] = true;
                 frame.release();
                 return;
             }
             ctx.fireChannelRead(frame);
         });
+        if (ADAPTIVE_ACK_PROTECTION_ENABLED && duplicateReliableFrameSet[0]) {
+            // Count retransmitted FrameSets, not the number of frames inside one
+            // datagram. A large packet must not activate protection by itself.
+            adaptiveAckProtection.onDuplicateFrameSet(System.nanoTime(), config.getRTTNanos());
+        }
         trySendResponses(ctx);
         ctx.fireChannelReadComplete();
     }
@@ -255,23 +362,49 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected void readAck(Reliability.ACK ack) {
         int ackdBytes = 0;
         int nIterations = 0;
+        boolean ackProgress = false;
+        final long now = System.nanoTime();
         for (Reliability.REntry entry : ack.getEntries()) {
             final int max = UINT.B3.plus(entry.idFinish, 1);
             for (int id = entry.idStart; id != max; id = UINT.B3.plus(id, 1)) {
                 final FrameSet frameSet = pendingFrameSets.remove(id);
                 if (frameSet != null) {
+                    targetedFecChannelsByFrameSet.remove(id);
+                    ackProgress = true;
+                    final int acknowledgedProbeBytes = clearPtoProbeTracking(id);
+                    if (acknowledgedProbeBytes > 0) {
+                        config.getMetrics().ptoProbeAcked(acknowledgedProbeBytes);
+                    }
+                    clearAdditionalRecoveryTracking(id);
+                    clearLogicalRecoveryTracking(frameSet);
+                    latestAckedSentTimeNanos = Math.max(latestAckedSentTimeNanos, frameSet.getSentTime());
+                    onRackCleanAck();
                     ackdBytes += frameSet.getRoughSize();
                     inFlightBytes = Math.max(0, inFlightBytes - frameSet.getRoughSize());
-                    adaptive.onAck(frameSet.getRoughSize(), System.nanoTime() - frameSet.getSentTime(), inFlightBytes);
+                    adaptive.onAck(frameSet.getRoughSize(), System.nanoTime() - frameSet.getSentTime(),
+                            totalInFlightBytes());
                     adjustResendGauge(1);
                     frameSet.succeed();
                     frameSet.release();
                     tryProduceFrameSets();
+                } else if (rackRetiredFrameSets.containsKey(id)) {
+                    rackRetiredFrameSets.remove(id);
+                    config.getMetrics().rackSpuriousAck(1);
+                    onRackSpuriousAck();
                 }
                 Constants.packetLossCheck(nIterations++, "ack confirm range");
             }
         }
         config.getMetrics().bytesACKd(ackdBytes);
+        if (ackProgress) {
+            lastAckProgressNanos = now;
+            lastPtoProbeSentNanos = 0L;
+            ptoCount = 0;
+        }
+        pruneRackRetired(now);
+        if (ackProgress) detectRackLosses(now);
+        else refreshRackLossTimer(now);
+        refreshPtoTimer(now);
     }
 
     protected void readNack(Reliability.NACK nack) {
@@ -284,6 +417,9 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             for (int id = entry.idStart; id != max; id = UINT.B3.plus(id, 1)) {
                 final FrameSet frameSet = pendingFrameSets.remove(id);
                 if (frameSet != null) {
+                    targetedFecChannelsByFrameSet.remove(id);
+                    clearPtoProbeTracking(id);
+                    clearAdditionalRecoveryTracking(id);
                     bytesNACKd += frameSet.getRoughSize();
                     inFlightBytes = Math.max(0, inFlightBytes - frameSet.getRoughSize());
                     adaptive.onLoss(frameSet.getRoughSize(), false);
@@ -294,6 +430,8 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         }
         config.getMetrics().bytesNACKd(bytesNACKd);
         config.getMetrics().nackRetransmit(bytesNACKd);
+        refreshRackLossTimer(System.nanoTime());
+        refreshPtoTimer(System.nanoTime());
     }
 
     protected void queueFrame(Frame frame) {
@@ -337,15 +475,25 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     }
 
     protected void sendResponses(ChannelHandlerContext ctx) {
+        final long now = System.nanoTime();
+        publishRecoveryPolicies(now);
         if (!ackSet.isEmpty()) {
             ctx.write(new Reliability.ACK(ackSet)).addListener(RakNet.INTERNAL_WRITE_LISTENER);
             config.getMetrics().acksSent(ackSet.size());
+            if (ADAPTIVE_ACK_PROTECTION_ENABLED && adaptiveAckProtection.isActive(now)) {
+                ackRepeatSet.addAll(ackSet);
+                scheduleAckRepeat(ctx, adaptiveAckProtection.repeatDelayNanos(config.getRTTNanos()));
+            }
             ackSet.clear();
             firstAckNanos = 0;
         }
         if (config.isNACKEnabled() && !nackSet.isEmpty() && config.isAutoRead()) { //only nack if we can read
             ctx.write(new Reliability.NACK(nackSet)).addListener(RakNet.INTERNAL_WRITE_LISTENER);
             config.getMetrics().nacksSent(nackSet.size());
+            if (isNackRepeatActive(now)) {
+                nackRepeatSet.addAll(nackSet);
+                scheduleNackRepeat(ctx, nackRepeatDelayNanos(config.getRTTNanos()));
+            }
             nackSet.clear();
         }
     }
@@ -372,6 +520,9 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                     frameSet.getRetryCount());
             if (now - frameSet.getSentTime() > timeout) {
                 packetItr.remove();
+                targetedFecChannelsByFrameSet.remove(frameSet.getSeqId());
+                clearPtoProbeTracking(frameSet.getSeqId());
+                clearAdditionalRecoveryTracking(frameSet.getSeqId());
                 inFlightBytes = Math.max(0, inFlightBytes - frameSet.getRoughSize());
                 adaptive.onLoss(frameSet.getRoughSize(), true);
                 config.getMetrics().timeoutRetransmit(frameSet.getRoughSize());
@@ -382,6 +533,357 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             // since higher retryCount = longer timeout, an older FrameSet with high
             // retryCount could be before a newer FrameSet with low retryCount.
             // Continue scanning rather than breaking to handle this correctly.
+        }
+        refreshRackLossTimer(now);
+        refreshPtoTimer(now);
+    }
+
+    static long rackReorderingWindowNanos(long rttNanos, int multiplierEighths) {
+        final long rtt = Math.max(1L, rttNanos);
+        final int multiplier = Math.max(RACK_BASE_REORDERING_MULTIPLIER_EIGHTHS,
+                Math.min(RACK_MAX_REORDERING_MULTIPLIER_EIGHTHS, multiplierEighths));
+        return Math.max(RACK_TIMER_GRANULARITY_NANOS,
+                saturatedMultiply(rtt, multiplier) / 8L);
+    }
+
+    /**
+     * Uses ACK progress from a chronologically newer transmission to infer that
+     * older outstanding FrameSets were lost. Unlike the fallback RTO this path
+     * deliberately ignores retryCount: a retransmission can itself be proven lost.
+     */
+    protected void detectRackLosses(long now) {
+        cancelRackLossTask();
+        if (!RACK_LOSS_DETECTION_ENABLED || latestAckedSentTimeNanos == 0L
+                || pendingFrameSets.isEmpty()) {
+            return;
+        }
+
+        final long reorderingWindow = rackReorderingWindowNanos(
+                config.getRTTNanos(), rackReorderingMultiplierEighths);
+        final ArrayList<FrameSet> lost = new ArrayList<>();
+        long nextDeadline = Long.MAX_VALUE;
+        final ObjectIterator<FrameSet> iterator = pendingFrameSets.values().iterator();
+        while (iterator.hasNext()) {
+            final FrameSet frameSet = iterator.next();
+            if (frameSet.getSentTime() >= latestAckedSentTimeNanos) continue;
+            final long deadline = saturatedAdd(frameSet.getSentTime(), reorderingWindow);
+            if (now >= deadline) {
+                iterator.remove();
+                targetedFecChannelsByFrameSet.remove(frameSet.getSeqId());
+                clearPtoProbeTracking(frameSet.getSeqId());
+                clearAdditionalRecoveryTracking(frameSet.getSeqId());
+                inFlightBytes = Math.max(0L, inFlightBytes - frameSet.getRoughSize());
+                adaptive.onLoss(frameSet.getRoughSize(), false);
+                config.getMetrics().rackRetransmit(frameSet.getRoughSize());
+                rackRetiredFrameSets.put(frameSet.getSeqId(), saturatedAdd(now,
+                        Math.max(MIN_RACK_RETIRED_RETENTION_NANOS,
+                                saturatedMultiply(Math.max(1L, config.getRTTNanos()), 4L))));
+                lost.add(frameSet);
+            } else {
+                nextDeadline = Math.min(nextDeadline, deadline);
+            }
+        }
+
+        for (FrameSet frameSet : lost) recallFrameSet(frameSet);
+        pruneRackRetired(now);
+        if (nextDeadline != Long.MAX_VALUE) scheduleRackLossCheck(nextDeadline);
+        refreshPtoTimer(now);
+    }
+
+    static long ptoTimeoutNanos(long rttNanos, long rttStdDevNanos,
+                                long retryDelayNanos, int ptoCount) {
+        final long rtt = Math.max(1L, rttNanos);
+        final long variation = saturatedMultiply(Math.max(0L, rttStdDevNanos), 4L);
+        final long base = saturatedAdd(saturatedAdd(rtt,
+                Math.max(PTO_TIMER_GRANULARITY_NANOS, variation)),
+                Math.max(0L, retryDelayNanos));
+        return saturatedMultiply(Math.max(PTO_TIMER_GRANULARITY_NANOS, base),
+                1L << Math.min(Math.max(0, ptoCount), MAX_PTO_BACKOFF_EXPONENT));
+    }
+
+    protected void refreshPtoTimer(long now) {
+        if (!PTO_PROBES_ENABLED) {
+            cancelPtoTask();
+            return;
+        }
+        final FrameSet candidate = selectPtoProbeCandidate();
+        if (candidate == null) {
+            cancelPtoTask();
+            ptoCount = 0;
+            lastPtoProbeSentNanos = 0L;
+            publishPtoState(now);
+            return;
+        }
+        final long anchor = Math.max(candidate.getSentTime(),
+                Math.max(lastAckProgressNanos, lastPtoProbeSentNanos));
+        final long deadline = saturatedAdd(anchor, ptoTimeoutNanos(
+                config.getRTTNanos(), config.getRTTStdDevNanos(),
+                config.getRetryDelayNanos(), ptoCount));
+        if (deadline <= now) sendPtoProbe(now);
+        else schedulePto(deadline);
+        publishPtoState(now);
+    }
+
+    protected FrameSet selectPtoProbeCandidate() {
+        FrameSet oldestReliable = null;
+        FrameSet oldestOrdered = null;
+        for (FrameSet frameSet : pendingFrameSets.values()) {
+            if (!frameSet.hasReliableFrame()) continue;
+            if (oldestReliable == null || frameSet.getSentTime() < oldestReliable.getSentTime()) {
+                oldestReliable = frameSet;
+            }
+            if (frameSet.hasReliableOrderedFrame()
+                    && (oldestOrdered == null || frameSet.getSentTime() < oldestOrdered.getSentTime())) {
+                oldestOrdered = frameSet;
+            }
+        }
+        return oldestOrdered != null ? oldestOrdered : oldestReliable;
+    }
+
+    protected void sendPtoProbe(long now) {
+        cancelPtoTask();
+        final FrameSet candidate = selectPtoProbeCandidate();
+        if (candidate == null || ctx == null || !ctx.channel().isOpen()) return;
+        final int bytes = candidate.getRoughSize();
+        if (adaptive.sendBudget(now, totalInFlightBytes(), bytes, queuedBytes) <= 0) {
+            schedulePto(saturatedAdd(now, Math.max(PTO_TIMER_GRANULARITY_NANOS,
+                    adaptive.nanosUntilSend(now))));
+            return;
+        }
+
+        candidate.touch("PTO probe");
+        ctx.write(candidate.retain()).addListener(RakNet.INTERNAL_WRITE_LISTENER);
+        ptoProbeBytesByFrameSet.addTo(candidate.getSeqId(), bytes);
+        ptoProbeBytesInFlight += bytes;
+        config.getMetrics().ptoProbe(bytes);
+        config.getMetrics().packetsOut(1);
+        config.getMetrics().framesOut(candidate.getNumPackets());
+        lastPtoProbeSentNanos = now;
+        ptoCount = Math.min(MAX_PTO_BACKOFF_EXPONENT, ptoCount + 1);
+        publishPtoState(now);
+        ctx.flush();
+        refreshPtoTimer(now);
+    }
+
+    private void schedulePto(long deadlineNanos) {
+        if (ctx == null || !ctx.channel().isOpen()) return;
+        if (ptoFuture != null && !ptoFuture.isDone() && ptoDeadlineNanos <= deadlineNanos) return;
+        cancelPtoTask();
+        ptoDeadlineNanos = deadlineNanos;
+        ptoFuture = ctx.executor().schedule(() -> {
+            ptoFuture = null;
+            ptoDeadlineNanos = Long.MAX_VALUE;
+            if (ctx.channel().isOpen()) sendPtoProbe(System.nanoTime());
+        }, Math.max(0L, deadlineNanos - System.nanoTime()), TimeUnit.NANOSECONDS);
+    }
+
+    private void cancelPtoTask() {
+        if (ptoFuture != null) ptoFuture.cancel(false);
+        ptoFuture = null;
+        ptoDeadlineNanos = Long.MAX_VALUE;
+    }
+
+    private int clearPtoProbeTracking(int sequenceId) {
+        final int bytes = ptoProbeBytesByFrameSet.remove(sequenceId);
+        if (bytes > 0) ptoProbeBytesInFlight = Math.max(0L, ptoProbeBytesInFlight - bytes);
+        return bytes;
+    }
+
+    private int clearAdditionalRecoveryTracking(int sequenceId) {
+        final int bytes = additionalRecoveryBytesByFrameSet.remove(sequenceId);
+        if (bytes > 0) {
+            additionalRecoveryBytesInFlight = Math.max(0L,
+                    additionalRecoveryBytesInFlight - bytes);
+        }
+        return bytes;
+    }
+
+    private void clearLogicalRecoveryTracking(FrameSet frameSet) {
+        frameSet.forEachReliableIndex(index -> {
+            additionalRecoveryLastSent.remove(index);
+            additionallyRecoveredThisPeriod.remove(index);
+        });
+    }
+
+    private long totalInFlightBytes() {
+        return saturatedAdd(saturatedAdd(inFlightBytes, ptoProbeBytesInFlight),
+                additionalRecoveryBytesInFlight);
+    }
+
+    private void publishPtoState(long now) {
+        config.getMetrics().ptoState(ptoCount,
+                lastAckProgressNanos == 0L ? 0L : Math.max(0L, now - lastAckProgressNanos));
+    }
+
+    protected void updateApplicationLimitedRecovery(long now) {
+        final boolean applicationLimited = frameQueue.isEmpty() && queuedBytes == 0;
+        if (!APPLICATION_LIMITED_RECOVERY_ENABLED || !applicationLimited) {
+            if (!applicationLimited) {
+                applicationLimitedRecoveryPeriod = false;
+                additionallyRecoveredThisPeriod.clear();
+            }
+            publishRecoveryQueueState(now);
+            return;
+        }
+        if (!applicationLimitedRecoveryPeriod) {
+            applicationLimitedRecoveryPeriod = true;
+            additionallyRecoveredThisPeriod.clear();
+        }
+        publishRecoveryQueueState(now);
+        if (!adaptive.allowsApplicationLimitedRecovery()) return;
+
+        final long rtt = Math.max(PTO_TIMER_GRANULARITY_NANOS, config.getRTTNanos());
+        if (lastPtoProbeSentNanos != 0L && now - lastPtoProbeSentNanos < rtt) return;
+        final FrameSet candidate = selectAdditionalRecoveryCandidate(now, rtt);
+        if (candidate == null) return;
+        final int bytes = candidate.getRoughSize();
+        if (adaptive.sendBudget(now, totalInFlightBytes(), bytes, queuedBytes) <= 0) return;
+
+        candidate.touch("Application-limited recovery");
+        ctx.write(candidate.retain()).addListener(RakNet.INTERNAL_WRITE_LISTENER);
+        additionalRecoveryBytesByFrameSet.addTo(candidate.getSeqId(), bytes);
+        additionalRecoveryBytesInFlight += bytes;
+        candidate.forEachRetriedReliableIndex(index -> {
+            additionallyRecoveredThisPeriod.add(index);
+            additionalRecoveryLastSent.put(index, now);
+        });
+        config.getMetrics().applicationLimitedRecovery(bytes);
+        config.getMetrics().packetsOut(1);
+        config.getMetrics().framesOut(candidate.getNumPackets());
+        lastPtoProbeSentNanos = now; // share the speculative-send cooldown with PTO
+        ctx.flush();
+        refreshPtoTimer(now);
+        publishRecoveryQueueState(now);
+    }
+
+    protected FrameSet selectAdditionalRecoveryCandidate(long now, long cooldownNanos) {
+        FrameSet oldest = null;
+        FrameSet oldestOrdered = null;
+        for (FrameSet frameSet : pendingFrameSets.values()) {
+            if (!isAdditionalRecoveryEligible(frameSet, now, cooldownNanos)) continue;
+            if (oldest == null || frameSet.getSentTime() < oldest.getSentTime()) oldest = frameSet;
+            if (frameSet.hasReliableOrderedFrame()
+                    && (oldestOrdered == null || frameSet.getSentTime() < oldestOrdered.getSentTime())) {
+                oldestOrdered = frameSet;
+            }
+        }
+        return oldestOrdered != null ? oldestOrdered : oldest;
+    }
+
+    private boolean isAdditionalRecoveryEligible(FrameSet frameSet, long now, long cooldownNanos) {
+        if (!frameSet.hasRetriedReliableFrame()) return false;
+        final boolean[] eligible = {true};
+        frameSet.forEachRetriedReliableIndex(index -> {
+            final long lastSent = additionalRecoveryLastSent.get(index);
+            if (additionallyRecoveredThisPeriod.contains(index)
+                    || (lastSent != Long.MIN_VALUE && now - lastSent < cooldownNanos)) {
+                eligible[0] = false;
+            }
+        });
+        return eligible[0];
+    }
+
+    private void publishRecoveryQueueState(long now) {
+        int depth = 0;
+        long oldestSent = now;
+        for (FrameSet frameSet : pendingFrameSets.values()) {
+            if (frameSet.hasRetriedReliableFrame()) {
+                depth++;
+                oldestSent = Math.min(oldestSent, frameSet.getSentTime());
+            }
+        }
+        config.getMetrics().recoveryQueueState(depth,
+                depth == 0 ? 0L : Math.max(0L, now - oldestSent));
+    }
+
+    int targetedFecChannel(int sequenceId) {
+        return targetedFecChannelsByFrameSet.get(sequenceId);
+    }
+
+    double recoveryDebtForSequence(int sequenceId, long now) {
+        final FrameSet frameSet = pendingFrameSets.get(sequenceId);
+        final int channel = targetedFecChannelsByFrameSet.get(sequenceId);
+        if (frameSet == null || channel < 0) return 0D;
+        final long rtt = Math.max(PTO_TIMER_GRANULARITY_NANOS, config.getRTTNanos());
+        final double ageInRtts = Math.max(0L, now - frameSet.getSentTime()) / (double) rtt;
+        final double debt = Math.min(32D, frameSet.maximumRetryCount() + ageInRtts);
+        config.getMetrics().recoveryDebt(debt, channel);
+        return debt;
+    }
+
+    boolean tryAcquireTargetedFecBudget(int sequenceId, int bytes, long now) {
+        if (!TARGETED_FEC_ENABLED || bytes <= 0
+                || recoveryDebtForSequence(sequenceId, now) < TARGETED_FEC_MIN_DEBT
+                || !adaptive.allowsApplicationLimitedRecovery()
+                || adaptive.congestionWindowBlocked(totalInFlightBytes(), bytes)) return false;
+        final long rtt = Math.max(PTO_TIMER_GRANULARITY_NANOS, config.getRTTNanos());
+        if (targetedFecWindowStartedNanos == 0L || now - targetedFecWindowStartedNanos >= rtt) {
+            targetedFecWindowStartedNanos = now;
+            targetedFecBytesInWindow = 0;
+        }
+        final int budget = Math.max(256, config.getMTU());
+        if (bytes > budget - targetedFecBytesInWindow) return false;
+        targetedFecBytesInWindow += bytes;
+        return true;
+    }
+
+    private void refreshRackLossTimer(long now) {
+        if (!RACK_LOSS_DETECTION_ENABLED || latestAckedSentTimeNanos == 0L) {
+            cancelRackLossTask();
+            return;
+        }
+        final long reorderingWindow = rackReorderingWindowNanos(
+                config.getRTTNanos(), rackReorderingMultiplierEighths);
+        long nextDeadline = Long.MAX_VALUE;
+        for (FrameSet frameSet : pendingFrameSets.values()) {
+            if (frameSet.getSentTime() < latestAckedSentTimeNanos) {
+                nextDeadline = Math.min(nextDeadline,
+                        saturatedAdd(frameSet.getSentTime(), reorderingWindow));
+            }
+        }
+        if (nextDeadline == Long.MAX_VALUE) cancelRackLossTask();
+        else if (nextDeadline <= now) detectRackLosses(now);
+        else scheduleRackLossCheck(nextDeadline);
+    }
+
+    private void scheduleRackLossCheck(long deadlineNanos) {
+        if (ctx == null || !ctx.channel().isOpen()) return;
+        if (rackLossFuture != null && !rackLossFuture.isDone()
+                && rackLossDeadlineNanos <= deadlineNanos) return;
+        cancelRackLossTask();
+        rackLossDeadlineNanos = deadlineNanos;
+        final long delay = Math.max(0L, deadlineNanos - System.nanoTime());
+        rackLossFuture = ctx.executor().schedule(() -> {
+            rackLossFuture = null;
+            rackLossDeadlineNanos = Long.MAX_VALUE;
+            if (ctx.channel().isOpen()) detectRackLosses(System.nanoTime());
+        }, delay, TimeUnit.NANOSECONDS);
+    }
+
+    private void cancelRackLossTask() {
+        if (rackLossFuture != null) rackLossFuture.cancel(false);
+        rackLossFuture = null;
+        rackLossDeadlineNanos = Long.MAX_VALUE;
+    }
+
+    private void pruneRackRetired(long now) {
+        final ObjectIterator<Int2LongMap.Entry> iterator = rackRetiredFrameSets.int2LongEntrySet().iterator();
+        while (iterator.hasNext()) {
+            if (iterator.next().getLongValue() <= now) iterator.remove();
+        }
+    }
+
+    private void onRackSpuriousAck() {
+        rackCleanAckCount = 0;
+        rackReorderingMultiplierEighths = Math.min(RACK_MAX_REORDERING_MULTIPLIER_EIGHTHS,
+                rackReorderingMultiplierEighths + 2);
+    }
+
+    private void onRackCleanAck() {
+        if (rackReorderingMultiplierEighths <= RACK_BASE_REORDERING_MULTIPLIER_EIGHTHS) return;
+        if (++rackCleanAckCount >= RACK_CLEAN_ACKS_TO_DECAY) {
+            rackCleanAckCount = 0;
+            rackReorderingMultiplierEighths--;
         }
     }
 
@@ -420,6 +922,12 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 Math.min(MAX_NACK_REORDER_DELAY_NANOS, candidate));
     }
 
+    static long nackRepeatDelayNanos(long rttNanos) {
+        final long candidate = Math.max(0L, rttNanos) / 8L;
+        return Math.max(MIN_NACK_REPEAT_DELAY_NANOS,
+                Math.min(MAX_NACK_REPEAT_DELAY_NANOS, candidate));
+    }
+
     private void deferNack(ChannelHandlerContext ctx, int sequenceId) {
         final long now = System.nanoTime();
         final long delay = nackReorderDelayNanos(config.getRTTNanos(), config.getRTTStdDevNanos());
@@ -449,7 +957,13 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             deferredNacks.clear();
             return;
         }
-        final long nextDelay = deferredNacks.drainDue(System.nanoTime(), id -> nackSet.add(id));
+        final long now = System.nanoTime();
+        final long nextDelay = deferredNacks.drainDue(now, id -> {
+            nackSet.add(id);
+            config.getMetrics().nackDeferredExpired(1);
+            adaptiveNackGrace.onLost(now, config.getRTTNanos());
+        });
+        publishRecoveryPolicies(now);
         if (!nackSet.isEmpty() && config.isAutoRead()) {
             sendResponses(ctx);
             ctx.flush();
@@ -459,13 +973,93 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 
     private void confirmDeferredNacks() {
         cancelDeferredNackTask();
-        deferredNacks.drainAll(id -> nackSet.add(id));
+        final long now = System.nanoTime();
+        deferredNacks.drainAll(id -> {
+            nackSet.add(id);
+            config.getMetrics().nackDeferredConfirmed(1);
+            adaptiveNackGrace.onLost(now, config.getRTTNanos());
+        });
+        publishRecoveryPolicies(now);
     }
 
     private void cancelDeferredNackTask() {
         if (deferredNackFuture != null) deferredNackFuture.cancel(false);
         deferredNackFuture = null;
         deferredNackDeadlineNanos = Long.MAX_VALUE;
+    }
+
+    private boolean isNackRepeatActive(long nowNanos) {
+        return ADAPTIVE_NACK_PROTECTION_ENABLED
+                && (adaptiveNackGrace.isBypassing(nowNanos)
+                || adaptiveAckProtection.isActive(nowNanos));
+    }
+
+    private void scheduleNackRepeat(ChannelHandlerContext ctx, long delayNanos) {
+        if (nackRepeatFuture != null && !nackRepeatFuture.isDone()) return;
+        nackRepeatFuture = ctx.executor().schedule(() -> flushRepeatedNacks(ctx),
+                delayNanos, TimeUnit.NANOSECONDS);
+    }
+
+    private void flushRepeatedNacks(ChannelHandlerContext ctx) {
+        nackRepeatFuture = null;
+        final long now = System.nanoTime();
+        publishRecoveryPolicies(now);
+        if (!ctx.channel().isOpen() || nackRepeatSet.isEmpty()) {
+            nackRepeatSet.clear();
+            return;
+        }
+        if (!isNackRepeatActive(now) || !config.isNACKEnabled() || !config.isAutoRead()) {
+            nackRepeatSet.clear();
+            return;
+        }
+        final int requested = nackRepeatSet.size();
+        ctx.write(new Reliability.NACK(nackRepeatSet)).addListener(RakNet.INTERNAL_WRITE_LISTENER);
+        config.getMetrics().nackRepeated(requested);
+        nackRepeatSet.clear();
+        ctx.flush();
+    }
+
+    private void cancelNackRepeatTask() {
+        if (nackRepeatFuture != null) nackRepeatFuture.cancel(false);
+        nackRepeatFuture = null;
+    }
+
+    private void scheduleAckRepeat(ChannelHandlerContext ctx, long delayNanos) {
+        if (ackRepeatFuture != null && !ackRepeatFuture.isDone()) return;
+        ackRepeatFuture = ctx.executor().schedule(() -> flushRepeatedAcks(ctx),
+                delayNanos, TimeUnit.NANOSECONDS);
+    }
+
+    private void flushRepeatedAcks(ChannelHandlerContext ctx) {
+        ackRepeatFuture = null;
+        final long now = System.nanoTime();
+        publishRecoveryPolicies(now);
+        if (!ctx.channel().isOpen() || ackRepeatSet.isEmpty()) {
+            ackRepeatSet.clear();
+            return;
+        }
+        if (!adaptiveAckProtection.isActive(now)) {
+            ackRepeatSet.clear();
+            return;
+        }
+        final int acknowledged = ackRepeatSet.size();
+        ctx.write(new Reliability.ACK(ackRepeatSet)).addListener(RakNet.INTERNAL_WRITE_LISTENER);
+        config.getMetrics().ackRepeated(acknowledged);
+        ackRepeatSet.clear();
+        ctx.flush();
+    }
+
+    private void cancelAckRepeatTask() {
+        if (ackRepeatFuture != null) ackRepeatFuture.cancel(false);
+        ackRepeatFuture = null;
+    }
+
+    private void publishRecoveryPolicies(long now) {
+        final boolean nackBypass = ADAPTIVE_NACK_GRACE_ENABLED && adaptiveNackGrace.isBypassing(now);
+        config.getMetrics().adaptiveNackGrace(nackBypass);
+        final boolean ackProtection = ADAPTIVE_ACK_PROTECTION_ENABLED && adaptiveAckProtection.isActive(now);
+        config.getMetrics().adaptiveAckPolicy(ackProtection, ACK_FLUSH_DELAY_NANOS,
+                ackProtection ? adaptiveAckProtection.repeatDelayNanos(config.getRTTNanos()) : 0L);
     }
 
     static final class DeferredNackTracker {
@@ -509,6 +1103,118 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         }
     }
 
+    static final class AdaptiveNackGrace {
+        private long lossOutcomes;
+        private int outcomeCount;
+        private int outcomeIndex;
+        private int lossCount;
+        private boolean bypass;
+        private boolean probePending;
+        private long bypassUntilNanos;
+
+        boolean shouldDefer(long nowNanos) {
+            if (!bypass) return true;
+            if (probePending || nowNanos < bypassUntilNanos) return false;
+            probePending = true;
+            return true;
+        }
+
+        void onLost(long nowNanos, long rttNanos) {
+            if (probePending) {
+                probePending = false;
+                enterBypass(nowNanos, rttNanos);
+                return;
+            }
+            recordOutcome(true);
+            if (outcomeCount >= NACK_GRACE_MIN_OUTCOMES
+                    && lossCount * 100 >= outcomeCount * NACK_GRACE_BYPASS_PERCENT) {
+                enterBypass(nowNanos, rttNanos);
+            }
+        }
+
+        void onReordered(long nowNanos) {
+            if (probePending) {
+                probePending = false;
+                bypass = false;
+                bypassUntilNanos = 0L;
+                clearOutcomes();
+            }
+            recordOutcome(false);
+        }
+
+        boolean isBypassing(long nowNanos) {
+            return bypass && (probePending || nowNanos < bypassUntilNanos);
+        }
+
+        private void enterBypass(long nowNanos, long rttNanos) {
+            bypass = true;
+            final long pathCooldown = saturatedMultiply(Math.max(0L, rttNanos), 16L);
+            bypassUntilNanos = saturatedAdd(nowNanos,
+                    Math.max(MIN_NACK_GRACE_BYPASS_NANOS, pathCooldown));
+        }
+
+        private void recordOutcome(boolean lost) {
+            final long bit = 1L << outcomeIndex;
+            if (outcomeCount == NACK_GRACE_OUTCOME_WINDOW) {
+                if ((lossOutcomes & bit) != 0L) lossCount--;
+            } else {
+                outcomeCount++;
+            }
+            if (lost) {
+                lossOutcomes |= bit;
+                lossCount++;
+            } else {
+                lossOutcomes &= ~bit;
+            }
+            outcomeIndex = (outcomeIndex + 1) % NACK_GRACE_OUTCOME_WINDOW;
+        }
+
+        private void clearOutcomes() {
+            lossOutcomes = 0L;
+            outcomeCount = 0;
+            outcomeIndex = 0;
+            lossCount = 0;
+        }
+    }
+
+    static final class AdaptiveAckProtection {
+        private int duplicateScore;
+        private long triggerWindowStartedNanos;
+        private long protectedUntilNanos;
+
+        void onDuplicateFrameSet(long nowNanos, long rttNanos) {
+            if (isActive(nowNanos)) {
+                extendProtection(nowNanos, rttNanos);
+                return;
+            }
+            if (triggerWindowStartedNanos == 0L
+                    || nowNanos - triggerWindowStartedNanos > ACK_PROTECTION_TRIGGER_WINDOW_NANOS) {
+                triggerWindowStartedNanos = nowNanos;
+                duplicateScore = 0;
+            }
+            duplicateScore++;
+            if (duplicateScore >= ACK_PROTECTION_DUPLICATE_THRESHOLD) {
+                extendProtection(nowNanos, rttNanos);
+            }
+        }
+
+        boolean isActive(long nowNanos) {
+            return nowNanos < protectedUntilNanos;
+        }
+
+        long repeatDelayNanos(long rttNanos) {
+            final long candidate = Math.max(0L, rttNanos) / 8L;
+            return Math.max(MIN_ACK_REPEAT_DELAY_NANOS,
+                    Math.min(MAX_ACK_REPEAT_DELAY_NANOS, candidate));
+        }
+
+        private void extendProtection(long nowNanos, long rttNanos) {
+            final long pathProtection = saturatedMultiply(Math.max(0L, rttNanos), 8L);
+            protectedUntilNanos = saturatedAdd(nowNanos,
+                    Math.max(MIN_ACK_PROTECTION_NANOS, pathProtection));
+        }
+    }
+
     protected void produceFrameSet(ChannelHandlerContext ctx, int maxSize) {
         if (frameQueue.isEmpty()) return;
         final FrameSet frameSet = FrameSet.create();
@@ -534,12 +1240,17 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             frameSet.setSeqId(nextSendSeqId);
             nextSendSeqId = UINT.B3.plus(nextSendSeqId, 1);
             pendingFrameSets.put(frameSet.getSeqId(), frameSet);
+            final int targetedFecChannel = frameSet.retriedOrderedChannel();
+            if (targetedFecChannel >= 0) {
+                targetedFecChannelsByFrameSet.put(frameSet.getSeqId(), targetedFecChannel);
+            }
             inFlightBytes += frameSet.getRoughSize();
             frameSet.touch("Added to pending FrameSet list");
             ctx.write(frameSet.retain()).addListener(RakNet.INTERNAL_WRITE_LISTENER);
             config.getMetrics().packetsOut(1);
             config.getMetrics().framesOut(frameSet.getNumPackets());
             config.getMetrics().currentQueuedBytes(this.queuedBytes);
+            if (frameSet.hasReliableFrame()) refreshPtoTimer(System.nanoTime());
             assert frameSet.refCnt() > 0;
         } else {
             frameSet.release();
@@ -548,21 +1259,25 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 
     protected void produceFrameSets(ChannelHandlerContext ctx) {
         if (frameQueue.isEmpty()) {
-            adaptive.onOutstandingBytes(System.nanoTime(), inFlightBytes);
+            final long now = System.nanoTime();
+            adaptive.onOutstandingBytes(now, totalInFlightBytes());
             if (pendingFrameSets.isEmpty()) adaptive.applyPendingMtu();
+            updateApplicationLimitedRecovery(now);
             return;
         }
+        applicationLimitedRecoveryPeriod = false;
+        additionallyRecoveredThisPeriod.clear();
         final int mtu = config.getMTU();
         final int maxSize = mtu - FrameSet.HEADER_SIZE - Frame.HEADER_SIZE;
         final int maxPendingFrameSets = config.getDefaultPendingFrameSets() + burstTokens;
-        int pacingBudget = adaptive.sendBudget(System.nanoTime(), inFlightBytes, mtu, queuedBytes);
+        int pacingBudget = adaptive.sendBudget(System.nanoTime(), totalInFlightBytes(), mtu, queuedBytes);
         while (pacingBudget-- > 0 && pendingFrameSets.size() < maxPendingFrameSets && !frameQueue.isEmpty()) {
             produceFrameSet(ctx, maxSize);
         }
         adaptive.applyDscp(ctx.channel().parent());
         if (config.isAdaptiveTransportEnabled() && !frameQueue.isEmpty()
                 && pendingFrameSets.size() < maxPendingFrameSets
-                && !adaptive.congestionWindowBlocked(inFlightBytes, mtu)
+                && !adaptive.congestionWindowBlocked(totalInFlightBytes(), mtu)
                 && !pacingScheduled) {
             pacingScheduled = true;
             ctx.executor().schedule(() -> {
@@ -570,6 +1285,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 if (ctx.channel().isOpen()) flush(ctx);
             }, adaptive.nanosUntilSend(System.nanoTime()), TimeUnit.NANOSECONDS);
         }
+        if (frameQueue.isEmpty()) updateApplicationLimitedRecovery(System.nanoTime());
     }
 
     protected void tryProduceFrameSets() {

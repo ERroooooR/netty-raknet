@@ -11,6 +11,21 @@ import java.util.Arrays;
 import java.util.List;
 
 public class LimitedFecHandlerTest {
+
+    @Test
+    public void targetedWindowPinsCriticalSequenceAndUsesNewestContext() {
+        final java.util.List<LimitedFecHandler.Entry> rolling = new java.util.ArrayList<>();
+        for (int sequence = 10; sequence <= 15; sequence++) {
+            rolling.add(new LimitedFecHandler.Entry(sequence, 4, new byte[]{1, 2, 3, 4}));
+        }
+        final java.util.List<LimitedFecHandler.Entry> selected =
+                LimitedFecHandler.selectTargetedGroup(rolling, 11);
+        Assertions.assertEquals(4, selected.size());
+        Assertions.assertEquals(11, selected.get(0).seq);
+        Assertions.assertEquals(java.util.Arrays.asList(15, 14, 13),
+                selected.subList(1, 4).stream().map(entry -> entry.seq)
+                        .collect(java.util.stream.Collectors.toList()));
+    }
     @Test
     public void recoversAnySingleMissingPacketWithUnequalLengths() {
         final List<byte[]> packets = Arrays.asList(

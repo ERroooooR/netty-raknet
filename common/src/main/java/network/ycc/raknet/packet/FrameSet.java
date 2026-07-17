@@ -17,6 +17,7 @@ import io.netty.util.ResourceLeakTracker;
 
 import java.util.ArrayList;
 import java.util.function.Consumer;
+import java.util.function.IntConsumer;
 
 public final class FrameSet extends AbstractReferenceCounted implements Packet {
 
@@ -185,6 +186,55 @@ public final class FrameSet extends AbstractReferenceCounted implements Packet {
 
     public int getRetryCount() {
         return retryCount;
+    }
+
+    public boolean hasReliableFrame() {
+        for (Frame frame : frames) {
+            if (frame.getReliability().isReliable) return true;
+        }
+        return false;
+    }
+
+    public boolean hasReliableOrderedFrame() {
+        for (Frame frame : frames) {
+            if (frame.getReliability().isReliable && frame.getReliability().isOrdered) return true;
+        }
+        return false;
+    }
+
+    public boolean hasRetriedReliableFrame() {
+        for (Frame frame : frames) {
+            if (frame.getReliability().isReliable && frame.getRetryCount() > 0) return true;
+        }
+        return false;
+    }
+
+    public void forEachReliableIndex(IntConsumer consumer) {
+        for (Frame frame : frames) {
+            if (frame.getReliability().isReliable) consumer.accept(frame.getReliableIndex());
+        }
+    }
+
+    public void forEachRetriedReliableIndex(IntConsumer consumer) {
+        for (Frame frame : frames) {
+            if (frame.getReliability().isReliable && frame.getRetryCount() > 0) {
+                consumer.accept(frame.getReliableIndex());
+            }
+        }
+    }
+
+    public int retriedOrderedChannel() {
+        for (Frame frame : frames) {
+            if (frame.getReliability().isReliable && frame.getReliability().isOrdered
+                    && frame.getRetryCount() > 0) return frame.getOrderChannel();
+        }
+        return -1;
+    }
+
+    public int maximumRetryCount() {
+        int maximum = 0;
+        for (Frame frame : frames) maximum = Math.max(maximum, frame.getRetryCount());
+        return maximum;
     }
 
     public void setRetryCount(int retryCount) {

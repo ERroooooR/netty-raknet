@@ -97,12 +97,30 @@ public class RakNet {
         default void reliableFrameDuplicate(int delta) {}
         default void nackDeferred(int delta) {}
         default void reorderedPacket(int delta) {}
+        default void nackDeferredExpired(int delta) {}
+        default void nackDeferredConfirmed(int delta) {}
+        default void nackGraceBypassed(int delta) {}
+        default void adaptiveNackGrace(boolean bypassed) {}
+        default void nackRepeated(int requestedFrameSets) {}
         default void nackRetransmit(int bytes) {}
         default void timeoutRetransmit(int bytes) {}
+        default void rackRetransmit(int bytes) {}
+        default void rackSpuriousAck(int delta) {}
+        default void ptoProbe(int bytes) {}
+        default void ptoProbeAcked(int bytes) {}
+        default void ptoState(int count, long lastAckProgressAgeNanos) {}
+        default void applicationLimitedRecovery(int bytes) {}
+        default void recoveryQueueState(int depth, long oldestAgeNanos) {}
+        default void recoveryDebt(double debt, int channel) {}
+        default void targetedFecRepair(int channel, int bytes) {}
+        default void targetedFecRecovered(int packets) {}
         default void fragmentReassemblyPending(int builders, long bytes, long oldestAgeNanos) {}
         default void fragmentReassemblyComplete(int bytes, long ageNanos) {}
         default void orderedQueuePending(int frames, long oldestAgeNanos) {}
         default void orderedQueueRelease(int frames, long oldestWaitNanos) {}
+        default void orderedChannelPending(int channel, int frames, long oldestAgeNanos,
+                                           int blockedOrderIndex) {}
+        default void orderedChannelRelease(int channel, int frames, long oldestWaitNanos) {}
         default void applicationBatch(int bytes) {}
         default void ackRepeated(int acknowledgedFrameSets) {}
         default void adaptiveAckPolicy(boolean protectedMode, long flushDelayNanos, long repeatDelayNanos) {}
