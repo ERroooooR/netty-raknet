@@ -7,9 +7,11 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Method;
 import java.util.Arrays;
 
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -23,7 +25,7 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
-    public void failedProbeNarrowsSearchWithoutReducingConfirmedMtu() {
+    public void startupDataTimeoutsCannotMasqueradeAsMtuBlackHole() {
         final RakNet.Config config = mock(RakNet.Config.class);
         when(config.isAdaptiveTransportEnabled()).thenReturn(true);
         when(config.getMTU()).thenReturn(1400);
@@ -40,8 +42,27 @@ public class AdaptiveTransportControllerTest {
         controller.onAck(128, 20_000_000L);
         controller.onLoss(1400, true);
         controller.applyPendingMtu();
+        verify(config, never()).setMTU(1200);
+        Assertions.assertNotEquals(AdaptiveTransportController.LossType.MTU_BLACK_HOLE,
+                controller.lossType());
+    }
+
+    @Test
+    public void completedPathCanStillDetectConfirmedDataBlackHole() throws Exception {
+        final RakNet.Config config = adaptiveConfig();
+        when(config.getPlpmtudMaxMtu()).thenReturn(1400);
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        for (int i = 0; i < 200; i++) controller.onAck(128, 20_000_000L, 0);
+
+        for (int i = 0; i < 3; i++) {
+            controller.onLoss(1400, true);
+            controller.onAck(128, 20_000_000L, 0);
+        }
+        controller.applyPendingMtu();
+
+        Assertions.assertEquals(AdaptiveTransportController.LossType.MTU_BLACK_HOLE,
+                controller.lossType());
         verify(config).setMTU(1200);
-        Assertions.assertEquals(1200, controller.probeCandidate());
     }
 
     @Test
@@ -64,7 +85,7 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
-    public void healthyBacklogDoesNotOverrideCurrentPacingModel() throws Exception {
+    public void healthyBacklogCalibrationUsesConfiguredPpsCeiling() throws Exception {
         final RakNet.Config config = adaptiveConfig();
         when(config.getAdaptiveMaxPps()).thenReturn(2000);
         final AdaptiveTransportController controller = new AdaptiveTransportController(config);
@@ -73,11 +94,11 @@ public class AdaptiveTransportControllerTest {
 
         controller.sendBudget(System.nanoTime(), 0, 1400, 400 * 1024);
 
-        Assertions.assertEquals(400D, controller.packetsPerSecond(), 0.01D);
+        Assertions.assertEquals(2000D, controller.packetsPerSecond(), 0.01D);
     }
 
     @Test
-    public void newConnectionCannotJumpStraightToTwoThousandPps() throws Exception {
+    public void newConnectionCalibrationUsesConfiguredPpsCeiling() throws Exception {
         final RakNet.Config config = adaptiveConfig();
         when(config.getAdaptiveMaxPps()).thenReturn(2000);
         final AdaptiveTransportController controller = new AdaptiveTransportController(config);
@@ -85,19 +106,87 @@ public class AdaptiveTransportControllerTest {
 
         controller.sendBudget(System.nanoTime(), 0, 1400, 4 * 1024 * 1024);
 
-        Assertions.assertEquals(600D, controller.packetsPerSecond(), 0.01D);
+        Assertions.assertEquals(2000D, controller.packetsPerSecond(), 0.01D);
     }
 
     @Test
-    public void newBacklogUsesBoundedByteBurstInsteadOfPpsOnly() {
+    public void newBacklogCalibrationStillUsesPpsBurstLimit() {
         final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
         final long now = System.nanoTime();
 
         Assertions.assertEquals(1, controller.sendBudget(now, 0, 1400, 1024 * 1024));
         Assertions.assertEquals(0, controller.sendBudget(now, 0, 1400, 1024 * 1024));
         Assertions.assertEquals(384L * 1024L, controller.burstAdmissionRateBytesPerSecond());
-        Assertions.assertTrue(controller.sendBudget(now + 10_000_000L, 0, 1400, 1024 * 1024) <= 2,
-                "the first 10ms must not release the full four-datagram PPS burst");
+        final int budget = controller.sendBudget(now + 10_000_000L, 0, 1400, 1024 * 1024);
+        Assertions.assertTrue(budget > 0 && budget <= 4,
+                "calibration may bypass byte admission but must keep the PPS burst bound");
+    }
+
+    @Test
+    public void healthyBulkKeepsBypassingByteAdmissionUntilExplicitCongestion() throws Exception {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        for (int i = 0; i < 100; i++) controller.onAck(600, 20_000_000L, 0);
+        final long now = System.nanoTime();
+        controller.sendBudget(now, 0, 1400, 1024 * 1024);
+        setDouble(controller, "pacingTokens", 1D);
+        setLong(controller, "tokenUpdatedNanos", now);
+        setDouble(controller, "burstAdmissionTokens", 0D);
+        setLong(controller, "burstAdmissionUpdatedNanos", now);
+
+        Assertions.assertEquals(1, controller.sendBudget(now, 0, 1400, 1024 * 1024),
+                "healthy calibration must not be blocked by the byte bucket");
+
+        controller.onLoss(600, false);
+        setDouble(controller, "pacingTokens", 1D);
+        setLong(controller, "tokenUpdatedNanos", now);
+        setDouble(controller, "burstAdmissionTokens", 0D);
+        setLong(controller, "burstAdmissionUpdatedNanos", now);
+        Assertions.assertEquals(1, controller.sendBudget(now, 0, 1400, 1024 * 1024),
+                "minor loss may reduce PPS but must not re-enable the byte bucket mid-calibration");
+
+        final long afterCalibration = now + 61_000_000_000L;
+        setDouble(controller, "pacingTokens", 1D);
+        setLong(controller, "tokenUpdatedNanos", afterCalibration);
+        setDouble(controller, "burstAdmissionTokens", 0D);
+        setLong(controller, "burstAdmissionUpdatedNanos", afterCalibration);
+        Assertions.assertEquals(1,
+                controller.sendBudget(afterCalibration, 0, 1400, 1024 * 1024),
+                "healthy bulk must remain work-conserving after the calibration minute");
+
+        final long congested = afterCalibration + 1;
+        setObject(controller, "lossType", AdaptiveTransportController.LossType.RATE_LIMIT);
+        setLong(controller, "lastLossNanos", congested);
+        setDouble(controller, "pacingTokens", 1D);
+        setLong(controller, "tokenUpdatedNanos", congested);
+        setDouble(controller, "burstAdmissionTokens", 0D);
+        setLong(controller, "burstAdmissionUpdatedNanos", congested);
+        Assertions.assertEquals(0, controller.sendBudget(congested, 0, 1400, 1024 * 1024),
+                "explicit congestion must restore byte admission immediately");
+    }
+
+    @Test
+    public void calibrationUsesRollingDemandInsteadOfExpiredDeadline() throws Exception {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        final long now = System.nanoTime();
+        setDouble(controller, "packetsPerSecond", 30D);
+        controller.sendBudget(now, 0, 1400, 1024 * 1024);
+
+        controller.sendBudget(now + 10_000_000_000L, 0, 1400, 1024 * 1024);
+
+        Assertions.assertEquals(2000D, controller.packetsPerSecond(), 0.01D,
+                "healthy measurement must not be pinned by a sender-limited bandwidth sample");
+    }
+
+    @Test
+    public void slowPathBacklogCanStartBelowOldFixedByteFloor() throws Exception {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        setDouble(controller, "packetsPerSecond", 30D);
+
+        controller.sendBudget(System.nanoTime(), 0, 1400, 1024 * 1024);
+
+        Assertions.assertTrue(controller.burstAdmissionRateBytesPerSecond() > 0L);
+        Assertions.assertTrue(controller.burstAdmissionRateBytesPerSecond() < 128L * 1024L,
+                "the configured minimum PPS must not imply a fixed 128KiB/s path floor");
     }
 
     @Test
@@ -163,6 +252,22 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
+    public void lowCapacityPathDoesNotResumeAtBootstrapRate() throws Exception {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        final long now = System.nanoTime();
+        final Field bandwidth = AdaptiveTransportController.class.getDeclaredField("bandwidthFilter");
+        bandwidth.setAccessible(true);
+        Arrays.fill((long[]) bandwidth.get(controller), 64L * 1024L);
+        setLong(controller, "lastValidatedBandwidthNanos", now);
+
+        controller.sendBudget(now, 0, 1400, 1024 * 1024);
+
+        Assertions.assertEquals(64L * 1024L, controller.burstAdmissionRateBytesPerSecond());
+        Assertions.assertTrue(controller.burstAdmissionTargetBytesPerSecond() <= 80L * 1024L);
+        Assertions.assertEquals(AdaptiveTransportController.ResumeState.VALIDATED, controller.resumeState());
+    }
+
+    @Test
     public void establishedBacklogResumesAtValidatedRateThenTracksDemand() throws Exception {
         final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
         for (int i = 0; i < 64; i++) controller.onAck(1200, 40_000_000L, 0);
@@ -224,6 +329,35 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
+    public void intermittentApplicationTrafficRetainsValidatedBandwidthAcrossProbeCycles() throws Exception {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        final Field bandwidth = AdaptiveTransportController.class.getDeclaredField("bandwidthFilter");
+        bandwidth.setAccessible(true);
+        Arrays.fill((long[]) bandwidth.get(controller), 1024L * 1024L);
+        final Method advance = AdaptiveTransportController.class
+                .getDeclaredMethod("advanceBandwidthFilterCycle");
+        advance.setAccessible(true);
+
+        for (int i = 0; i < 8; i++) advance.invoke(controller);
+
+        Assertions.assertEquals(1024L * 1024L, controller.validatedPathRateBytesPerSecond(),
+                "short application-limited gaps must not erase a recently demonstrated path rate");
+    }
+
+    @Test
+    public void collapsedCwndLetsSubFortyEightKibQueueEnterBulk() throws Exception {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        setLong(controller, "congestionWindowBytes", 12L * 1024L);
+        setDouble(controller, "packetsPerSecond", 30D);
+
+        controller.sendBudget(System.nanoTime(), 0, 1400, 32 * 1024);
+
+        Assertions.assertEquals(2000D, controller.packetsPerSecond(), 0.01D,
+                "a queue larger than the collapsed cwnd must escape the IDLE pacing self-lock");
+        Assertions.assertTrue(controller.burstAdmissionRateBytesPerSecond() > 0L);
+    }
+
+    @Test
     public void stalePathStateResumesAtHalfRateAndValidatesTwoRounds() throws Exception {
         final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
         final Field bandwidth = AdaptiveTransportController.class.getDeclaredField("bandwidthFilter");
@@ -263,7 +397,7 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
-    public void agedQueueRaisesDemandOnlyUpToValidatedCapacity() throws Exception {
+    public void healthyWorkConservingQueueKeepsBoundedAdmissionTarget() throws Exception {
         final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
         for (int i = 0; i < 64; i++) controller.onAck(1200, 40_000_000L, 0);
         final Field bandwidth = AdaptiveTransportController.class.getDeclaredField("bandwidthFilter");
@@ -275,10 +409,53 @@ public class AdaptiveTransportControllerTest {
 
         controller.sendBudget(now, 0, 1400, 1024 * 1024);
         setLong(controller, "burstDrainStartedNanos", now - 3_000_000_000L);
+        setLong(controller, "calibrationStartedNanos", now - 61_000_000_000L);
         controller.sendBudget(now + 1_000_000L, 0, 1400, 1024 * 1024);
 
-        Assertions.assertTrue(controller.burstAdmissionTargetBytesPerSecond() >= 1024L * 1024L);
-        Assertions.assertTrue(controller.burstAdmissionTargetBytesPerSecond() <= 1280L * 1024L);
+        Assertions.assertEquals(512L * 1024L,
+                controller.burstAdmissionTargetBytesPerSecond(),
+                "the inactive byte gate must retain a bounded rolling-demand target for congestion fallback");
+        Assertions.assertTrue(controller.burstAdmissionTargetBytesPerSecond() <= 1280L * 1024L,
+                "work-conserving mode must not discard the validated-capacity ceiling");
+    }
+
+    @Test
+    public void rttInflationWithoutLossCutsAdmissionBelowOldFixedFloor() throws Exception {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        final long now = System.nanoTime();
+        controller.sendBudget(now, 0, 1400, 1024 * 1024);
+        setLong(controller, "burstAdmissionRateBytesPerSecond", 120L * 1024L);
+        setLong(controller, "burstAdmissionTargetBytesPerSecond", 120L * 1024L);
+        setLong(controller, "minRtt", 20_000_000L);
+        setLong(controller, "minRttStamp", now);
+        setLong(controller, "smoothedRtt", 20_000_000L);
+        setDouble(controller, "packetsPerSecond", 100D);
+
+        controller.onAck(1200, 200_000_000L, 0);
+
+        final double reducedPps = controller.packetsPerSecond();
+        Assertions.assertTrue(controller.burstAdmissionRateBytesPerSecond() < 120L * 1024L);
+        Assertions.assertTrue(controller.burstAdmissionRateBytesPerSecond() < 128L * 1024L);
+        Assertions.assertTrue(reducedPps < 100D);
+
+        controller.sendBudget(now + 1_000_000L, 0, 1400, 1024 * 1024);
+        Assertions.assertTrue(controller.packetsPerSecond() <= reducedPps,
+                "the backlog floor must not undo an RTT-pressure cut on the next send");
+    }
+
+    @Test
+    public void queueLossCanReduceAdmissionBelowOldFixedFloor() throws Exception {
+        final AdaptiveTransportController controller = new AdaptiveTransportController(adaptiveConfig());
+        controller.sendBudget(System.nanoTime(), 0, 1400, 1024 * 1024);
+        setLong(controller, "burstAdmissionRateBytesPerSecond", 140L * 1024L);
+        setLong(controller, "burstAdmissionTargetBytesPerSecond", 140L * 1024L);
+        setLong(controller, "minRtt", 20_000_000L);
+        setLong(controller, "smoothedRtt", 40_000_000L);
+
+        controller.onLoss(1200, true);
+
+        Assertions.assertEquals(AdaptiveTransportController.LossType.QUEUE, controller.lossType());
+        Assertions.assertTrue(controller.burstAdmissionRateBytesPerSecond() < 128L * 1024L);
     }
 
     @Test
@@ -357,7 +534,7 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
-    public void observedLargeZstdBatchUsesBoundedDrainFloor() throws Exception {
+    public void observedLargeZstdBatchUsesCalibrationCeiling() throws Exception {
         final RakNet.Config config = adaptiveConfig();
         when(config.getAdaptiveMaxPps()).thenReturn(600);
         final AdaptiveTransportController controller = new AdaptiveTransportController(config);
@@ -365,8 +542,7 @@ public class AdaptiveTransportControllerTest {
 
         controller.sendBudget(System.nanoTime(), 0, 1400, 211 * 1024);
 
-        Assertions.assertTrue(controller.packetsPerSecond() >= 100D);
-        Assertions.assertTrue(controller.packetsPerSecond() <= 150D);
+        Assertions.assertEquals(600D, controller.packetsPerSecond(), 0.01D);
     }
 
     @Test

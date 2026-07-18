@@ -130,4 +130,7 @@ final class DplpmtudController {
     int probedMtu() { return probedMtu; }
     int maximumMtu() { return maximumMtu; }
     int probeCount() { return probeCount; }
+    boolean canDetectBlackHole() {
+        return state == State.SEARCH_COMPLETE && confirmedMtu > baseMtu && probedMtu == 0;
+    }
 }

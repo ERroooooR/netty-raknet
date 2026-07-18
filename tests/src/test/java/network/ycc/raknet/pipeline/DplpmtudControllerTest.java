@@ -39,6 +39,17 @@ public class DplpmtudControllerTest {
     }
 
     @Test
+    public void dataBlackHoleDetectionRequiresCompletedValidatedPath() {
+        final DplpmtudController searching = new DplpmtudController(1400, 1500);
+        Assertions.assertFalse(searching.canDetectBlackHole());
+
+        final DplpmtudController completed = new DplpmtudController(1400, 1400);
+        Assertions.assertTrue(completed.canDetectBlackHole());
+        completed.onProbeSent(1400);
+        Assertions.assertFalse(completed.canDetectBlackHole());
+    }
+
+    @Test
     public void dropsShortExtensionPacketsBeforeGenericDecoding() {
         final EmbeddedChannel channel = new EmbeddedChannel(new PathMtuDiscoveryHandler());
         Assertions.assertFalse(channel.writeInbound(Unpooled.wrappedBuffer(new byte[]{0x20, 1, 2})));

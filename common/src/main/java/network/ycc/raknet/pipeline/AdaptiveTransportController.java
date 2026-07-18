@@ -22,7 +22,11 @@ final class AdaptiveTransportController {
     private static final LongAdder HEALTHY_VOTES = new LongAdder();
     private static final LongAdder CONGESTED_VOTES = new LongAdder();
     private static final int WINDOW_BUCKETS = 10;
-    private static final int BANDWIDTH_FILTER_CYCLES = 2;
+    // Minecraft chunk/ZSTD production is often application-limited for several
+    // complete gain cycles. Keep a longer clean-path maximum so those gaps do
+    // not erase capacity that was just demonstrated. Congestion responses
+    // explicitly reduce every slot, so this does not defer loss feedback.
+    private static final int BANDWIDTH_FILTER_CYCLES = 10;
     private static final double[] PROBE_BW_GAINS = {1.25D, 0.75D, 1D, 1D, 1D, 1D, 1D, 1D};
     private static final long MIN_RTT_FILTER_NANOS = TimeUnit.SECONDS.toNanos(30);
     private static final long PROBE_RTT_NANOS = TimeUnit.MILLISECONDS.toNanos(200);
@@ -34,9 +38,8 @@ final class AdaptiveTransportController {
     private static final int QOS_RECOVERY_BASE_PPS = 100;
     private static final long MIN_QOS_RECOVERY_STEP_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
     private static final long BURST_QUEUE_TIME_LIMIT_NANOS = TimeUnit.SECONDS.toNanos(2);
-    private static final long BURST_QUEUE_MIN_REMAINING_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
+    private static final long STARTUP_CALIBRATION_NANOS = TimeUnit.MINUTES.toNanos(1);
     private static final long BURST_ADMISSION_INITIAL_BPS = 384L * 1024L;
-    private static final long BURST_ADMISSION_MIN_BPS = 128L * 1024L;
     private static final double BURST_ADMISSION_GROWTH = 1.25D;
     private static final int BURST_ADMISSION_TOKEN_DATAGRAMS = 4;
     private static final long BURST_ADMISSION_MAX_GROWTH_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(250);
@@ -116,6 +119,8 @@ final class AdaptiveTransportController {
     private long unvalidatedBandwidthSample;
     private long scheduledPacingDeadlineNanos;
     private long pacerWakeupLatenessNanos;
+    private boolean rttPressureActive;
+    private long calibrationStartedNanos;
 
     AdaptiveTransportController(RakNet.Config config) {
         this.config = config;
@@ -152,6 +157,7 @@ final class AdaptiveTransportController {
         final long outstandingBytes = Math.max(0L, inFlightBytes) + Math.max(0, queuedBytes);
         onOutstandingBytes(nowNanos, outstandingBytes);
         updateBurstAdmission(nowNanos, nextDatagramBytes);
+        final boolean workConserving = workConservingBulk(nowNanos);
         lastInFlightBytes = Math.max(0, inFlightBytes);
         updateMode(nowNanos, inFlightBytes);
         if (inFlightBytes > 0 && inFlightBytes + nextDatagramBytes > congestionWindowBytes) {
@@ -174,22 +180,24 @@ final class AdaptiveTransportController {
             final long cwndBudget = Math.max(1L,
                     (congestionWindowBytes - inFlightBytes + nextDatagramBytes - 1L) / nextDatagramBytes);
             budget = (int) Math.min(budget, cwndBudget);
-        } else if (pacingTokens >= 0D && inFlightBytes == 0) {
+        } else if (pacingTokens >= 0D && inFlightBytes == 0 && !burstDrainActive) {
             budget = 1;
         }
-        if (burstDrainActive && burstAdmissionRateBytesPerSecond > 0) {
+        if (burstDrainActive && burstAdmissionRateBytesPerSecond > 0 && !workConserving) {
             final int byteBudget = Math.max(0, (int) (burstAdmissionTokens / nextDatagramBytes));
             budget = Math.min(budget, byteBudget);
         }
         if (budget > 0) {
             pacingTokens -= budget;
-            if (burstDrainActive) burstAdmissionTokens -= (double) budget * nextDatagramBytes;
+            if (burstDrainActive && !workConserving) {
+                burstAdmissionTokens -= (double) budget * nextDatagramBytes;
+            }
         }
         // Preserve the existing one-packet idle credit outside the byte-gated
         // backlog path; the burst admission bucket is what smooths bulk starts.
         final double missingPackets = Math.max(0D, -pacingTokens);
         long pacingDelay = (long) Math.ceil(missingPackets * 1_000_000_000D / packetsPerSecond);
-        if (burstDrainActive && burstAdmissionRateBytesPerSecond > 0) {
+        if (burstDrainActive && burstAdmissionRateBytesPerSecond > 0 && !workConserving) {
             final double missingBytes = Math.max(0D, nextDatagramBytes - burstAdmissionTokens);
             pacingDelay = Math.max(pacingDelay, (long) Math.ceil(missingBytes * 1_000_000_000D
                     / burstAdmissionRateBytesPerSecond));
@@ -266,15 +274,22 @@ final class AdaptiveTransportController {
             lastLargeLossNanos = 0;
         }
         final double recentLoss = lossRatio();
-        if (queueInflated() && recentLoss >= 0.01D) {
+        final boolean inflated = queueInflated();
+        if (inflated && recentLoss >= 0.01D) {
             lossType = LossType.QUEUE;
             congestionReason = "RTT_INFLATION_LOSS";
+            rttPressureActive = true;
             if (!congestionEpisodeActive && enterCongestion(now)) {
                 congestionEpisodeActive = true;
             }
+        } else if (inflated && burstDrainActive) {
+            if (!rttPressureActive) enterRttPressure(now);
         } else if (recentLoss < 0.005D && lossQuiet(now)) {
             lossType = LossType.NONE;
-            congestionReason = "NONE";
+            if (rttRecovered()) {
+                rttPressureActive = false;
+                congestionReason = "NONE";
+            }
             congestionEpisodeActive = false;
         }
         updateCongestionModel(now, inFlightBytes, bytes);
@@ -289,7 +304,8 @@ final class AdaptiveTransportController {
         consecutiveLosses++;
         final long now = System.nanoTime();
         lastLossNanos = now;
-        if (timeout && !queueInflated() && (lossSampleCount() < 64 || lossRatio() < 0.02D)
+        if (timeout && pathMtu.canDetectBlackHole() && rttRecovered()
+                && lossSampleCount() >= 64 && lossRatio() < 0.02D
                 && bytes >= config.getMTU() - 64 && recordLargeLoss(now) >= 3) {
             lossType = LossType.MTU_BLACK_HOLE;
             congestionReason = "MTU_BLACK_HOLE";
@@ -498,16 +514,17 @@ final class AdaptiveTransportController {
 
     private void updateBurstDrain(long now, long outstandingBytes) {
         if (burstDrainActive) {
-            if (outstandingBytes <= BURST_DRAIN_EXIT_BYTES) {
+            if (outstandingBytes <= burstDrainExitBytes()) {
                 burstDrainActive = false;
                 burstDrainStartedNanos = 0;
                 burstDrainFloorPps = 0D;
                 stopBurstAdmission();
                 return;
             }
-        } else if (outstandingBytes >= BURST_DRAIN_ENTER_BYTES) {
+        } else if (outstandingBytes >= burstDrainEnterBytes()) {
             burstDrainActive = true;
             burstDrainStartedNanos = now;
+            if (calibrationStartedNanos == 0L) calibrationStartedNanos = now;
             startBurstAdmission(now);
         } else {
             return;
@@ -515,15 +532,44 @@ final class AdaptiveTransportController {
 
         final double estimatedPayloadBytes = Math.max(512D, config.getMTU() * 0.75D);
         final long backlogAge = Math.max(0L, now - burstDrainStartedNanos);
-        final long remaining = Math.max(BURST_QUEUE_MIN_REMAINING_NANOS,
-                BURST_QUEUE_TIME_LIMIT_NANOS - backlogAge);
-        double target = outstandingBytes / estimatedPayloadBytes * 1_000_000_000D / remaining;
-        target = Math.max(100D, target);
+        final boolean calibrating = calibrationWindowOpen(now);
         final double recentLoss = lossRatio();
+        final boolean workConserving = calibrating || calibrationProbeAllowed(recentLoss);
+        double target;
+        if (workConserving || backlogAge < BURST_QUEUE_TIME_LIMIT_NANOS) {
+            final long remaining = workConserving ? BURST_QUEUE_TIME_LIMIT_NANOS
+                    : Math.max(1L, BURST_QUEUE_TIME_LIMIT_NANOS - backlogAge);
+            target = Math.max(100D,
+                    outstandingBytes / estimatedPayloadBytes * 1_000_000_000D / remaining);
+        } else {
+            // Missing an application drain deadline does not prove that the path
+            // can carry more traffic. Once overdue, stop turning queue age into
+            // an ever-larger pacing floor and fall back to validated capacity.
+            final long validatedRate = maxBandwidth();
+            final double validatedPps = validatedRate > 0L
+                    ? validatedRate / estimatedPayloadBytes : packetsPerSecond;
+            target = Math.max(config.getAdaptiveMinPps(),
+                    Math.min(packetsPerSecond, validatedPps));
+        }
+        if (rttPressureActive && !rttRecovered()) {
+            // Do not let the backlog PPS floor immediately undo a delay-based
+            // admission cut on the next sendBudget call. Capacity recovery stays
+            // ACK-driven until smoothed RTT returns close to the path minimum.
+            burstDrainFloorPps = 0D;
+            updateBurstAdmissionTarget(now, outstandingBytes, estimatedPayloadBytes,
+                    Math.max(config.getAdaptiveMinPps(), packetsPerSecond));
+            return;
+        }
         final boolean severe = lossType == LossType.RATE_LIMIT || lossType == LossType.QUEUE
                 || lossType == LossType.MTU_BLACK_HOLE || recentLoss >= 0.03D;
         final double ceiling;
-        if (severe) {
+        if (workConserving && calibrationProbeAllowed(recentLoss)) {
+            // A healthy bulk sender is work-conserving: do not let a
+            // sender-limited bandwidth estimate pin PPS to its own low sample.
+            // cwnd remains authoritative and RTT pressure still exits above.
+            target = Math.max(target, config.getAdaptiveMaxPps());
+            ceiling = config.getAdaptiveMaxPps();
+        } else if (severe) {
             if (!lossQuiet(now)) {
                 // A large application backlog is not evidence of available network capacity.
                 // Do not let multi-megabyte chunk queues override an active policer/queue signal.
@@ -565,7 +611,8 @@ final class AdaptiveTransportController {
     private void startBurstAdmission(long now) {
         final long validatedRate = maxBandwidth();
         final long packetRate = (long) Math.ceil(packetsPerSecond * Math.max(256D, averagePacketBytes));
-        long initial = Math.max(BURST_ADMISSION_MIN_BPS,
+        final long minimum = burstAdmissionMinimumBytesPerSecond();
+        long initial = Math.max(minimum,
                 Math.min(BURST_ADMISSION_INITIAL_BPS, packetRate));
         final boolean healthy = lossType == LossType.NONE && lossRatio() < 0.005D
                 && !queueInflated() && lossQuietForRecovery(now);
@@ -578,12 +625,12 @@ final class AdaptiveTransportController {
         if (validatedRateIsFresh && healthy) {
             // Same live path: BBR-style idle restart at the already validated
             // bottleneck rate. The one-datagram initial token prevents a burst.
-            initial = Math.max(initial, validatedRate);
+            initial = Math.max(minimum, validatedRate);
             resumeState = ResumeState.VALIDATED;
         } else if (validatedRate > 0L && healthy) {
             // Stale retained state is useful but no longer fully trusted. Follow
             // Careful Resume: start at half rate and validate two packet rounds.
-            initial = Math.max(initial, validatedRate / 2L);
+            initial = Math.max(minimum, validatedRate / 2L);
             resumeState = ResumeState.UNVALIDATED;
         } else {
             resumeState = lossType == LossType.NONE ? ResumeState.IDLE : ResumeState.SAFE_RETREAT;
@@ -621,22 +668,39 @@ final class AdaptiveTransportController {
                 * Math.max(256D, averagePacketBytes));
         final long pacingMaximum = (long) Math.ceil(pacingCeiling
                 * Math.max(256D, estimatedPayloadBytes));
-        final long observedMaximum = lossSampleCount() < 64 || validatedRate <= 0L
-                ? (long) Math.ceil(Math.min(DEGRADED_BURST_MAX_PPS, config.getAdaptiveMaxPps())
-                * Math.max(256D, estimatedPayloadBytes))
-                : resumeState == ResumeState.UNVALIDATED
-                ? Math.max(BURST_ADMISSION_MIN_BPS, burstAdmissionRateBytesPerSecond)
-                : Math.max(BURST_ADMISSION_INITIAL_BPS, (long) Math.ceil(validatedRate * 1.25D));
-        final long safeMaximum = Math.max(BURST_ADMISSION_MIN_BPS,
+        final long minimum = burstAdmissionMinimumBytesPerSecond();
+        final long observedMaximum = resumeState == ResumeState.UNVALIDATED
+                ? Math.max(minimum, burstAdmissionRateBytesPerSecond)
+                : validatedRate > 0L
+                ? Math.max(minimum, (long) Math.ceil(validatedRate * 1.25D))
+                : (long) Math.ceil(Math.min(DEGRADED_BURST_MAX_PPS, config.getAdaptiveMaxPps())
+                * Math.max(256D, estimatedPayloadBytes));
+        final long safeMaximum = Math.max(minimum,
                 Math.min(configuredMaximum, Math.min(pacingMaximum, observedMaximum)));
         final long arrivalTarget = (long) Math.ceil(applicationArrivalRateBytesPerSecond
                 * APPLICATION_ARRIVAL_HEADROOM);
         final long backlogAge = Math.max(0L, now - burstDrainStartedNanos);
-        final long remaining = Math.max(BURST_QUEUE_MIN_REMAINING_NANOS,
-                BURST_QUEUE_TIME_LIMIT_NANOS - backlogAge);
-        final long drainTarget = saturatedMultiply(Math.max(0L, outstandingBytes), 1_000_000_000L)
-                / remaining;
-        final long demandTarget = Math.max(BURST_ADMISSION_MIN_BPS,
+        final boolean calibrating = calibrationWindowOpen(now);
+        final boolean workConserving = calibrating || calibrationProbeAllowed(lossRatio());
+        final long drainTarget;
+        if (workConserving || backlogAge < BURST_QUEUE_TIME_LIMIT_NANOS) {
+            final long remaining = workConserving ? BURST_QUEUE_TIME_LIMIT_NANOS
+                    : Math.max(1L, BURST_QUEUE_TIME_LIMIT_NANOS - backlogAge);
+            drainTarget = saturatedMultiply(Math.max(0L, outstandingBytes), 1_000_000_000L)
+                    / remaining;
+        } else {
+            // An overdue queue is capacity-limited, not deadline-limited. Keep
+            // a bounded 25% probe so a sender-limited delivery sample cannot
+            // permanently lock the path at its own previously reduced rate.
+            final boolean probeAllowed = lossType == LossType.NONE && lossRatio() < 0.005D
+                    && !queueInflated() && lossQuietForRecovery(now);
+            drainTarget = validatedRate > 0L && probeAllowed
+                    ? (long) Math.ceil(validatedRate * 1.25D)
+                    : validatedRate > 0L
+                    ? Math.min(burstAdmissionRateBytesPerSecond, validatedRate)
+                    : burstAdmissionRateBytesPerSecond;
+        }
+        final long demandTarget = Math.max(minimum,
                 Math.max(arrivalTarget, drainTarget));
         burstAdmissionTargetBytesPerSecond = Math.min(safeMaximum, demandTarget);
     }
@@ -668,7 +732,7 @@ final class AdaptiveTransportController {
                 smoothedRtt > 0 ? smoothedRtt : TimeUnit.MILLISECONDS.toNanos(100));
         final long rampElapsed = Math.max(0L, now - burstRampUpdatedNanos);
         if (rampElapsed < rtt) return;
-        final long target = Math.max(BURST_ADMISSION_MIN_BPS,
+        final long target = Math.max(burstAdmissionMinimumBytesPerSecond(),
                 burstAdmissionTargetBytesPerSecond);
         final long growthInterval = Math.min(rampElapsed, BURST_ADMISSION_MAX_GROWTH_INTERVAL_NANOS);
         if (target < burstAdmissionRateBytesPerSecond) {
@@ -701,9 +765,7 @@ final class AdaptiveTransportController {
 
     private void reduceBurstAdmission(double reduction) {
         final long now = System.nanoTime();
-        final long configuredMinimum = (long) Math.ceil(config.getAdaptiveMinPps()
-                * Math.max(256D, averagePacketBytes));
-        final long minimum = Math.max(BURST_ADMISSION_MIN_BPS, configuredMinimum);
+        final long minimum = burstAdmissionMinimumBytesPerSecond();
         if (burstDrainActive && burstAdmissionRateBytesPerSecond > 0L) {
             burstAdmissionRateBytesPerSecond = Math.max(minimum,
                     (long) Math.floor(burstAdmissionRateBytesPerSecond * reduction));
@@ -717,6 +779,67 @@ final class AdaptiveTransportController {
     private boolean lossQuietForRecovery(long now) {
         return lastLossNanos == 0L || now - lastLossNanos
                 > Math.max(TimeUnit.MILLISECONDS.toNanos(250), saturatedMultiply(smoothedRtt, 2L));
+    }
+
+    private long burstAdmissionMinimumBytesPerSecond() {
+        return Math.max(1L, (long) Math.ceil(config.getAdaptiveMinPps()
+                * Math.max(256D, averagePacketBytes)));
+    }
+
+    private long burstDrainEnterBytes() {
+        // A fixed 48KiB trigger self-locks after an application-limited sample:
+        // cwnd and pacing shrink, a 20-40KiB queue can no longer drain, yet it
+        // never becomes BULK. Scale the trigger down with the current cwnd while
+        // retaining four datagrams as the minimum useful pressure signal.
+        return Math.min(BURST_DRAIN_ENTER_BYTES,
+                Math.max(minimumCongestionWindow(), congestionWindowBytes));
+    }
+
+    private long burstDrainExitBytes() {
+        final long enter = burstDrainEnterBytes();
+        return Math.min(BURST_DRAIN_EXIT_BYTES,
+                Math.max(2L * config.getMTU(), enter / 3L));
+    }
+
+    private boolean calibrationWindowOpen(long now) {
+        if (calibrationStartedNanos == 0L
+                || now - calibrationStartedNanos >= STARTUP_CALIBRATION_NANOS) return false;
+        return true;
+    }
+
+    private boolean calibrationProbeAllowed(double recentLoss) {
+        return recentLoss < 0.03D && !queueInflated() && !rttPressureActive
+                && lossType != LossType.QUEUE && lossType != LossType.RATE_LIMIT
+                && lossType != LossType.BURST && lossType != LossType.MTU_BLACK_HOLE;
+    }
+
+    private boolean workConservingBulk(long now) {
+        if (!burstDrainActive) return false;
+        return calibrationWindowOpen(now) || calibrationProbeAllowed(lossRatio());
+    }
+
+    private void enterRttPressure(long now) {
+        rttPressureActive = true;
+        congestionEpisodeActive = true;
+        congestionMode = CongestionMode.DRAIN;
+        congestionReason = "RTT_INFLATION";
+        lastLossNanos = now;
+        bandwidthProbeSuppressedUntil = Math.max(bandwidthProbeSuppressedUntil,
+                now + Math.max(TimeUnit.SECONDS.toNanos(1), saturatedMultiply(smoothedRtt, 4L)));
+        gainCycle = 2;
+        congestionWindowBytes = Math.max(minimumCongestionWindow(), congestionWindowBytes * 7L / 8L);
+        final double inflation = minRtt == Long.MAX_VALUE || minRtt <= 0L
+                ? 1D : smoothedRtt / (double) minRtt;
+        final double reduction = inflation >= 2D ? 0.75D : 0.85D;
+        packetsPerSecond = clampPps(packetsPerSecond * reduction);
+        burstDrainFloorPps = Math.min(burstDrainFloorPps, packetsPerSecond);
+        lossPacingCeiling = Math.min(lossPacingCeiling, packetsPerSecond);
+        lossRecoveryUpdatedNanos = now;
+        reduceBurstAdmission(reduction);
+    }
+
+    private boolean rttRecovered() {
+        return minRtt == Long.MAX_VALUE || smoothedRtt <= minRtt * 5L / 4L;
     }
 
     private double healthyBurstCeiling() {
@@ -873,6 +996,7 @@ final class AdaptiveTransportController {
         // actually injected. BBR applies the same send-rate bound before a
         // sample is allowed to become retained path capacity.
         final long sendRateCeiling = burstDrainActive && burstAdmissionRateBytesPerSecond > 0L
+                && !workConservingBulk(now)
                 ? burstAdmissionRateBytesPerSecond
                 : (long) Math.ceil(packetsPerSecond * Math.max(256D, averagePacketBytes));
         final long sample = Math.min(rawSample, Math.max(1L, sendRateCeiling));
@@ -983,13 +1107,17 @@ final class AdaptiveTransportController {
     private long maximumCongestionWindow() { return Math.max(minimumCongestionWindow(), config.getMaxQueuedBytes()); }
 
     private void publishMetrics() {
+        final boolean calibrating = calibrationWindowOpen(System.nanoTime());
+        final boolean workConserving = workConservingBulk(System.nanoTime());
         config.getMetrics().adaptivePacingRate(packetsPerSecond);
-        config.getMetrics().adaptiveBytePacingRate(burstDrainActive ? burstAdmissionRateBytesPerSecond : 0L);
+        config.getMetrics().adaptiveBytePacingRate(burstDrainActive && !workConserving
+                ? burstAdmissionRateBytesPerSecond : 0L);
         config.getMetrics().adaptiveDemand(!burstDrainActive, burstDrainActive ? "BULK" : "IDLE",
                 burstDrainActive ? Math.max(0L, System.nanoTime() - burstDrainStartedNanos) : 0L,
                 burstRecoveryProbes);
         config.getMetrics().adaptivePathModel(maxBandwidth(), lastDeliverySampleApplicationLimited,
-                resumeState.name(), resumeValidatedRounds);
+                calibrating ? "CALIBRATING" : workConserving
+                ? "WORK_CONSERVING" : resumeState.name(), resumeValidatedRounds);
         config.getMetrics().adaptiveDeliveryRate(deliveryRateBytesPerSecond);
         long acknowledgements = 0, losses = 0;
         for (int i = 0; i < WINDOW_BUCKETS; i++) { acknowledgements += acked[i]; losses += lost[i]; }
