@@ -13,6 +13,14 @@ import java.util.List;
 public class LimitedFecHandlerTest {
 
     @Test
+    public void lowYieldNormalFecIsSuppressedAfterAFeedbackWindow() {
+        Assertions.assertFalse(LimitedFecHandler.shouldSuppressNormalFec(63, 0));
+        Assertions.assertTrue(LimitedFecHandler.shouldSuppressNormalFec(64, 0));
+        Assertions.assertTrue(LimitedFecHandler.shouldSuppressNormalFec(100, 0));
+        Assertions.assertFalse(LimitedFecHandler.shouldSuppressNormalFec(100, 1));
+    }
+
+    @Test
     public void targetedWindowPinsCriticalSequenceAndUsesNewestContext() {
         final java.util.List<LimitedFecHandler.Entry> rolling = new java.util.ArrayList<>();
         for (int sequence = 10; sequence <= 15; sequence++) {

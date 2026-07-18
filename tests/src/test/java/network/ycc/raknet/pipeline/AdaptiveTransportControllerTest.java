@@ -318,6 +318,19 @@ public class AdaptiveTransportControllerTest {
     }
 
     @Test
+    public void backgroundFecIsSuppressedDuringBulkDrain() throws Exception {
+        final RakNet.Config config = adaptiveConfig();
+        final AdaptiveTransportController controller = new AdaptiveTransportController(config);
+        for (int i = 0; i < 99; i++) controller.onAck(600, 20_000_000L, 0);
+        controller.onLoss(600, false);
+        setObject(controller, "lossType", AdaptiveTransportController.LossType.RANDOM);
+
+        Assertions.assertTrue(controller.shouldUseFec());
+        setBoolean(controller, "burstDrainActive", true);
+        Assertions.assertFalse(controller.shouldUseFec());
+    }
+
+    @Test
     public void oneLossBurstCannotRepeatedlyCollapsePacingWithinOneRtt() {
         final RakNet.Config config = adaptiveConfig();
         final AdaptiveTransportController controller = new AdaptiveTransportController(config);
@@ -418,6 +431,12 @@ public class AdaptiveTransportControllerTest {
         final Field field = target.getClass().getDeclaredField(name);
         field.setAccessible(true);
         field.setDouble(target, value);
+    }
+
+    private static void setBoolean(Object target, String name, boolean value) throws Exception {
+        final Field field = target.getClass().getDeclaredField(name);
+        field.setAccessible(true);
+        field.setBoolean(target, value);
     }
 
     private static void setObject(Object target, String name, Object value) throws Exception {

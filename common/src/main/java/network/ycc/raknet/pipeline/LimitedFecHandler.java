@@ -33,6 +33,8 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
     private static final int MAX_PENDING_GROUPS = 64;
     private static final int TARGETED_WINDOW_SIZE = 4;
     private static final int TARGETED_ROLLING_CACHE = 8;
+    private static final long NORMAL_FEC_FEEDBACK_WINDOW = 64;
+    private static final long NORMAL_FEC_SUPPRESSION_NANOS = TimeUnit.SECONDS.toNanos(10);
 
     private final List<Entry> outbound = new ArrayList<>(MAX_GROUP_SIZE);
     private final List<Entry> rollingOutbound = new ArrayList<>(TARGETED_ROLLING_CACHE);
@@ -46,6 +48,7 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
     private int outboundParityShards;
     private long feedbackGroups;
     private long feedbackRecovered;
+    private long normalFecSuppressedUntilNanos;
     private ScheduledFuture<?> cleanupTask;
 
     @Override
@@ -70,7 +73,9 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
         }
         final boolean reedSolomon = reedSolomonEnabled(ctx);
         final ReliabilityHandler reliability = ctx.pipeline().get(ReliabilityHandler.class);
-        final boolean normalFec = reliability != null && reliability.adaptiveController().shouldUseFec();
+        final long now = System.nanoTime();
+        final boolean normalFec = reliability != null && reliability.adaptiveController().shouldUseFec()
+                && normalFecAllowed(ctx, now);
         final AdaptiveTransportController.FecParameters parameters = normalFec
                 ? fecParameters(ctx, reedSolomon)
                 : new AdaptiveTransportController.FecParameters(TARGETED_WINDOW_SIZE, 1, 0.0D);
@@ -103,7 +108,6 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
             wroteNormalParity = true;
         }
         if (!wroteNormalParity && reedSolomon && current != null && reliability != null) {
-            final long now = System.nanoTime();
             final int targetSequence = selectTargetedSequence(reliability, now);
             if (targetSequence >= 0) writeTargetedParity(ctx, reliability, targetSequence, now);
         }
@@ -131,14 +135,15 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
                 final int feedbackGroupId = buf.readInt();
                 final int recovered = buf.readUnsignedByte();
                 if (recovered > 2 || buf.isReadable()) throw new IllegalArgumentException("invalid FEC feedback");
-                feedbackGroups++;
-                feedbackRecovered += recovered;
-                if (targetedGroups.remove(feedbackGroupId) && recovered > 0) {
-                    RakNet.config(ctx).getMetrics().targetedFecRecovered(recovered);
-                }
-                if (feedbackGroups >= 128) {
-                    feedbackGroups /= 2;
-                    feedbackRecovered /= 2;
+                if (targetedGroups.remove(feedbackGroupId)) {
+                    if (recovered > 0) RakNet.config(ctx).getMetrics().targetedFecRecovered(recovered);
+                } else {
+                    feedbackGroups++;
+                    feedbackRecovered += recovered;
+                    if (feedbackGroups >= 128) {
+                        feedbackGroups /= 2;
+                        feedbackRecovered /= 2;
+                    }
                 }
             } catch (RuntimeException ignored) {
                 // Untrusted extension packet.
@@ -236,11 +241,15 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
         for (Entry entry : rollingOutbound) {
             if (reliability.targetedFecChannel(entry.seq) < 0) continue;
             final double debt = reliability.recoveryDebtForSequence(entry.seq, now);
+            if (debt >= 2D && reliability.isRemoteOrderedHolTarget(entry.seq, now)) {
+                return entry.seq;
+            }
             if (debt >= 2D && debt > maximumDebt) {
                 maximumDebt = debt;
                 sequence = entry.seq;
             }
         }
+        if (sequence < 0) RakNet.config(reliability.ctx).getMetrics().recoveryDebt(0D, -1);
         return sequence;
     }
 
@@ -400,6 +409,21 @@ public final class LimitedFecHandler extends ChannelDuplexHandler {
             return new AdaptiveTransportController.FecParameters(base.dataShards, 2, 0.20D);
         }
         return base;
+    }
+
+    private boolean normalFecAllowed(ChannelHandlerContext ctx, long now) {
+        if (now < normalFecSuppressedUntilNanos) return false;
+        if (!shouldSuppressNormalFec(feedbackGroups, feedbackRecovered)) return true;
+        final double ratio = feedbackGroups == 0 ? 0D : feedbackRecovered / (double) feedbackGroups;
+        normalFecSuppressedUntilNanos = now + NORMAL_FEC_SUPPRESSION_NANOS;
+        feedbackGroups = 0;
+        feedbackRecovered = 0;
+        RakNet.config(ctx).getMetrics().fecBudget(0, 0, ratio);
+        return false;
+    }
+
+    static boolean shouldSuppressNormalFec(long groups, long recovered) {
+        return groups >= NORMAL_FEC_FEEDBACK_WINDOW && recovered * 100L < groups;
     }
 
     private boolean enabled(ChannelHandlerContext ctx) {

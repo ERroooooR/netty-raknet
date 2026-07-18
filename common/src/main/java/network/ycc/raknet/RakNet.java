@@ -33,6 +33,8 @@ public class RakNet {
     public static final AttributeKey<PingTracker> PING_TRACKER = AttributeKey.valueOf("RN_PING_TRACKER");
     public static final AttributeKey<Long> LAST_INBOUND_NANOS = AttributeKey.valueOf("RN_LAST_INBOUND_NANOS");
     public static final AttributeKey<Long> TRANSPORT_FEATURES = AttributeKey.valueOf("RN_TRANSPORT_FEATURES");
+    public static final AttributeKey<OrderedHolFeedback> REMOTE_ORDERED_HOL =
+            AttributeKey.valueOf("RN_REMOTE_ORDERED_HOL");
 
     public static final ChannelOption<Long> SERVER_ID = ChannelOption.valueOf("RN_SERVER_ID");
     public static final ChannelOption<Long> CLIENT_ID = ChannelOption.valueOf("RN_CLIENT_ID");
@@ -114,6 +116,8 @@ public class RakNet {
         default void recoveryDebt(double debt, int channel) {}
         default void targetedFecRepair(int channel, int bytes) {}
         default void targetedFecRecovered(int packets) {}
+        default void orderedHolProbe(int channel, int bytes) {}
+        default void orderedHolProbeAcked(int bytes) {}
         default void fragmentReassemblyPending(int builders, long bytes, long oldestAgeNanos) {}
         default void fragmentReassemblyComplete(int bytes, long ageNanos) {}
         default void orderedQueuePending(int frames, long oldestAgeNanos) {}
@@ -162,6 +166,22 @@ public class RakNet {
         default void pathMtuState(String state, int confirmedMtu, int probeMtu, int maximumMtu) {}
 
         default void currentQueuedBytes(int bytes) {}
+    }
+
+    /** Latest peer-reported ordered head-of-line gap, supplied by an optional integration layer. */
+    public static final class OrderedHolFeedback {
+        public final int channel;
+        public final int blockedOrderIndex;
+        public final long ageNanos;
+        public final long receivedAtNanos;
+
+        public OrderedHolFeedback(int channel, int blockedOrderIndex,
+                                  long ageNanos, long receivedAtNanos) {
+            this.channel = channel;
+            this.blockedOrderIndex = blockedOrderIndex;
+            this.ageNanos = Math.max(0L, ageNanos);
+            this.receivedAtNanos = receivedAtNanos;
+        }
     }
 
     public interface Config extends ChannelConfig {

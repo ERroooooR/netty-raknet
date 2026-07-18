@@ -6,6 +6,7 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.EventLoop;
+import io.netty.util.Attribute;
 import io.netty.util.concurrent.EventExecutor;
 import io.netty.util.concurrent.ScheduledFuture;
 import network.ycc.raknet.RakNet;
@@ -249,6 +250,41 @@ public class ReliabilityAdaptiveRecoveryHandlerTest {
     }
 
     @Test
+    public void ptoPrefersHighestRetryDebtOverAnOlderUnretriedOrderedFrameSet() {
+        final Fixture fixture = new Fixture();
+        final FrameSet original = reliableFrameSet(52, true, 7);
+        final FrameSet retried = reliableFrameSet(53, true, 3, true);
+        fixture.handler.pendingFrameSets.put(52, original);
+        fixture.handler.pendingFrameSets.put(53, retried);
+
+        Assertions.assertSame(retried, fixture.handler.selectPtoProbeCandidate());
+
+        fixture.handler.pendingFrameSets.remove(52).release();
+        fixture.handler.pendingFrameSets.remove(53).release();
+    }
+
+    @Test
+    public void ackProgressCancelsStalePtoBeforeSchedulingTheRemainingFlight() {
+        final Fixture fixture = new Fixture();
+        doReturn(fixture.scheduledFuture).when(fixture.executor)
+                .schedule(any(Runnable.class), anyLong(), eq(TimeUnit.NANOSECONDS));
+        when(fixture.scheduledFuture.isDone()).thenReturn(false);
+        final FrameSet acknowledged = reliableFrameSet(54, true, 2);
+        final FrameSet remaining = reliableFrameSet(55, true, 2);
+        fixture.handler.pendingFrameSets.put(54, acknowledged);
+        fixture.handler.pendingFrameSets.put(55, remaining);
+        fixture.handler.inFlightBytes = acknowledged.getRoughSize() + remaining.getRoughSize();
+
+        fixture.handler.refreshPtoTimer(System.nanoTime());
+        fixture.handler.readAck(new Reliability.ACK(54));
+
+        verify(fixture.scheduledFuture, atLeastOnce()).cancel(false);
+        verify(fixture.executor, times(2))
+                .schedule(any(Runnable.class), anyLong(), eq(TimeUnit.NANOSECONDS));
+        fixture.handler.pendingFrameSets.remove(55).release();
+    }
+
+    @Test
     public void applicationLimitedRecoverySendsOncePerLogicalEntryAndPeriod() {
         final Fixture fixture = new Fixture();
         final FrameSet retried = reliableFrameSet(60, true, 3, true);
@@ -289,6 +325,32 @@ public class ReliabilityAdaptiveRecoveryHandlerTest {
                 System.nanoTime(), fixture.rttNanos));
 
         fixture.handler.pendingFrameSets.remove(61).release();
+    }
+
+    @Test
+    public void remoteOrderedHolFeedbackProbesTheExactBlockedOrderIndex() {
+        final Fixture fixture = new Fixture();
+        final FrameSet unrelated = reliableFrameSet(69, true, 7);
+        final FrameSet blocked = reliableFrameSet(70, true, 7, true);
+        fixture.handler.pendingFrameSets.put(69, unrelated);
+        fixture.handler.pendingFrameSets.put(70, blocked);
+        fixture.handler.inFlightBytes = unrelated.getRoughSize() + blocked.getRoughSize();
+        fixture.remoteOrderedHol(7, 70, TimeUnit.SECONDS.toNanos(3));
+
+        fixture.handler.onRemoteOrderedHolFeedback();
+
+        verify(fixture.ctx).write(blocked);
+        verify(fixture.ctx, never()).write(unrelated);
+        verify(fixture.metrics).orderedHolProbe(7, blocked.getRoughSize());
+        Assertions.assertEquals(blocked.getRoughSize(), fixture.handler.orderedHolProbeBytesInFlight);
+
+        fixture.handler.readAck(new Reliability.ACK(70));
+        verify(fixture.metrics).orderedHolProbeAcked(blocked.getRoughSize());
+        Assertions.assertEquals(0L, fixture.handler.orderedHolProbeBytesInFlight);
+
+        // Release the outbound retain and remaining pending ownership.
+        blocked.release();
+        fixture.handler.pendingFrameSets.remove(69).release();
     }
 
     @Test
@@ -347,6 +409,7 @@ public class ReliabilityAdaptiveRecoveryHandlerTest {
         final EventExecutor executor = mock(EventExecutor.class);
         final ChannelFuture writeFuture = mock(ChannelFuture.class);
         final ScheduledFuture<?> scheduledFuture = mock(ScheduledFuture.class);
+        final Attribute<RakNet.OrderedHolFeedback> remoteOrderedHol = mock(Attribute.class);
         final AdaptiveTransportController adaptive;
 
         Fixture() {
@@ -361,12 +424,18 @@ public class ReliabilityAdaptiveRecoveryHandlerTest {
             when(writeFuture.addListener(any())).thenReturn(writeFuture);
             when(channel.isOpen()).thenReturn(true);
             when(channel.eventLoop()).thenReturn(eventLoop);
+            doReturn(remoteOrderedHol).when(channel).attr(RakNet.REMOTE_ORDERED_HOL);
             doReturn(scheduledFuture).when(eventLoop)
                     .schedule(any(Runnable.class), anyLong(), eq(TimeUnit.NANOSECONDS));
             handler.config = config;
             handler.ctx = ctx;
             adaptive = new AdaptiveTransportController(config);
             handler.adaptive = adaptive;
+        }
+
+        void remoteOrderedHol(int channel, int blockedOrderIndex, long ageNanos) {
+            when(remoteOrderedHol.get()).thenReturn(new RakNet.OrderedHolFeedback(
+                    channel, blockedOrderIndex, ageNanos, System.nanoTime()));
         }
 
         void enableNacks() {

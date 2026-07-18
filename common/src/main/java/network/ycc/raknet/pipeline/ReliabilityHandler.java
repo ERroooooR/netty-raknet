@@ -6,6 +6,7 @@ import io.netty.channel.ChannelPromise;
 import io.netty.handler.codec.CodecException;
 import io.netty.handler.codec.CorruptedFrameException;
 import io.netty.util.ReferenceCountUtil;
+import io.netty.util.Attribute;
 import io.netty.util.concurrent.ScheduledFuture;
 import it.unimi.dsi.fastutil.ints.Int2LongMap;
 import it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap;
@@ -44,6 +45,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected final Int2ObjectLinkedOpenHashMap<FrameSet> pendingFrameSets = new Int2ObjectLinkedOpenHashMap<>();
     protected final Int2LongOpenHashMap rackRetiredFrameSets = new Int2LongOpenHashMap();
     protected final Int2IntOpenHashMap ptoProbeBytesByFrameSet = new Int2IntOpenHashMap();
+    protected final Int2IntOpenHashMap orderedHolProbeBytesByFrameSet = new Int2IntOpenHashMap();
     protected final Int2IntOpenHashMap additionalRecoveryBytesByFrameSet = new Int2IntOpenHashMap();
     protected final Int2LongOpenHashMap additionalRecoveryLastSent = new Int2LongOpenHashMap();
     protected final IntOpenHashSet additionallyRecoveredThisPeriod = new IntOpenHashSet();
@@ -54,6 +56,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected int queuedBytes = 0;
     protected long inFlightBytes = 0;
     protected long ptoProbeBytesInFlight = 0;
+    protected long orderedHolProbeBytesInFlight = 0;
     protected long additionalRecoveryBytesInFlight = 0;
 
     protected int lastReceivedSeqId = 0;
@@ -81,6 +84,9 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected long lastAckProgressNanos;
     protected long lastPtoProbeSentNanos;
     protected int ptoCount;
+    protected long lastOrderedHolProbeSentNanos;
+    protected int lastOrderedHolProbeChannel = -1;
+    protected int lastOrderedHolProbeOrderIndex = -1;
     protected boolean applicationLimitedRecoveryPeriod;
     protected long targetedFecWindowStartedNanos;
     protected int targetedFecBytesInWindow;
@@ -111,6 +117,9 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     private static final long MIN_RACK_RETIRED_RETENTION_NANOS = TimeUnit.SECONDS.toNanos(1);
     private static final long PTO_TIMER_GRANULARITY_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
     private static final int MAX_PTO_BACKOFF_EXPONENT = 6;
+    private static final long MIN_ORDERED_HOL_PROBE_AGE_NANOS = TimeUnit.MILLISECONDS.toNanos(250);
+    private static final long MIN_ORDERED_HOL_PROBE_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(500);
+    private static final long REMOTE_ORDERED_HOL_RETENTION_NANOS = TimeUnit.SECONDS.toNanos(3);
     private static final boolean ADAPTIVE_NACK_GRACE_ENABLED = Boolean.parseBoolean(
             System.getProperty("raknetify.adaptiveNackGrace", "true"));
     private static final boolean ADAPTIVE_NACK_PROTECTION_ENABLED = Boolean.parseBoolean(
@@ -121,6 +130,8 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             System.getProperty("raknetify.rackLossDetection", "true"));
     private static final boolean PTO_PROBES_ENABLED = Boolean.parseBoolean(
             System.getProperty("raknetify.ptoProbes", "true"));
+    private static final boolean REMOTE_ORDERED_HOL_RECOVERY_ENABLED = Boolean.parseBoolean(
+            System.getProperty("raknetify.remoteOrderedHolRecovery", "true"));
     private static final boolean APPLICATION_LIMITED_RECOVERY_ENABLED = Boolean.parseBoolean(
             System.getProperty("raknetify.applicationLimitedRecovery", "true"));
     private static final boolean TARGETED_FEC_ENABLED = Boolean.parseBoolean(
@@ -147,6 +158,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         if (config.isIgnoreResendGauge()) this.resendGauge = 2;
         rackRetiredFrameSets.defaultReturnValue(Long.MIN_VALUE);
         ptoProbeBytesByFrameSet.defaultReturnValue(0);
+        orderedHolProbeBytesByFrameSet.defaultReturnValue(0);
         additionalRecoveryBytesByFrameSet.defaultReturnValue(0);
         additionalRecoveryLastSent.defaultReturnValue(Long.MIN_VALUE);
         targetedFecChannelsByFrameSet.defaultReturnValue(-1);
@@ -165,6 +177,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         ackRepeatSet.clear();
         rackRetiredFrameSets.clear();
         ptoProbeBytesByFrameSet.clear();
+        orderedHolProbeBytesByFrameSet.clear();
         additionalRecoveryBytesByFrameSet.clear();
         additionalRecoveryLastSent.clear();
         additionallyRecoveredThisPeriod.clear();
@@ -278,9 +291,11 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         this.queuedBytes = 0;
         this.inFlightBytes = 0;
         this.ptoProbeBytesInFlight = 0;
+        this.orderedHolProbeBytesInFlight = 0;
         this.additionalRecoveryBytesInFlight = 0;
         cancelPtoTask();
         ptoProbeBytesByFrameSet.clear();
+        orderedHolProbeBytesByFrameSet.clear();
         additionalRecoveryBytesByFrameSet.clear();
         additionalRecoveryLastSent.clear();
         additionallyRecoveredThisPeriod.clear();
@@ -375,6 +390,10 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                     if (acknowledgedProbeBytes > 0) {
                         config.getMetrics().ptoProbeAcked(acknowledgedProbeBytes);
                     }
+                    final int acknowledgedHolProbeBytes = clearOrderedHolProbeTracking(id);
+                    if (acknowledgedHolProbeBytes > 0) {
+                        config.getMetrics().orderedHolProbeAcked(acknowledgedHolProbeBytes);
+                    }
                     clearAdditionalRecoveryTracking(id);
                     clearLogicalRecoveryTracking(frameSet);
                     latestAckedSentTimeNanos = Math.max(latestAckedSentTimeNanos, frameSet.getSentTime());
@@ -397,6 +416,11 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         }
         config.getMetrics().bytesACKd(ackdBytes);
         if (ackProgress) {
+            // A useful ACK restarts the connection-level PTO. Keeping an older
+            // scheduled deadline causes stale probes to fire despite continuous
+            // ACK progress because schedulePto deliberately preserves the
+            // earliest existing deadline.
+            cancelPtoTask();
             lastAckProgressNanos = now;
             lastPtoProbeSentNanos = 0L;
             ptoCount = 0;
@@ -419,6 +443,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 if (frameSet != null) {
                     targetedFecChannelsByFrameSet.remove(id);
                     clearPtoProbeTracking(id);
+                    clearOrderedHolProbeTracking(id);
                     clearAdditionalRecoveryTracking(id);
                     bytesNACKd += frameSet.getRoughSize();
                     inFlightBytes = Math.max(0, inFlightBytes - frameSet.getRoughSize());
@@ -522,6 +547,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 packetItr.remove();
                 targetedFecChannelsByFrameSet.remove(frameSet.getSeqId());
                 clearPtoProbeTracking(frameSet.getSeqId());
+                clearOrderedHolProbeTracking(frameSet.getSeqId());
                 clearAdditionalRecoveryTracking(frameSet.getSeqId());
                 inFlightBytes = Math.max(0, inFlightBytes - frameSet.getRoughSize());
                 adaptive.onLoss(frameSet.getRoughSize(), true);
@@ -571,6 +597,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 iterator.remove();
                 targetedFecChannelsByFrameSet.remove(frameSet.getSeqId());
                 clearPtoProbeTracking(frameSet.getSeqId());
+                clearOrderedHolProbeTracking(frameSet.getSeqId());
                 clearAdditionalRecoveryTracking(frameSet.getSeqId());
                 inFlightBytes = Math.max(0L, inFlightBytes - frameSet.getRoughSize());
                 adaptive.onLoss(frameSet.getRoughSize(), false);
@@ -625,8 +652,12 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     }
 
     protected FrameSet selectPtoProbeCandidate() {
+        final RakNet.OrderedHolFeedback feedback = remoteOrderedHolFeedback(System.nanoTime());
+        final FrameSet directed = selectRemoteOrderedHolCandidate(feedback, false, 0L, 0L);
+        if (directed != null) return directed;
         FrameSet oldestReliable = null;
         FrameSet oldestOrdered = null;
+        FrameSet highestDebtOrdered = null;
         for (FrameSet frameSet : pendingFrameSets.values()) {
             if (!frameSet.hasReliableFrame()) continue;
             if (oldestReliable == null || frameSet.getSentTime() < oldestReliable.getSentTime()) {
@@ -636,8 +667,93 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                     && (oldestOrdered == null || frameSet.getSentTime() < oldestOrdered.getSentTime())) {
                 oldestOrdered = frameSet;
             }
+            if (frameSet.hasRetriedReliableOrderedFrame()
+                    && (highestDebtOrdered == null
+                    || frameSet.maximumRetryCount() > highestDebtOrdered.maximumRetryCount()
+                    || (frameSet.maximumRetryCount() == highestDebtOrdered.maximumRetryCount()
+                    && frameSet.getSentTime() < highestDebtOrdered.getSentTime()))) {
+                highestDebtOrdered = frameSet;
+            }
         }
+        if (highestDebtOrdered != null) return highestDebtOrdered;
         return oldestOrdered != null ? oldestOrdered : oldestReliable;
+    }
+
+    /**
+     * Consumes optional peer HOL diagnostics without changing the RakNet wire
+     * format. One exact same-sequence probe per feedback interval is enough to
+     * target the blocked ordering index while remaining bounded under BULK.
+     */
+    public void onRemoteOrderedHolFeedback() {
+        if (!REMOTE_ORDERED_HOL_RECOVERY_ENABLED || ctx == null || !ctx.channel().isOpen()) return;
+        final long now = System.nanoTime();
+        final RakNet.OrderedHolFeedback feedback = remoteOrderedHolFeedback(now);
+        if (feedback == null) return;
+        final long rtt = Math.max(PTO_TIMER_GRANULARITY_NANOS, config.getRTTNanos());
+        if (feedback.ageNanos < Math.max(MIN_ORDERED_HOL_PROBE_AGE_NANOS,
+                saturatedMultiply(rtt, 2L))) return;
+        final boolean sameTarget = feedback.channel == lastOrderedHolProbeChannel
+                && feedback.blockedOrderIndex == lastOrderedHolProbeOrderIndex;
+        final long interval = Math.max(MIN_ORDERED_HOL_PROBE_INTERVAL_NANOS, rtt);
+        if (sameTarget && now - lastOrderedHolProbeSentNanos < interval) return;
+
+        final FrameSet candidate = selectRemoteOrderedHolCandidate(feedback, false, now, rtt);
+        if (candidate == null) {
+            tryProduceFrameSets();
+            return;
+        }
+        final int bytes = candidate.getRoughSize();
+        if (adaptive.sendBudget(now, totalInFlightBytes(), bytes, queuedBytes) <= 0) return;
+
+        candidate.touch("Remote ordered HOL probe");
+        ctx.write(candidate.retain()).addListener(RakNet.INTERNAL_WRITE_LISTENER);
+        orderedHolProbeBytesByFrameSet.addTo(candidate.getSeqId(), bytes);
+        orderedHolProbeBytesInFlight += bytes;
+        config.getMetrics().orderedHolProbe(feedback.channel, bytes);
+        config.getMetrics().packetsOut(1);
+        config.getMetrics().framesOut(candidate.getNumPackets());
+        lastOrderedHolProbeSentNanos = now;
+        lastOrderedHolProbeChannel = feedback.channel;
+        lastOrderedHolProbeOrderIndex = feedback.blockedOrderIndex;
+        lastPtoProbeSentNanos = now; // share speculative-send pacing with PTO
+        ctx.flush();
+        refreshPtoTimer(now);
+    }
+
+    private RakNet.OrderedHolFeedback remoteOrderedHolFeedback(long now) {
+        if (!REMOTE_ORDERED_HOL_RECOVERY_ENABLED || ctx == null) return null;
+        final Attribute<RakNet.OrderedHolFeedback> attribute =
+                ctx.channel().attr(RakNet.REMOTE_ORDERED_HOL);
+        if (attribute == null) return null;
+        final RakNet.OrderedHolFeedback feedback = attribute.get();
+        if (feedback == null || feedback.channel < 0 || feedback.channel >= 8
+                || feedback.blockedOrderIndex < 0
+                || now - feedback.receivedAtNanos > REMOTE_ORDERED_HOL_RETENTION_NANOS) return null;
+        return feedback;
+    }
+
+    private FrameSet selectRemoteOrderedHolCandidate(RakNet.OrderedHolFeedback feedback,
+                                                      boolean additionalRecoveryOnly,
+                                                      long now, long cooldownNanos) {
+        if (feedback == null) return null;
+        FrameSet best = null;
+        for (FrameSet frameSet : pendingFrameSets.values()) {
+            if (!frameSet.containsReliableOrderedFrame(
+                    feedback.channel, feedback.blockedOrderIndex)) continue;
+            if (additionalRecoveryOnly
+                    && !isAdditionalRecoveryEligible(frameSet, now, cooldownNanos)) continue;
+            if (best == null || frameSet.maximumRetryCount() > best.maximumRetryCount()
+                    || (frameSet.maximumRetryCount() == best.maximumRetryCount()
+                    && frameSet.getSentTime() < best.getSentTime())) best = frameSet;
+        }
+        return best;
+    }
+
+    boolean isRemoteOrderedHolTarget(int sequenceId, long now) {
+        final FrameSet frameSet = pendingFrameSets.get(sequenceId);
+        final RakNet.OrderedHolFeedback feedback = remoteOrderedHolFeedback(now);
+        return frameSet != null && feedback != null && frameSet.containsReliableOrderedFrame(
+                feedback.channel, feedback.blockedOrderIndex);
     }
 
     protected void sendPtoProbe(long now) {
@@ -689,6 +805,14 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         return bytes;
     }
 
+    private int clearOrderedHolProbeTracking(int sequenceId) {
+        final int bytes = orderedHolProbeBytesByFrameSet.remove(sequenceId);
+        if (bytes > 0) {
+            orderedHolProbeBytesInFlight = Math.max(0L, orderedHolProbeBytesInFlight - bytes);
+        }
+        return bytes;
+    }
+
     private int clearAdditionalRecoveryTracking(int sequenceId) {
         final int bytes = additionalRecoveryBytesByFrameSet.remove(sequenceId);
         if (bytes > 0) {
@@ -706,8 +830,8 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     }
 
     private long totalInFlightBytes() {
-        return saturatedAdd(saturatedAdd(inFlightBytes, ptoProbeBytesInFlight),
-                additionalRecoveryBytesInFlight);
+        return saturatedAdd(saturatedAdd(saturatedAdd(inFlightBytes, ptoProbeBytesInFlight),
+                orderedHolProbeBytesInFlight), additionalRecoveryBytesInFlight);
     }
 
     private void publishPtoState(long now) {
@@ -757,8 +881,12 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     }
 
     protected FrameSet selectAdditionalRecoveryCandidate(long now, long cooldownNanos) {
+        final FrameSet directed = selectRemoteOrderedHolCandidate(
+                remoteOrderedHolFeedback(now), true, now, cooldownNanos);
+        if (directed != null) return directed;
         FrameSet oldest = null;
         FrameSet oldestOrdered = null;
+        FrameSet highestDebtOrdered = null;
         for (FrameSet frameSet : pendingFrameSets.values()) {
             if (!isAdditionalRecoveryEligible(frameSet, now, cooldownNanos)) continue;
             if (oldest == null || frameSet.getSentTime() < oldest.getSentTime()) oldest = frameSet;
@@ -766,7 +894,15 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                     && (oldestOrdered == null || frameSet.getSentTime() < oldestOrdered.getSentTime())) {
                 oldestOrdered = frameSet;
             }
+            if (frameSet.hasRetriedReliableOrderedFrame()
+                    && (highestDebtOrdered == null
+                    || frameSet.maximumRetryCount() > highestDebtOrdered.maximumRetryCount()
+                    || (frameSet.maximumRetryCount() == highestDebtOrdered.maximumRetryCount()
+                    && frameSet.getSentTime() < highestDebtOrdered.getSentTime()))) {
+                highestDebtOrdered = frameSet;
+            }
         }
+        if (highestDebtOrdered != null) return highestDebtOrdered;
         return oldestOrdered != null ? oldestOrdered : oldest;
     }
 
@@ -794,6 +930,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         }
         config.getMetrics().recoveryQueueState(depth,
                 depth == 0 ? 0L : Math.max(0L, now - oldestSent));
+        if (depth == 0) config.getMetrics().recoveryDebt(0D, -1);
     }
 
     int targetedFecChannel(int sequenceId) {

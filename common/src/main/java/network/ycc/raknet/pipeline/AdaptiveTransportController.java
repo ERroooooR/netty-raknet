@@ -305,7 +305,8 @@ final class AdaptiveTransportController {
     boolean shouldUseFec() {
         final double ratio = lossRatio();
         return config.isAdaptiveTransportEnabled() && lossType == LossType.RANDOM
-                && ratio >= 0.005D && ratio <= 0.03D;
+                && ratio >= 0.005D && ratio <= 0.03D
+                && !burstDrainActive && !queueInflated();
     }
 
     int smallWriteCoalesceMicros() {

@@ -202,6 +202,24 @@ public final class FrameSet extends AbstractReferenceCounted implements Packet {
         return false;
     }
 
+    public boolean hasRetriedReliableOrderedFrame() {
+        for (Frame frame : frames) {
+            if (frame.getReliability().isReliable && frame.getReliability().isOrdered
+                    && frame.getRetryCount() > 0) return true;
+        }
+        return false;
+    }
+
+    public boolean containsReliableOrderedFrame(int channel, int orderIndex) {
+        for (Frame frame : frames) {
+            if (frame.getReliability().isReliable && frame.getReliability().isOrdered
+                    && frame.getOrderChannel() == channel && frame.getOrderIndex() == orderIndex) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public boolean hasRetriedReliableFrame() {
         for (Frame frame : frames) {
             if (frame.getReliability().isReliable && frame.getRetryCount() > 0) return true;
