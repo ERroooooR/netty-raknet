@@ -130,6 +130,8 @@ public class RakNet {
         default void adaptiveAckPolicy(boolean protectedMode, long flushDelayNanos, long repeatDelayNanos) {}
         default void adaptiveDemand(boolean applicationLimited, String backlogState,
                                     long backlogAgeNanos, long backlogProbes) {}
+        default void adaptivePathModel(long validatedRateBytesPerSecond, boolean sampleApplicationLimited,
+                                       String resumeState, int validatedRounds) {}
         default void frameError(int delta) {}
         default void bytesIn(int delta) {}
         default void packetsOut(int delta) {}
@@ -158,6 +160,7 @@ public class RakNet {
         default void adaptiveDscp(int ipTos) {}
         default void smallWriteBatch(int frames, long delayNanos) {}
         default void pacingDelay(long delayNanos) {}
+        default void pacingScheduler(long wakeupLatenessNanos, int datagrams) {}
         default void congestionControl(String mode, long congestionWindowBytes, long inFlightBytes,
                                        long bandwidthBytesPerSecond, long ackAggregationBytes,
                                        double ecnCeRatio) {}

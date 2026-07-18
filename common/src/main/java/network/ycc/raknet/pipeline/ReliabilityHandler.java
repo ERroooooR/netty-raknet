@@ -193,6 +193,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             // Only flush on the first frame after silence — subsequent frames
             // are batched by the normal flush cycle for packet efficiency.
             final boolean wasIdle = frameQueue.isEmpty();
+            adaptive.onApplicationQueued(System.nanoTime(), frame.getRoughPacketSize());
             queueFrame(frame);
             frame.setPromise(promise);
             Constants.packetLossCheck(pendingFrameSets.size(), "unconfirmed sent packets");
@@ -400,8 +401,11 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                     onRackCleanAck();
                     ackdBytes += frameSet.getRoughSize();
                     inFlightBytes = Math.max(0, inFlightBytes - frameSet.getRoughSize());
+                    final long remainingInFlight = totalInFlightBytes();
+                    final boolean applicationLimited = frameQueue.isEmpty() && queuedBytes == 0
+                            && remainingInFlight < adaptive.congestionWindowBytes() / 2L;
                     adaptive.onAck(frameSet.getRoughSize(), System.nanoTime() - frameSet.getSentTime(),
-                            totalInFlightBytes());
+                            remainingInFlight, applicationLimited, frameSet.getSentTime());
                     adjustResendGauge(1);
                     frameSet.succeed();
                     frameSet.release();
@@ -707,6 +711,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 
         candidate.touch("Remote ordered HOL probe");
         ctx.write(candidate.retain()).addListener(RakNet.INTERNAL_WRITE_LISTENER);
+        adaptive.onPacingBatchSent(1);
         orderedHolProbeBytesByFrameSet.addTo(candidate.getSeqId(), bytes);
         orderedHolProbeBytesInFlight += bytes;
         config.getMetrics().orderedHolProbe(feedback.channel, bytes);
@@ -769,6 +774,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 
         candidate.touch("PTO probe");
         ctx.write(candidate.retain()).addListener(RakNet.INTERNAL_WRITE_LISTENER);
+        adaptive.onPacingBatchSent(1);
         ptoProbeBytesByFrameSet.addTo(candidate.getSeqId(), bytes);
         ptoProbeBytesInFlight += bytes;
         config.getMetrics().ptoProbe(bytes);
@@ -865,6 +871,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 
         candidate.touch("Application-limited recovery");
         ctx.write(candidate.retain()).addListener(RakNet.INTERNAL_WRITE_LISTENER);
+        adaptive.onPacingBatchSent(1);
         additionalRecoveryBytesByFrameSet.addTo(candidate.getSeqId(), bytes);
         additionalRecoveryBytesInFlight += bytes;
         candidate.forEachRetriedReliableIndex(index -> {
@@ -1408,9 +1415,12 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         final int maxSize = mtu - FrameSet.HEADER_SIZE - Frame.HEADER_SIZE;
         final int maxPendingFrameSets = config.getDefaultPendingFrameSets() + burstTokens;
         int pacingBudget = adaptive.sendBudget(System.nanoTime(), totalInFlightBytes(), mtu, queuedBytes);
+        int pacedDatagrams = 0;
         while (pacingBudget-- > 0 && pendingFrameSets.size() < maxPendingFrameSets && !frameQueue.isEmpty()) {
             produceFrameSet(ctx, maxSize);
+            pacedDatagrams++;
         }
+        adaptive.onPacingBatchSent(pacedDatagrams);
         adaptive.applyDscp(ctx.channel().parent());
         if (config.isAdaptiveTransportEnabled() && !frameQueue.isEmpty()
                 && pendingFrameSets.size() < maxPendingFrameSets
