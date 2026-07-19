@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
 import network.ycc.raknet.client.RakNetClient;
+import network.ycc.raknet.client.channel.RakNetClientChannel;
 import network.ycc.raknet.config.DefaultMagic;
 import network.ycc.raknet.packet.FrameSet;
 import network.ycc.raknet.packet.InvalidVersion;
@@ -17,6 +18,8 @@ import io.netty.bootstrap.ServerBootstrap;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelInboundHandlerAdapter;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.ConnectTimeoutException;
 import io.netty.channel.DefaultEventLoopGroup;
@@ -25,9 +28,11 @@ import io.netty.channel.nio.NioEventLoopGroup;
 import io.netty.channel.socket.nio.NioDatagramChannel;
 import io.netty.handler.codec.CorruptedFrameException;
 
+import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.nio.channels.UnsupportedAddressTypeException;
 import java.util.concurrent.ExecutionException;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class BehaviorTest {
     final EventLoopGroup ioGroup = new NioEventLoopGroup();
@@ -218,5 +223,31 @@ public class BehaviorTest {
         Assertions.assertThrows(CorruptedFrameException.class, () -> {
             FrameSet.read(Unpooled.wrappedBuffer(new byte[]{1, 2, 3, 4, 5, 6, 7, 8, 9}));
         });
+    }
+
+    @Test
+    public void receiveMessageTooLongBecomesPathMtuFeedback() throws Exception {
+        final RakNetClientChannel channel = new RakNetClientChannel(NioDatagramChannel.class);
+        final AtomicReference<TransportFeedbackEvent> feedback = new AtomicReference<>();
+        channel.config().setMTU(1488);
+        channel.pipeline().addLast(new ChannelInboundHandlerAdapter() {
+            @Override
+            public void userEventTriggered(ChannelHandlerContext ctx, Object evt) {
+                if (evt instanceof TransportFeedbackEvent) {
+                    feedback.set((TransportFeedbackEvent) evt);
+                }
+                ctx.fireUserEventTriggered(evt);
+            }
+        });
+
+        ioGroup.register(channel.parent()).sync();
+        channel.parent().eventLoop().submit(() -> channel.parent().pipeline().fireExceptionCaught(
+                new IOException("recvAddress(..) failed: Message too long"))).sync();
+
+        Assertions.assertNotNull(feedback.get());
+        Assertions.assertEquals(TransportFeedbackEvent.Type.PACKET_TOO_BIG, feedback.get().getType());
+        Assertions.assertEquals(1456, feedback.get().getMtu());
+        Assertions.assertTrue(channel.isOpen());
+        channel.close().sync();
     }
 }

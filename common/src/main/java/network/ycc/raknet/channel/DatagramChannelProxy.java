@@ -20,6 +20,7 @@ import io.netty.util.Attribute;
 import io.netty.util.AttributeKey;
 import io.netty.util.ReferenceCountUtil;
 import network.ycc.raknet.RakNet;
+import network.ycc.raknet.TransportFeedbackEvent;
 import network.ycc.raknet.config.DefaultConfig;
 
 import java.lang.reflect.InvocationTargetException;
@@ -263,6 +264,19 @@ public class DatagramChannelProxy implements Channel {
         return out;
     }
 
+    /**
+     * A connected UDP socket may surface an asynchronous path-MTU error from
+     * recvmsg rather than from the write promise. Convert it into transport
+     * feedback so DPLPMTUD can reduce the active payload size without treating
+     * the recoverable path event as a fatal channel exception.
+     */
+    protected boolean handleMessageTooLong(Throwable cause) {
+        if (!RakNet.isMessageTooLong(cause)) return false;
+        final int reducedMtu = Math.max(576, config.getMTU() - 32);
+        pipeline.fireUserEventTriggered(TransportFeedbackEvent.packetTooBig(reducedMtu));
+        return true;
+    }
+
     protected class Config extends DefaultConfig {
 
         protected Config() {
@@ -338,6 +352,9 @@ public class DatagramChannelProxy implements Channel {
             if (cause instanceof NoRouteToHostException) {
                 return;
             }
+            if (handleMessageTooLong(cause)) {
+                return;
+            }
             ctx.fireExceptionCaught(cause);
         }
 
@@ -388,6 +405,9 @@ public class DatagramChannelProxy implements Channel {
         @SuppressWarnings("deprecation")
         public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
             if (cause instanceof ClosedChannelException) {
+                return;
+            }
+            if (handleMessageTooLong(cause)) {
                 return;
             }
             pipeline.fireExceptionCaught(cause);

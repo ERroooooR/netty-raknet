@@ -39,6 +39,52 @@ room for extension with any plugins or custom behavior.
 * Automated flush driver
   * Recommended to write to pipeline with no flush. 
   * Flush cycles condense outbound data for best use of MTU.
+
+## Adaptive transport
+
+Protocol version 12 is preferred by default so peers can explicitly negotiate this fork's
+transport extensions. Clients automatically retry with version 11 when a server rejects v12;
+versions 9-11 remain accepted and never emit extension packets.
+
+Adaptive pacing, rolling-window loss classification, idle-boundary MTU fallback/recovery and
+PPS-aware batching are enabled by default. Configure them through Netty channel options:
+
+```java
+bootstrap.option(RakNet.ADAPTIVE_TRANSPORT, true);
+bootstrap.option(RakNet.ADAPTIVE_DSCP, false); // Shared UDP socket: disabled by default.
+bootstrap.option(RakNet.PROTOCOL_VERSION, 12); // Preferred; the client falls back to v11 on rejection.
+bootstrap.option(RakNet.ADAPTIVE_MIN_PPS, 50);
+bootstrap.option(RakNet.ADAPTIVE_MAX_PPS, 2000);
+bootstrap.option(RakNet.SMALL_WRITE_COALESCE_MICROS, 250); // 0 disables the wait window.
+bootstrap.option(RakNet.PLPMTUD_MAX_MTU, 1500); // May exceed the handshake MTU.
+```
+
+Version 12 negotiates bounded Reed-Solomon FEC. It protects adaptive groups of 8-12 FrameSets with
+one or two GF(256) parity shards, recovers up to two losses, and feeds receiver recovery outcomes
+back into the sender's redundancy budget. Peers without the Reed-Solomon feature bit retain the
+single-parity XOR format. FEC remains off during burst loss and queue congestion.
+
+The DPLPMTUD implementation follows the RFC 8899 BASE, SEARCHING, SEARCH_COMPLETE, ERROR and
+DISABLED phases, requires positive token acknowledgement, retries a candidate three times, validates
+Packet Too Big bounds, periodically reopens a completed search, and can probe above the handshake
+MTU up to `PLPMTUD_MAX_MTU`. Java/native transports can publish validated ICMP PTB and ECN-CE
+signals with `TransportFeedbackEvent`; local EMSGSIZE/message-too-long write failures are converted
+automatically. MTU changes wait for queued and in-flight frames to drain.
+
+The model congestion controller keeps a ten-second max-delivery-rate filter, minimum RTT, explicit
+bytes-in-flight and congestion window, ACK aggregation allowance, STARTUP/DRAIN/PROBE_BW/PROBE_RTT
+phases, pacing gains and ECN-CE response. This replaces packet-rate-only growth while retaining the
+configured PPS bounds as operational safety limits.
+
+Adaptive DSCP operates on the single shared server socket. It requires at least 16 connection votes,
+a 2:1 majority and a 30-second cooldown before switching between AF41 and CS0. Per-player DSCP is not
+possible with the shared-socket server architecture.
+
+`RakNet.MetricsLogger` exposes pacing and delivery rates, rolling ACK/loss samples, loss type,
+active MTU and DPLPMTUD state, FEC shards/recovery budget, congestion mode/cwnd/in-flight/bandwidth,
+ACK aggregation, ECN ratio, shared-socket DSCP changes, coalesced small writes and pacing delay.
+Implementations may leave these default methods unused; the transport does not perform blocking
+metric export on an event loop.
   
 # Usage
 

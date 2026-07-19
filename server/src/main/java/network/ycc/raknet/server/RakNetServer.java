@@ -2,6 +2,8 @@ package network.ycc.raknet.server;
 
 import network.ycc.raknet.RakNet;
 import network.ycc.raknet.pipeline.FlushTickHandler;
+import network.ycc.raknet.pipeline.LimitedFecHandler;
+import network.ycc.raknet.pipeline.PathMtuDiscoveryHandler;
 import network.ycc.raknet.pipeline.RawPacketCodec;
 import network.ycc.raknet.server.channel.RakNetServerChannel;
 import network.ycc.raknet.server.pipeline.DatagramConsumer;
@@ -33,6 +35,8 @@ public final class RakNetServer extends RakNet {
         protected void initChannel(Channel channel) {
             channel.pipeline()
                     .addLast(FlushTickHandler.NAME, new FlushTickHandler())
+                    .addLast(PathMtuDiscoveryHandler.NAME, new PathMtuDiscoveryHandler())
+                    .addLast(LimitedFecHandler.NAME, new LimitedFecHandler())
                     .addLast(RawPacketCodec.NAME, RawPacketCodec.INSTANCE)
                     .addLast(ReliableFrameHandling.INSTANCE)
                     .addLast(PacketHandling.INSTANCE)

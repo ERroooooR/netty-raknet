@@ -17,7 +17,8 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
             (byte) 0xfe, (byte) 0xfe, (byte) 0xfd, (byte) 0xfd, (byte) 0xfd, (byte) 0xfd,
             (byte) 0x12, (byte) 0x34, (byte) 0x56, (byte) 0x78});
 
-    public static final int DEFAULT_MTU = 1500;
+    // RakNet v11 implementations use 1400 to avoid fragmentation on common tunnels.
+    public static final int DEFAULT_MTU = 1400;
 
     private static final RakNet.MetricsLogger DEFAULT_METRICS = new RakNet.MetricsLogger() {};
     private static final Random rnd = new Random();
@@ -37,12 +38,20 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
     private volatile int maxQueuedBytes = 3 * 1024 * 1024;
     private volatile RakNet.Magic magic = DEFAULT_MAGIC;
     private volatile RakNet.Codec codec = DefaultCodec.INSTANCE;
-    private volatile int[] protocolVersions = new int[]{9, 10};
+    private volatile int[] protocolVersions = new int[]{9, 10, 11, 12};
     private volatile int maxConnections = 2048;
-    private volatile int protocolVersion = 9;
+    private volatile int protocolVersion = 12;
     private volatile boolean ignoreResendGauge = false;
     private volatile boolean NACKEnabled = false;
     private volatile boolean noDelay = false;
+    private volatile boolean adaptiveTransport = true;
+    private volatile boolean adaptiveDscp = false;
+    private volatile int adaptiveMinPps = 30;
+    private volatile int adaptiveMaxPps = 2000;
+    private volatile int smallWriteCoalesceMicros = 500;
+    // UDP payload ceiling for a conventional 1500-byte path. 1452 leaves
+    // room for the larger IPv6 (40-byte) plus UDP (8-byte) headers.
+    private volatile int plpmtudMaxMtu = 1452;
 
     public DefaultConfig(Channel channel) {
         super(channel);
@@ -55,7 +64,10 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
         return getOptions(
                 super.getOptions(),
                 RakNet.SERVER_ID, RakNet.CLIENT_ID, RakNet.METRICS, RakNet.MTU,
-                RakNet.RTT, RakNet.PROTOCOL_VERSION, RakNet.MAGIC, RakNet.RETRY_DELAY_NANOS);
+                RakNet.RTT, RakNet.PROTOCOL_VERSION, RakNet.MAGIC, RakNet.RETRY_DELAY_NANOS,
+                RakNet.ADAPTIVE_TRANSPORT, RakNet.ADAPTIVE_DSCP, RakNet.ADAPTIVE_MIN_PPS,
+                RakNet.ADAPTIVE_MAX_PPS, RakNet.SMALL_WRITE_COALESCE_MICROS,
+                RakNet.PLPMTUD_MAX_MTU);
     }
 
     @Override
@@ -79,6 +91,18 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
             return (T) (Long) retryDelayNanos;
         } else if (option == RakNet.MAX_CONNECTIONS) {
             return (T) (Integer) maxConnections;
+        } else if (option == RakNet.ADAPTIVE_TRANSPORT) {
+            return (T) (Boolean) adaptiveTransport;
+        } else if (option == RakNet.ADAPTIVE_DSCP) {
+            return (T) (Boolean) adaptiveDscp;
+        } else if (option == RakNet.ADAPTIVE_MIN_PPS) {
+            return (T) (Integer) adaptiveMinPps;
+        } else if (option == RakNet.ADAPTIVE_MAX_PPS) {
+            return (T) (Integer) adaptiveMaxPps;
+        } else if (option == RakNet.SMALL_WRITE_COALESCE_MICROS) {
+            return (T) (Integer) smallWriteCoalesceMicros;
+        } else if (option == RakNet.PLPMTUD_MAX_MTU) {
+            return (T) (Integer) plpmtudMaxMtu;
         }
         return super.getOption(option);
     }
@@ -104,6 +128,18 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
             retryDelayNanos = (Long) value;
         } else if (option == RakNet.MAX_CONNECTIONS) {
             maxConnections = (Integer) value;
+        } else if (option == RakNet.ADAPTIVE_TRANSPORT) {
+            adaptiveTransport = (Boolean) value;
+        } else if (option == RakNet.ADAPTIVE_DSCP) {
+            adaptiveDscp = (Boolean) value;
+        } else if (option == RakNet.ADAPTIVE_MIN_PPS) {
+            setAdaptiveMinPps((Integer) value);
+        } else if (option == RakNet.ADAPTIVE_MAX_PPS) {
+            setAdaptiveMaxPps((Integer) value);
+        } else if (option == RakNet.SMALL_WRITE_COALESCE_MICROS) {
+            setSmallWriteCoalesceMicros((Integer) value);
+        } else if (option == RakNet.PLPMTUD_MAX_MTU) {
+            setPlpmtudMaxMtu((Integer) value);
         } else {
             return super.setOption(option, value);
         }
@@ -283,5 +319,53 @@ public class DefaultConfig extends DefaultChannelConfig implements RakNet.Config
     @Override
     public void setNoDelayEnabled(boolean value) {
         this.noDelay = value;
+    }
+
+    @Override
+    public boolean isAdaptiveTransportEnabled() { return adaptiveTransport; }
+
+    @Override
+    public void setAdaptiveTransportEnabled(boolean value) { adaptiveTransport = value; }
+
+    @Override
+    public boolean isAdaptiveDscpEnabled() { return adaptiveDscp; }
+
+    @Override
+    public void setAdaptiveDscpEnabled(boolean value) { adaptiveDscp = value; }
+
+    @Override
+    public int getAdaptiveMinPps() { return adaptiveMinPps; }
+
+    @Override
+    public void setAdaptiveMinPps(int value) {
+        if (value < 1) throw new IllegalArgumentException("adaptive minimum PPS must be positive");
+        adaptiveMinPps = value;
+    }
+
+    @Override
+    public int getAdaptiveMaxPps() { return adaptiveMaxPps; }
+
+    @Override
+    public void setAdaptiveMaxPps(int value) {
+        if (value < 1) throw new IllegalArgumentException("adaptive maximum PPS must be positive");
+        adaptiveMaxPps = value;
+    }
+
+    @Override
+    public int getSmallWriteCoalesceMicros() { return smallWriteCoalesceMicros; }
+
+    @Override
+    public void setSmallWriteCoalesceMicros(int value) {
+        if (value < 0 || value > 100_000) throw new IllegalArgumentException("small-write coalescing must be 0..100000 microseconds");
+        smallWriteCoalesceMicros = value;
+    }
+
+    @Override
+    public int getPlpmtudMaxMtu() { return plpmtudMaxMtu; }
+
+    @Override
+    public void setPlpmtudMaxMtu(int value) {
+        if (value < 576 || value > 65_507) throw new IllegalArgumentException("PLPMTUD maximum MTU must be 576..65507");
+        plpmtudMaxMtu = value;
     }
 }

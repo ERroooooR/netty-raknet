@@ -6,6 +6,8 @@ import network.ycc.raknet.client.channel.RakNetClientChannel;
 import network.ycc.raknet.client.channel.RakNetClientThreadedChannel;
 import network.ycc.raknet.client.pipeline.ConnectionInitializer;
 import network.ycc.raknet.pipeline.FlushTickHandler;
+import network.ycc.raknet.pipeline.LimitedFecHandler;
+import network.ycc.raknet.pipeline.PathMtuDiscoveryHandler;
 import network.ycc.raknet.pipeline.RawPacketCodec;
 
 import io.netty.channel.ChannelInboundHandlerAdapter;
@@ -22,6 +24,8 @@ public class RakNetClient extends RakNet {
         protected void initChannel(Channel channel) {
             channel.pipeline()
                     .addLast(FlushTickHandler.NAME, new FlushTickHandler())
+                    .addLast(PathMtuDiscoveryHandler.NAME, new PathMtuDiscoveryHandler())
+                    .addLast(LimitedFecHandler.NAME, new LimitedFecHandler())
                     .addLast(RawPacketCodec.NAME, RawPacketCodec.INSTANCE)
                     .addLast(ReliableFrameHandling.INSTANCE)
                     .addLast(PacketHandling.INSTANCE)
