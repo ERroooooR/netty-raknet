@@ -28,7 +28,9 @@ import network.ycc.raknet.utils.UINT;
 import java.util.ArrayList;
 import java.util.PriorityQueue;
 import java.util.concurrent.TimeUnit;
-import java.util.function.IntConsumer;
+
+import static network.ycc.raknet.utils.SaturatedMath.add;
+import static network.ycc.raknet.utils.SaturatedMath.multiply;
 
 /**
  * This handler handles the bulk of reliable (framed) transport.
@@ -68,8 +70,13 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     protected AdaptiveTransportController adaptive;
     protected boolean pacingScheduled;
     protected boolean coalesceScheduled;
+    protected boolean productionScheduled;
+    protected boolean removed;
     protected int coalescedFrames;
     protected long coalesceStartedNanos;
+    protected ScheduledFuture<?> pacingFuture;
+    protected ScheduledFuture<?> coalesceFuture;
+    protected ScheduledFuture<?> ackFlushFuture;
     protected ScheduledFuture<?> deferredNackFuture;
     protected long deferredNackDeadlineNanos = Long.MAX_VALUE;
     protected ScheduledFuture<?> nackRepeatFuture;
@@ -96,20 +103,11 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     // Item 3: track when first ACK was queued for time-based flush
     protected long firstAckNanos = 0;
     private static final long ACK_FLUSH_DELAY_NANOS = 2_000_000; // 2ms
-    private static final long MIN_ACK_REPEAT_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(5);
-    private static final long MAX_ACK_REPEAT_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(20);
-    private static final long MIN_ACK_PROTECTION_NANOS = TimeUnit.SECONDS.toNanos(2);
-    private static final int ACK_PROTECTION_DUPLICATE_THRESHOLD = 3;
-    private static final long ACK_PROTECTION_TRIGGER_WINDOW_NANOS = TimeUnit.SECONDS.toNanos(1);
     private static final long MIN_NACK_REORDER_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(4);
     private static final long MAX_NACK_REORDER_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(25);
     private static final long MIN_NACK_REPEAT_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(5);
     private static final long MAX_NACK_REPEAT_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(20);
     private static final int MAX_DEFERRED_NACK_GAP = 2;
-    private static final int NACK_GRACE_OUTCOME_WINDOW = 32;
-    private static final int NACK_GRACE_MIN_OUTCOMES = 8;
-    private static final int NACK_GRACE_BYPASS_PERCENT = 88;
-    private static final long MIN_NACK_GRACE_BYPASS_NANOS = TimeUnit.SECONDS.toNanos(2);
     private static final long RACK_TIMER_GRANULARITY_NANOS = TimeUnit.MILLISECONDS.toNanos(1);
     private static final int RACK_BASE_REORDERING_MULTIPLIER_EIGHTHS = 10; // 1.25 RTT
     private static final int RACK_MAX_REORDERING_MULTIPLIER_EIGHTHS = 16; // 2 RTT
@@ -140,17 +138,13 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     // Item 7: guard against recursive flush from recallFrameSet
     protected boolean flushing = false;
 
-    protected Runnable frameSetProduction = () -> {
-        this.produceFrameSets(ctx);
-        ctx.flush();
-    };
-
     public void onNegotiatedMtu(int mtu) {
         if (adaptive != null) adaptive.onNegotiatedMtu(mtu);
     }
 
     @Override
     public void handlerAdded(ChannelHandlerContext ctx) {
+        removed = false;
         config = RakNet.config(ctx);
         this.ctx = ctx;
         this.adaptive = new AdaptiveTransportController(config);
@@ -167,13 +161,17 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) {
+        removed = true;
+        cancelTransportTasks();
         cancelDeferredNackTask();
         cancelNackRepeatTask();
         cancelAckRepeatTask();
         cancelRackLossTask();
         cancelPtoTask();
         deferredNacks.clear();
+        nackSet.clear();
         nackRepeatSet.clear();
+        ackSet.clear();
         ackRepeatSet.clear();
         rackRetiredFrameSets.clear();
         ptoProbeBytesByFrameSet.clear();
@@ -182,6 +180,8 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         additionalRecoveryLastSent.clear();
         additionallyRecoveredThisPeriod.clear();
         targetedFecChannelsByFrameSet.clear();
+        firstAckNanos = 0L;
+        coalescedFrames = 0;
         clearQueue(null);
     }
 
@@ -204,9 +204,10 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 coalesceScheduled = true;
                 coalescedFrames = 1;
                 coalesceStartedNanos = System.nanoTime();
-                ctx.executor().schedule(() -> {
+                coalesceFuture = ctx.executor().schedule(() -> {
+                    coalesceFuture = null;
                     coalesceScheduled = false;
-                    if (ctx.channel().isOpen() && !frameQueue.isEmpty()) {
+                    if (!removed && ctx.channel().isOpen() && !frameQueue.isEmpty()) {
                         config.getMetrics().smallWriteBatch(coalescedFrames,
                                 System.nanoTime() - coalesceStartedNanos);
                         flush(ctx);
@@ -308,13 +309,18 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
 
     protected void readFrameSet(ChannelHandlerContext ctx, FrameSet frameSet) {
         final int packetSeqId = frameSet.getSeqId();
+        final int forwardDistance = UINT.B3.minusWrap(packetSeqId, lastReceivedSeqId);
+        if (config.isNACKEnabled() && forwardDistance > 0) {
+            Constants.packetLossCheck(forwardDistance - 1, "incoming sequence gap");
+        }
         // Item 3: track first ACK time for time-based flush trigger
         if (ackSet.isEmpty()) {
             firstAckNanos = System.nanoTime();
             // Schedule guaranteed ACK flush so low-traffic connections
             // don't wait until the 50ms flush tick or next FrameSet arrival.
-            ctx.channel().eventLoop().schedule(() -> {
-                trySendResponses(ctx);
+            ackFlushFuture = ctx.channel().eventLoop().schedule(() -> {
+                ackFlushFuture = null;
+                if (!removed && ctx.channel().isOpen()) trySendResponses(ctx);
             }, ACK_FLUSH_DELAY_NANOS + 500_000L, TimeUnit.NANOSECONDS);
         }
         ackSet.add(packetSeqId);
@@ -327,8 +333,8 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 adaptiveNackGrace.onReordered(System.nanoTime());
             }
         }
-        if (UINT.B3.minusWrap(packetSeqId, lastReceivedSeqId) > 0) {
-            final int missingCount = UINT.B3.minusWrap(packetSeqId, lastReceivedSeqId) - 1;
+        if (forwardDistance > 0) {
+            final int missingCount = forwardDistance - 1;
             final long now = System.nanoTime();
             final boolean graceEligible = config.isNACKEnabled() && shouldDeferNackGap(missingCount);
             final boolean deferGap = graceEligible && (!ADAPTIVE_NACK_GRACE_ENABLED
@@ -337,16 +343,18 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             if (config.isNACKEnabled() && missingCount > MAX_DEFERRED_NACK_GAP) {
                 confirmDeferredNacks();
             }
-            lastReceivedSeqId = UINT.B3.plus(lastReceivedSeqId, 1);
-            while (lastReceivedSeqId != packetSeqId) { //nack any missed packets before this one
-                if (config.isNACKEnabled()) {
+            if (!config.isNACKEnabled()) {
+                lastReceivedSeqId = packetSeqId;
+            } else {
+                lastReceivedSeqId = UINT.B3.plus(lastReceivedSeqId, 1);
+                while (lastReceivedSeqId != packetSeqId) { //nack any missed packets before this one
                     if (deferGap) deferNack(ctx, lastReceivedSeqId);
                     else {
                         nackSet.add(lastReceivedSeqId);
                         if (bypassGrace) config.getMetrics().nackGraceBypassed(1);
                     }
+                    lastReceivedSeqId = UINT.B3.plus(lastReceivedSeqId, 1);
                 }
-                lastReceivedSeqId = UINT.B3.plus(lastReceivedSeqId, 1);
             }
         }
         config.getMetrics().packetsIn(1);
@@ -381,6 +389,8 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         boolean ackProgress = false;
         final long now = System.nanoTime();
         for (Reliability.REntry entry : ack.getEntries()) {
+            nIterations += entry.size();
+            Constants.packetLossCheck(nIterations, "ack confirm ranges");
             final int max = UINT.B3.plus(entry.idFinish, 1);
             for (int id = entry.idStart; id != max; id = UINT.B3.plus(id, 1)) {
                 final FrameSet frameSet = pendingFrameSets.remove(id);
@@ -415,7 +425,6 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                     config.getMetrics().rackSpuriousAck(1);
                     onRackSpuriousAck();
                 }
-                Constants.packetLossCheck(nIterations++, "ack confirm range");
             }
         }
         config.getMetrics().bytesACKd(ackdBytes);
@@ -441,6 +450,8 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         int bytesNACKd = 0;
         int nIterations = 0;
         for (Reliability.REntry entry : nack.getEntries()) {
+            nIterations += entry.size();
+            Constants.packetLossCheck(nIterations, "nack confirm ranges");
             final int max = UINT.B3.plus(entry.idFinish, 1);
             for (int id = entry.idStart; id != max; id = UINT.B3.plus(id, 1)) {
                 final FrameSet frameSet = pendingFrameSets.remove(id);
@@ -454,7 +465,6 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                     adaptive.onLoss(frameSet.getRoughSize(), false);
                     recallFrameSet(frameSet);
                 }
-                Constants.packetLossCheck(nIterations++, "nack confirm range");
             }
         }
         config.getMetrics().bytesNACKd(bytesNACKd);
@@ -515,6 +525,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
             }
             ackSet.clear();
             firstAckNanos = 0;
+            cancelAckFlushTask();
         }
         if (config.isNACKEnabled() && !nackSet.isEmpty() && config.isAutoRead()) { //only nack if we can read
             ctx.write(new Reliability.NACK(nackSet)).addListener(RakNet.INTERNAL_WRITE_LISTENER);
@@ -573,7 +584,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         final int multiplier = Math.max(RACK_BASE_REORDERING_MULTIPLIER_EIGHTHS,
                 Math.min(RACK_MAX_REORDERING_MULTIPLIER_EIGHTHS, multiplierEighths));
         return Math.max(RACK_TIMER_GRANULARITY_NANOS,
-                saturatedMultiply(rtt, multiplier) / 8L);
+                multiply(rtt, multiplier) / 8L);
     }
 
     /**
@@ -596,7 +607,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         while (iterator.hasNext()) {
             final FrameSet frameSet = iterator.next();
             if (frameSet.getSentTime() >= latestAckedSentTimeNanos) continue;
-            final long deadline = saturatedAdd(frameSet.getSentTime(), reorderingWindow);
+            final long deadline = add(frameSet.getSentTime(), reorderingWindow);
             if (now >= deadline) {
                 iterator.remove();
                 targetedFecChannelsByFrameSet.remove(frameSet.getSeqId());
@@ -606,9 +617,9 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 inFlightBytes = Math.max(0L, inFlightBytes - frameSet.getRoughSize());
                 adaptive.onLoss(frameSet.getRoughSize(), false);
                 config.getMetrics().rackRetransmit(frameSet.getRoughSize());
-                rackRetiredFrameSets.put(frameSet.getSeqId(), saturatedAdd(now,
+                rackRetiredFrameSets.put(frameSet.getSeqId(), add(now,
                         Math.max(MIN_RACK_RETIRED_RETENTION_NANOS,
-                                saturatedMultiply(Math.max(1L, config.getRTTNanos()), 4L))));
+                                multiply(Math.max(1L, config.getRTTNanos()), 4L))));
                 lost.add(frameSet);
             } else {
                 nextDeadline = Math.min(nextDeadline, deadline);
@@ -624,11 +635,11 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     static long ptoTimeoutNanos(long rttNanos, long rttStdDevNanos,
                                 long retryDelayNanos, int ptoCount) {
         final long rtt = Math.max(1L, rttNanos);
-        final long variation = saturatedMultiply(Math.max(0L, rttStdDevNanos), 4L);
-        final long base = saturatedAdd(saturatedAdd(rtt,
+        final long variation = multiply(Math.max(0L, rttStdDevNanos), 4L);
+        final long base = add(add(rtt,
                 Math.max(PTO_TIMER_GRANULARITY_NANOS, variation)),
                 Math.max(0L, retryDelayNanos));
-        return saturatedMultiply(Math.max(PTO_TIMER_GRANULARITY_NANOS, base),
+        return multiply(Math.max(PTO_TIMER_GRANULARITY_NANOS, base),
                 1L << Math.min(Math.max(0, ptoCount), MAX_PTO_BACKOFF_EXPONENT));
     }
 
@@ -647,7 +658,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         }
         final long anchor = Math.max(candidate.getSentTime(),
                 Math.max(lastAckProgressNanos, lastPtoProbeSentNanos));
-        final long deadline = saturatedAdd(anchor, ptoTimeoutNanos(
+        final long deadline = add(anchor, ptoTimeoutNanos(
                 config.getRTTNanos(), config.getRTTStdDevNanos(),
                 config.getRetryDelayNanos(), ptoCount));
         if (deadline <= now) sendPtoProbe(now);
@@ -695,7 +706,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         if (feedback == null) return;
         final long rtt = Math.max(PTO_TIMER_GRANULARITY_NANOS, config.getRTTNanos());
         if (feedback.ageNanos < Math.max(MIN_ORDERED_HOL_PROBE_AGE_NANOS,
-                saturatedMultiply(rtt, 2L))) return;
+                multiply(rtt, 2L))) return;
         final boolean sameTarget = feedback.channel == lastOrderedHolProbeChannel
                 && feedback.blockedOrderIndex == lastOrderedHolProbeOrderIndex;
         final long interval = Math.max(MIN_ORDERED_HOL_PROBE_INTERVAL_NANOS, rtt);
@@ -767,7 +778,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         if (candidate == null || ctx == null || !ctx.channel().isOpen()) return;
         final int bytes = candidate.getRoughSize();
         if (adaptive.sendBudget(now, totalInFlightBytes(), bytes, queuedBytes) <= 0) {
-            schedulePto(saturatedAdd(now, Math.max(PTO_TIMER_GRANULARITY_NANOS,
+            schedulePto(add(now, Math.max(PTO_TIMER_GRANULARITY_NANOS,
                     adaptive.nanosUntilSend(now))));
             return;
         }
@@ -836,7 +847,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
     }
 
     private long totalInFlightBytes() {
-        return saturatedAdd(saturatedAdd(saturatedAdd(inFlightBytes, ptoProbeBytesInFlight),
+        return add(add(add(inFlightBytes, ptoProbeBytesInFlight),
                 orderedHolProbeBytesInFlight), additionalRecoveryBytesInFlight);
     }
 
@@ -982,7 +993,7 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         for (FrameSet frameSet : pendingFrameSets.values()) {
             if (frameSet.getSentTime() < latestAckedSentTimeNanos) {
                 nextDeadline = Math.min(nextDeadline,
-                        saturatedAdd(frameSet.getSentTime(), reorderingWindow));
+                        add(frameSet.getSentTime(), reorderingWindow));
             }
         }
         if (nextDeadline == Long.MAX_VALUE) cancelRackLossTask();
@@ -1031,14 +1042,6 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         }
     }
 
-    private static long saturatedAdd(long a, long b) {
-        return a > Long.MAX_VALUE - b ? Long.MAX_VALUE : a + b;
-    }
-
-    private static long saturatedMultiply(long value, long multiplier) {
-        return value > Long.MAX_VALUE / multiplier ? Long.MAX_VALUE : value * multiplier;
-    }
-
     static long retransmissionTimeoutNanos(long rttNanos, long rttStdDevNanos,
                                            long retryDelayNanos, int retryCount) {
         final long rtt = Math.max(1, rttNanos);
@@ -1047,11 +1050,10 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
         // NACKs provide fast recovery for observed gaps, so the timeout is a
         // conservative fallback. A two-RTT floor prevents delayed ACKs and
         // ordinary Internet jitter from creating duplicate reliable frames.
-        final long jitterTimeout = saturatedAdd(saturatedAdd(rtt,
-                saturatedMultiply(deviation, 4)), delay);
-        final long roundTripFloor = saturatedAdd(saturatedMultiply(rtt, 2), delay);
+        final long jitterTimeout = add(add(rtt, multiply(deviation, 4)), delay);
+        final long roundTripFloor = add(multiply(rtt, 2), delay);
         final long base = Math.max(jitterTimeout, roundTripFloor);
-        return saturatedMultiply(base, 1L << Math.min(Math.max(0, retryCount), 3));
+        return multiply(base, 1L << Math.min(Math.max(0, retryCount), 3));
     }
 
     static boolean shouldDeferNackGap(int missingCount) {
@@ -1206,159 +1208,6 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 ackProtection ? adaptiveAckProtection.repeatDelayNanos(config.getRTTNanos()) : 0L);
     }
 
-    static final class DeferredNackTracker {
-        private final Int2LongOpenHashMap deadlines = new Int2LongOpenHashMap();
-
-        boolean defer(int sequenceId, long deadlineNanos) {
-            if (deadlines.containsKey(sequenceId)) return false;
-            deadlines.put(sequenceId, deadlineNanos);
-            return true;
-        }
-
-        boolean cancel(int sequenceId) {
-            return deadlines.remove(sequenceId) != 0L;
-        }
-
-        long drainDue(long nowNanos, IntConsumer consumer) {
-            long nextDeadline = Long.MAX_VALUE;
-            final ObjectIterator<Int2LongMap.Entry> iterator = deadlines.int2LongEntrySet().fastIterator();
-            while (iterator.hasNext()) {
-                final Int2LongMap.Entry entry = iterator.next();
-                if (entry.getLongValue() <= nowNanos) {
-                    consumer.accept(entry.getIntKey());
-                    iterator.remove();
-                } else {
-                    nextDeadline = Math.min(nextDeadline, entry.getLongValue());
-                }
-            }
-            return nextDeadline == Long.MAX_VALUE ? -1L : Math.max(0L, nextDeadline - nowNanos);
-        }
-
-        void drainAll(IntConsumer consumer) {
-            final ObjectIterator<Int2LongMap.Entry> iterator = deadlines.int2LongEntrySet().fastIterator();
-            while (iterator.hasNext()) {
-                consumer.accept(iterator.next().getIntKey());
-                iterator.remove();
-            }
-        }
-
-        void clear() {
-            deadlines.clear();
-        }
-    }
-
-    static final class AdaptiveNackGrace {
-        private long lossOutcomes;
-        private int outcomeCount;
-        private int outcomeIndex;
-        private int lossCount;
-        private boolean bypass;
-        private boolean probePending;
-        private long bypassUntilNanos;
-
-        boolean shouldDefer(long nowNanos) {
-            if (!bypass) return true;
-            if (probePending || nowNanos < bypassUntilNanos) return false;
-            probePending = true;
-            return true;
-        }
-
-        void onLost(long nowNanos, long rttNanos) {
-            if (probePending) {
-                probePending = false;
-                enterBypass(nowNanos, rttNanos);
-                return;
-            }
-            recordOutcome(true);
-            if (outcomeCount >= NACK_GRACE_MIN_OUTCOMES
-                    && lossCount * 100 >= outcomeCount * NACK_GRACE_BYPASS_PERCENT) {
-                enterBypass(nowNanos, rttNanos);
-            }
-        }
-
-        void onReordered(long nowNanos) {
-            if (probePending) {
-                probePending = false;
-                bypass = false;
-                bypassUntilNanos = 0L;
-                clearOutcomes();
-            }
-            recordOutcome(false);
-        }
-
-        boolean isBypassing(long nowNanos) {
-            return bypass && (probePending || nowNanos < bypassUntilNanos);
-        }
-
-        private void enterBypass(long nowNanos, long rttNanos) {
-            bypass = true;
-            final long pathCooldown = saturatedMultiply(Math.max(0L, rttNanos), 16L);
-            bypassUntilNanos = saturatedAdd(nowNanos,
-                    Math.max(MIN_NACK_GRACE_BYPASS_NANOS, pathCooldown));
-        }
-
-        private void recordOutcome(boolean lost) {
-            final long bit = 1L << outcomeIndex;
-            if (outcomeCount == NACK_GRACE_OUTCOME_WINDOW) {
-                if ((lossOutcomes & bit) != 0L) lossCount--;
-            } else {
-                outcomeCount++;
-            }
-            if (lost) {
-                lossOutcomes |= bit;
-                lossCount++;
-            } else {
-                lossOutcomes &= ~bit;
-            }
-            outcomeIndex = (outcomeIndex + 1) % NACK_GRACE_OUTCOME_WINDOW;
-        }
-
-        private void clearOutcomes() {
-            lossOutcomes = 0L;
-            outcomeCount = 0;
-            outcomeIndex = 0;
-            lossCount = 0;
-        }
-    }
-
-    static final class AdaptiveAckProtection {
-        private int duplicateScore;
-        private long triggerWindowStartedNanos;
-        private long protectedUntilNanos;
-
-        void onDuplicateFrameSet(long nowNanos, long rttNanos) {
-            if (isActive(nowNanos)) {
-                extendProtection(nowNanos, rttNanos);
-                return;
-            }
-            if (triggerWindowStartedNanos == 0L
-                    || nowNanos - triggerWindowStartedNanos > ACK_PROTECTION_TRIGGER_WINDOW_NANOS) {
-                triggerWindowStartedNanos = nowNanos;
-                duplicateScore = 0;
-            }
-            duplicateScore++;
-            if (duplicateScore >= ACK_PROTECTION_DUPLICATE_THRESHOLD) {
-                extendProtection(nowNanos, rttNanos);
-            }
-        }
-
-        boolean isActive(long nowNanos) {
-            return nowNanos < protectedUntilNanos;
-        }
-
-        long repeatDelayNanos(long rttNanos) {
-            final long candidate = Math.max(0L, rttNanos) / 8L;
-            return Math.max(MIN_ACK_REPEAT_DELAY_NANOS,
-                    Math.min(MAX_ACK_REPEAT_DELAY_NANOS, candidate));
-        }
-
-        private void extendProtection(long nowNanos, long rttNanos) {
-            final long pathProtection = saturatedMultiply(Math.max(0L, rttNanos), 8L);
-            protectedUntilNanos = saturatedAdd(nowNanos,
-                    Math.max(MIN_ACK_PROTECTION_NANOS, pathProtection));
-        }
-    }
-
     protected void produceFrameSet(ChannelHandlerContext ctx, int maxSize) {
         if (frameQueue.isEmpty()) return;
         final FrameSet frameSet = FrameSet.create();
@@ -1427,16 +1276,40 @@ public class ReliabilityHandler extends ChannelDuplexHandler {
                 && !adaptive.congestionWindowBlocked(totalInFlightBytes(), mtu)
                 && !pacingScheduled) {
             pacingScheduled = true;
-            ctx.executor().schedule(() -> {
+            pacingFuture = ctx.executor().schedule(() -> {
+                pacingFuture = null;
                 pacingScheduled = false;
-                if (ctx.channel().isOpen()) flush(ctx);
+                if (!removed && ctx.channel().isOpen()) flush(ctx);
             }, adaptive.nanosUntilSend(System.nanoTime()), TimeUnit.NANOSECONDS);
         }
         if (frameQueue.isEmpty()) updateApplicationLimitedRecovery(System.nanoTime());
     }
 
     protected void tryProduceFrameSets() {
-        ctx.executor().execute(frameSetProduction);
+        if (removed || productionScheduled || ctx == null) return;
+        productionScheduled = true;
+        ctx.executor().execute(() -> {
+            productionScheduled = false;
+            if (removed || !ctx.channel().isOpen()) return;
+            produceFrameSets(ctx);
+            ctx.flush();
+        });
+    }
+
+    private void cancelTransportTasks() {
+        cancelAckFlushTask();
+        if (coalesceFuture != null) coalesceFuture.cancel(false);
+        coalesceFuture = null;
+        coalesceScheduled = false;
+        if (pacingFuture != null) pacingFuture.cancel(false);
+        pacingFuture = null;
+        pacingScheduled = false;
+        productionScheduled = false;
+    }
+
+    private void cancelAckFlushTask() {
+        if (ackFlushFuture != null) ackFlushFuture.cancel(false);
+        ackFlushFuture = null;
     }
 
     //TODO: instead of immediate recall, mark framesets as 'recalled', and flush at flush cycle

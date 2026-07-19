@@ -35,10 +35,9 @@ public class DisconnectHandler extends ChannelDuplexHandler {
         if (ctx.channel().isActive()) {
             final ChannelPromise disconnectPromise = ctx.newPromise();
             final ScheduledFuture<?> timeout = ctx.channel().eventLoop().schedule(
-                    () -> {
-                        disconnectPromise.trySuccess();
-                        throw new SocketTimeoutException();
-                    }, DISCONNECT_TIMEOUT_SECS, TimeUnit.SECONDS);
+                    () -> disconnectPromise.tryFailure(
+                            new SocketTimeoutException("RakNet disconnect acknowledgement timed out")),
+                    DISCONNECT_TIMEOUT_SECS, TimeUnit.SECONDS);
             ctx.channel().writeAndFlush(new Disconnect())
                     .addListener(f -> disconnectPromise.trySuccess());
             disconnectPromise.addListener(f -> {

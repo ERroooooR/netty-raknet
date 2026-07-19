@@ -3,16 +3,16 @@ package network.ycc.raknet.pipeline;
 import network.ycc.raknet.RakNet;
 import network.ycc.raknet.packet.ConnectionFailed;
 import network.ycc.raknet.packet.Packet;
-import network.ycc.raknet.packet.Ping;
 
 import io.netty.channel.Channel;
-import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelPromise;
 import io.netty.channel.ConnectTimeoutException;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.util.concurrent.ScheduledFuture;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.TimeUnit;
 
 public abstract class AbstractConnectionInitializer extends SimpleChannelInboundHandler<Packet> {
@@ -22,6 +22,7 @@ public abstract class AbstractConnectionInitializer extends SimpleChannelInbound
     protected State state = State.CR1;
     protected ScheduledFuture<?> sendTimer = null;
     protected ScheduledFuture<?> connectTimer = null;
+    protected final List<ScheduledFuture<?>> burstTimers = new ArrayList<>(BURST_COUNT);
     protected int retryCount = 0;
 
     private static final int BURST_COUNT = 2;
@@ -50,9 +51,14 @@ public abstract class AbstractConnectionInitializer extends SimpleChannelInbound
     protected void adjustRetryInterval(ChannelHandlerContext ctx) {
         if (retryCount < BURST_COUNT) {
             retryCount++;
-            ctx.channel().eventLoop().schedule(
-                    () -> sendRequest(ctx),
-                    BURST_DELAY_MS, TimeUnit.MILLISECONDS);
+            final ScheduledFuture<?>[] holder = new ScheduledFuture<?>[1];
+            holder[0] = ctx.channel().eventLoop().schedule(() -> {
+                burstTimers.remove(holder[0]);
+                if (ctx.pipeline().context(this) != null && ctx.channel().isOpen()) {
+                    sendRequest(ctx);
+                }
+            }, BURST_DELAY_MS, TimeUnit.MILLISECONDS);
+            burstTimers.add(holder[0]);
         }
     }
 
@@ -62,8 +68,12 @@ public abstract class AbstractConnectionInitializer extends SimpleChannelInbound
 
     @Override
     public void handlerRemoved(ChannelHandlerContext ctx) {
-        sendTimer.cancel(false);
-        connectTimer.cancel(false);
+        if (sendTimer != null) sendTimer.cancel(false);
+        if (connectTimer != null) connectTimer.cancel(false);
+        for (ScheduledFuture<?> timer : burstTimers) timer.cancel(false);
+        burstTimers.clear();
+        sendTimer = null;
+        connectTimer = null;
     }
 
     @Override

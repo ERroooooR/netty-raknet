@@ -308,7 +308,9 @@ public class AdaptiveTransportControllerTest {
         final Field bandwidth = AdaptiveTransportController.class.getDeclaredField("bandwidthFilter");
         bandwidth.setAccessible(true);
         Arrays.fill((long[]) bandwidth.get(controller), 1024L * 1024L);
-        setLong(controller, "bucketStarted", System.nanoTime() - 30_000_000_000L);
+        final Field lossWindow = AdaptiveTransportController.class.getDeclaredField("lossWindow");
+        lossWindow.setAccessible(true);
+        setLong(lossWindow.get(controller), "bucketStarted", System.nanoTime() - 30_000_000_000L);
 
         controller.onAck(1200, 40_000_000L, 0, true, Long.MIN_VALUE);
 

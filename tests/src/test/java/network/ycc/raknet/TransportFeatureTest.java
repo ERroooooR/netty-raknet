@@ -11,6 +11,17 @@ import java.net.InetSocketAddress;
 
 public class TransportFeatureTest {
     @Test
+    public void negotiationRemovesUnrequestedAndOrphanedCapabilities() {
+        final long peer = TransportFeatures.FEC | TransportFeatures.REED_SOLOMON_FEC
+                | TransportFeatures.PLPMTUD | TransportFeatures.DPLPMTUD_STATE_MACHINE;
+        Assertions.assertEquals(TransportFeatures.FEC,
+                TransportFeatures.negotiate(TransportFeatures.FEC, peer));
+        Assertions.assertEquals(0L, TransportFeatures.negotiate(
+                TransportFeatures.REED_SOLOMON_FEC | TransportFeatures.DPLPMTUD_STATE_MACHINE,
+                peer));
+    }
+
+    @Test
     public void connectionRequestNegotiatesFeaturesWithoutChangingLegacyEncoding() {
         final ByteBuf legacy = Unpooled.buffer();
         new ConnectionRequest(42).encode(legacy);

@@ -13,7 +13,10 @@ import io.netty.util.concurrent.ScheduledFuture;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+
+import static network.ycc.raknet.utils.SaturatedMath.multiply;
 
 import it.unimi.dsi.fastutil.ints.Int2ObjectOpenHashMap;
 import it.unimi.dsi.fastutil.ints.Int2LongOpenHashMap;
@@ -23,6 +26,8 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
     public static final String NAME = "rn-order-in";
 
     protected final OrderedChannelPacketQueue[] channels = new OrderedChannelPacketQueue[8];
+    private static final long METRICS_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(100);
+    private long lastMetricsNanos;
 
     public FrameOrderIn() {
         for (int i = 0; i < channels.length; i++) {
@@ -34,7 +39,7 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
     public void handlerRemoved(ChannelHandlerContext ctx) throws Exception {
         super.handlerRemoved(ctx);
         Arrays.stream(channels).forEach(OrderedChannelPacketQueue::clear);
-        publishMetrics(ctx);
+        publishMetrics(ctx, true);
     }
 
     protected void decode(ChannelHandlerContext ctx, Frame frame, List<Object> list) {
@@ -54,6 +59,18 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
 
     private void publishMetrics(ChannelHandlerContext ctx) {
         final long now = System.nanoTime();
+        if (now - lastMetricsNanos < METRICS_INTERVAL_NANOS) return;
+        publishMetrics(ctx, now);
+    }
+
+    private void publishMetrics(ChannelHandlerContext ctx, boolean force) {
+        final long now = System.nanoTime();
+        if (!force && now - lastMetricsNanos < METRICS_INTERVAL_NANOS) return;
+        publishMetrics(ctx, now);
+    }
+
+    private void publishMetrics(ChannelHandlerContext ctx, long now) {
+        lastMetricsNanos = now;
         int pending = 0;
         long oldestQueuedAt = now;
         for (OrderedChannelPacketQueue channel : channels) {
@@ -100,9 +117,9 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
                 lastSequenceIndex = frame.getSequenceIndex();
                 //remove earlier packets from queue
                 while (UINT.B3.minusWrap(frame.getOrderIndex(), lastOrderIndex) > 1) {
+                    lastOrderIndex = UINT.B3.plus(lastOrderIndex, 1);
                     ReferenceCountUtil.release(queue.remove(lastOrderIndex));
                     queuedAt.remove(lastOrderIndex);
-                    lastOrderIndex = UINT.B3.plus(lastOrderIndex, 1);
                 }
             }
             decodeOrdered(frame, list, rttNanos); //register packet as normal
@@ -144,7 +161,7 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
                     gapStartNanos = System.nanoTime();
                     gapIsSkippable = true;
                     if (ctx != null) {
-                        final long delay = Math.max(1_000_000L, saturatedMultiply(
+                        final long delay = Math.max(1_000_000L, multiply(
                                 Math.max(1L, rttNanos), Math.max(1L, GAP_TIMEOUT_MULTIPLIER)));
                         gapTask = ctx.executor().schedule(() -> flushGap(ctx), delay, java.util.concurrent.TimeUnit.NANOSECONDS);
                     }
@@ -155,7 +172,8 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
                 queue.put(frame.getOrderIndex(), frame.retainedFrameData());
                 queuedAt.put(frame.getOrderIndex(), System.nanoTime());
                 if (isUnreliable && gapStartNanos > 0) {
-                    final long gapTimeoutNanos = rttNanos * GAP_TIMEOUT_MULTIPLIER;
+                    final long gapTimeoutNanos = multiply(
+                            Math.max(1L, rttNanos), Math.max(1L, GAP_TIMEOUT_MULTIPLIER));
                     if (System.nanoTime() - gapStartNanos > gapTimeoutNanos && !queue.isEmpty()) {
                         final QueueRelease release = flushGap(list);
                         if (release.frames > 0 && ctx != null) {
@@ -182,10 +200,6 @@ public class FrameOrderIn extends MessageToMessageDecoder<Frame> {
             for (Object msg : out) ctx.fireChannelRead(msg);
             if (!out.isEmpty()) ctx.fireChannelReadComplete();
             metricsPublisher.accept(ctx);
-        }
-
-        private static long saturatedMultiply(long value, long multiplier) {
-            return value > Long.MAX_VALUE / multiplier ? Long.MAX_VALUE : value * multiplier;
         }
 
         private void cancelGapTask() {

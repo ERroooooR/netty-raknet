@@ -104,6 +104,34 @@ public class HandlerOptimizationsTest {
     }
 
     @Test
+    public void newerSequencedFrameDiscardsQueuedOlderOrderIndex() throws Exception {
+        final FrameOrderIn handler = new FrameOrderIn();
+        final Object queue = getChannelQueue(handler);
+        final Method decodeOrdered = getDecodeOrderedMethod(queue);
+        final Method decodeSequenced = queue.getClass()
+                .getDeclaredMethod("decodeSequenced", Frame.class, List.class, long.class);
+        decodeSequenced.setAccessible(true);
+        final long rttNanos = 50_000_000L;
+
+        final Frame queued = makeFrame(ByteBufAllocator.DEFAULT, 2, 1,
+                FramedPacket.Reliability.RELIABLE_ORDERED, 0);
+        decodeOrdered.invoke(queue, queued, new ArrayList<>(), rttNanos);
+        queued.release();
+
+        final Frame newer = makeFrame(ByteBufAllocator.DEFAULT, 3, 2,
+                FramedPacket.Reliability.UNRELIABLE_SEQUENCED, 0);
+        final List<Object> out = new ArrayList<>();
+        decodeSequenced.invoke(queue, newer, out, rttNanos);
+        Assertions.assertEquals(1, out.size());
+        Assertions.assertEquals(3, getLastOrderIndex(queue));
+        final Field queueField = queue.getClass().getDeclaredField("queue");
+        queueField.setAccessible(true);
+        Assertions.assertTrue(((java.util.Map<?, ?>) queueField.get(queue)).isEmpty());
+        ReferenceCountUtil.release(out.get(0));
+        newer.release();
+    }
+
+    @Test
     public void testGapTimeoutNeverSkipsReliableOrdered() throws Exception {
         final FrameOrderIn handler = new FrameOrderIn();
         final Object queue = getChannelQueue(handler);

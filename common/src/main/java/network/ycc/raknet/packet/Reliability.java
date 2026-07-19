@@ -1,8 +1,10 @@
 package network.ycc.raknet.packet;
 
 import network.ycc.raknet.utils.UINT;
+import network.ycc.raknet.utils.Constants;
 
 import io.netty.buffer.ByteBuf;
+import io.netty.handler.codec.CorruptedFrameException;
 
 import java.util.ArrayList;
 
@@ -61,7 +63,10 @@ public class Reliability extends SimplePacket implements Packet {
 
     @Override
     public void decode(ByteBuf buf) {
-        entries = new REntry[buf.readUnsignedShort()];
+        final int entryCount = buf.readUnsignedShort();
+        Constants.packetLossCheck(entryCount, "acknowledgement entry count");
+        entries = new REntry[entryCount];
+        int acknowledgedIds = 0;
         for (int i = 0; i < entries.length; i++) {
             boolean single = buf.readBoolean();
             if (single) {
@@ -69,6 +74,12 @@ public class Reliability extends SimplePacket implements Packet {
             } else {
                 entries[i] = new REntry(buf.readUnsignedMediumLE(), buf.readUnsignedMediumLE());
             }
+            final int rangeSize = entries[i].size();
+            if (rangeSize < 0 || acknowledgedIds > Constants.MAX_PACKET_LOSS - rangeSize) {
+                throw new CorruptedFrameException("Acknowledgement ranges exceed "
+                        + Constants.MAX_PACKET_LOSS + " sequence IDs");
+            }
+            acknowledgedIds += rangeSize;
         }
     }
 
@@ -89,6 +100,16 @@ public class Reliability extends SimplePacket implements Packet {
         public REntry(int idstart, int idfinish) {
             this.idStart = idstart;
             this.idFinish = idfinish;
+        }
+
+        /** Returns the bounded cardinality of this wrap-aware 24-bit range. */
+        public int size() {
+            final int distance = UINT.B3.minusWrap(idFinish, idStart);
+            if (distance < 0 || distance >= Constants.MAX_PACKET_LOSS) {
+                throw new CorruptedFrameException("Invalid acknowledgement range: "
+                        + idStart + ".." + idFinish);
+            }
+            return distance + 1;
         }
     }
 

@@ -84,7 +84,10 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
             }
             case CR3: {
                 if (msg instanceof ServerHandshake) {
-                    final long negotiated = ((ServerHandshake) msg).getTransportFeatures();
+                    final Long requested = ctx.channel().attr(RakNet.TRANSPORT_FEATURES).get();
+                    final long negotiated = TransportFeatures.negotiate(
+                            requested == null ? 0L : requested,
+                            ((ServerHandshake) msg).getTransportFeatures());
                     ctx.channel().attr(RakNet.TRANSPORT_FEATURES).set(negotiated);
                     final Packet packet = new ClientHandshake(
                             ((ServerHandshake) msg).getTimestamp(),

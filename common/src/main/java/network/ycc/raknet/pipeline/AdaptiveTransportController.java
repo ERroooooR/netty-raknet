@@ -4,8 +4,10 @@ import io.netty.channel.Channel;
 import io.netty.channel.ChannelOption;
 import network.ycc.raknet.RakNet;
 
-import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
+
+import static network.ycc.raknet.utils.SaturatedMath.add;
+import static network.ycc.raknet.utils.SaturatedMath.multiply;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
@@ -21,7 +23,6 @@ final class AdaptiveTransportController {
     private static final AtomicInteger CURRENT_TOS = new AtomicInteger(-1);
     private static final LongAdder HEALTHY_VOTES = new LongAdder();
     private static final LongAdder CONGESTED_VOTES = new LongAdder();
-    private static final int WINDOW_BUCKETS = 10;
     // Minecraft chunk/ZSTD production is often application-limited for several
     // complete gain cycles. Keep a longer clean-path maximum so those gaps do
     // not erase capacity that was just demonstrated. Congestion responses
@@ -53,15 +54,10 @@ final class AdaptiveTransportController {
     private long nextSendNanos;
     private long tokenUpdatedNanos;
     private double pacingTokens = 1D;
-    private final long[] acked = new long[WINDOW_BUCKETS];
-    private final long[] lost = new long[WINDOW_BUCKETS];
-    private final long[] ackedBytes = new long[WINDOW_BUCKETS];
+    private final TransportLossWindow lossWindow = new TransportLossWindow();
     private final long[] bandwidthFilter = new long[BANDWIDTH_FILTER_CYCLES];
-    private final long[] ecnMarks = new long[WINDOW_BUCKETS];
-    private int bucket;
     private int bandwidthCycle;
     private boolean bandwidthCycleHadValidSample;
-    private long bucketStarted = System.nanoTime();
     private int consecutiveLosses;
     private int largeLosses;
     private long lastLargeLossNanos;
@@ -249,13 +245,11 @@ final class AdaptiveTransportController {
     void onAck(int bytes, long rttNanos, long inFlightBytes,
                boolean applicationLimited, long packetSentNanos) {
         if (!config.isAdaptiveTransportEnabled()) return;
-        rotate();
-        acked[bucket]++;
-        ackedBytes[bucket] += bytes;
         final long now = System.nanoTime();
+        lossWindow.recordAcknowledgement(now);
         final long ackGap = lastAckNanos == 0L ? 0L : Math.max(0L, now - lastAckNanos);
         final long idleThreshold = Math.max(TimeUnit.MILLISECONDS.toNanos(250),
-                saturatedMultiply(Math.max(1L, smoothedRtt), 2L));
+                multiply(Math.max(1L, smoothedRtt), 2L));
         final boolean idleRestartSample = ackGap > idleThreshold;
         averagePacketBytes = averagePacketBytes * 0.875D + bytes * 0.125D;
         updateDeliveryRate(now, bytes, applicationLimited || idleRestartSample);
@@ -299,10 +293,9 @@ final class AdaptiveTransportController {
 
     void onLoss(int bytes, boolean timeout) {
         if (!config.isAdaptiveTransportEnabled()) return;
-        rotate();
-        lost[bucket]++;
-        consecutiveLosses++;
         final long now = System.nanoTime();
+        lossWindow.recordLoss(now);
+        consecutiveLosses++;
         lastLossNanos = now;
         if (timeout && pathMtu.canDetectBlackHole() && rttRecovered()
                 && lossSampleCount() >= 64 && lossRatio() < 0.02D
@@ -353,12 +346,11 @@ final class AdaptiveTransportController {
 
     void onEcnCe() {
         if (!config.isAdaptiveTransportEnabled()) return;
-        rotate();
-        ecnMarks[bucket]++;
+        final long now = System.nanoTime();
+        lossWindow.recordEcn(now);
         if (ecnCeRatio() >= 0.10D) {
             lossType = LossType.QUEUE;
             congestionReason = "ECN_CE";
-            final long now = System.nanoTime();
             lastLossNanos = now;
             if (resumeState == ResumeState.UNVALIDATED) enterResumeSafeRetreat();
             if (!congestionEpisodeActive) {
@@ -486,7 +478,7 @@ final class AdaptiveTransportController {
     private void updateCongestionModel(long now, long inFlightBytes, int acknowledgedBytes) {
         final long bandwidth = maxBandwidth();
         final long rtt = minRtt == Long.MAX_VALUE ? Math.max(1, smoothedRtt) : minRtt;
-        final long bdp = Math.max(minimumCongestionWindow(), saturatedMultiply(bandwidth, rtt) / 1_000_000_000L);
+        final long bdp = Math.max(minimumCongestionWindow(), multiply(bandwidth, rtt) / 1_000_000_000L);
         if (roundStarted == 0 || now - roundStarted >= Math.max(1, smoothedRtt)) {
             if (bandwidth >= fullBandwidth + Math.max(1, fullBandwidth / 4)) {
                 fullBandwidth = bandwidth;
@@ -499,7 +491,7 @@ final class AdaptiveTransportController {
         if (congestionMode == CongestionMode.STARTUP) {
             congestionWindowBytes = Math.min(maximumCongestionWindow(), congestionWindowBytes + acknowledgedBytes);
         } else {
-            final long target = Math.min(maximumCongestionWindow(), saturatedAdd(bdp * 2L, ackAggregationBytes));
+            final long target = Math.min(maximumCongestionWindow(), add(bdp * 2L, ackAggregationBytes));
             congestionWindowBytes = Math.max(minimumCongestionWindow(),
                     (congestionWindowBytes * 7L + target) / 8L);
         }
@@ -600,7 +592,7 @@ final class AdaptiveTransportController {
 
     private double qosRecoveryCeiling(long now) {
         final long quietThreshold = Math.max(TimeUnit.SECONDS.toNanos(1),
-                saturatedMultiply(smoothedRtt, 4L));
+                multiply(smoothedRtt, 4L));
         final long recoveryNanos = Math.max(0L, now - lastLossNanos - quietThreshold);
         final long stepNanos = Math.max(MIN_QOS_RECOVERY_STEP_NANOS, smoothedRtt);
         final double steps = recoveryNanos / (double) stepNanos;
@@ -642,7 +634,7 @@ final class AdaptiveTransportController {
                 ? Math.max(TimeUnit.MILLISECONDS.toNanos(20), smoothedRtt)
                 : minRtt;
         resumeValidationRoundBytes = Math.max(minimumCongestionWindow(),
-                saturatedMultiply(initial, Math.max(1L, validationRtt)) / 1_000_000_000L);
+                multiply(initial, Math.max(1L, validationRtt)) / 1_000_000_000L);
         burstAdmissionRateBytesPerSecond = initial;
         burstAdmissionTargetBytesPerSecond = initial;
         burstAdmissionTokens = Math.max(1, config.getMTU());
@@ -686,7 +678,7 @@ final class AdaptiveTransportController {
         if (workConserving || backlogAge < BURST_QUEUE_TIME_LIMIT_NANOS) {
             final long remaining = workConserving ? BURST_QUEUE_TIME_LIMIT_NANOS
                     : Math.max(1L, BURST_QUEUE_TIME_LIMIT_NANOS - backlogAge);
-            drainTarget = saturatedMultiply(Math.max(0L, outstandingBytes), 1_000_000_000L)
+            drainTarget = multiply(Math.max(0L, outstandingBytes), 1_000_000_000L)
                     / remaining;
         } else {
             // An overdue queue is capacity-limited, not deadline-limited. Keep
@@ -778,7 +770,7 @@ final class AdaptiveTransportController {
 
     private boolean lossQuietForRecovery(long now) {
         return lastLossNanos == 0L || now - lastLossNanos
-                > Math.max(TimeUnit.MILLISECONDS.toNanos(250), saturatedMultiply(smoothedRtt, 2L));
+                > Math.max(TimeUnit.MILLISECONDS.toNanos(250), multiply(smoothedRtt, 2L));
     }
 
     private long burstAdmissionMinimumBytesPerSecond() {
@@ -825,7 +817,7 @@ final class AdaptiveTransportController {
         congestionReason = "RTT_INFLATION";
         lastLossNanos = now;
         bandwidthProbeSuppressedUntil = Math.max(bandwidthProbeSuppressedUntil,
-                now + Math.max(TimeUnit.SECONDS.toNanos(1), saturatedMultiply(smoothedRtt, 4L)));
+                now + Math.max(TimeUnit.SECONDS.toNanos(1), multiply(smoothedRtt, 4L)));
         gainCycle = 2;
         congestionWindowBytes = Math.max(minimumCongestionWindow(), congestionWindowBytes * 7L / 8L);
         final double inflation = minRtt == Long.MAX_VALUE || minRtt <= 0L
@@ -880,7 +872,7 @@ final class AdaptiveTransportController {
         lastCongestionResponseNanos = now;
         bandwidthProbeSuppressedUntil = Math.max(bandwidthProbeSuppressedUntil,
                 now + Math.max(MIN_BANDWIDTH_PROBE_COOLDOWN_NANOS,
-                        saturatedMultiply(smoothedRtt, 8L)));
+                        multiply(smoothedRtt, 8L)));
         gainCycle = 2; // resume at 1.0 rather than immediately probing at 1.25
         congestionWindowBytes = Math.max(minimumCongestionWindow(), congestionWindowBytes * 3L / 4L);
         // A policer/queue event makes the old max-bandwidth samples unsafe. Keep
@@ -899,7 +891,7 @@ final class AdaptiveTransportController {
             return modelRate;
         }
         final long quietPeriod = Math.max(TimeUnit.MILLISECONDS.toNanos(250),
-                saturatedMultiply(smoothedRtt, 2L));
+                multiply(smoothedRtt, 2L));
         if (now - lastLossNanos > quietPeriod) {
             final long elapsed = Math.max(0L, now - lossRecoveryUpdatedNanos);
             final long recoveryStep = Math.max(MIN_QOS_RECOVERY_STEP_NANOS, smoothedRtt);
@@ -926,12 +918,12 @@ final class AdaptiveTransportController {
 
     private boolean lossQuiet(long now) {
         return lastLossNanos == 0 || now - lastLossNanos
-                > Math.max(TimeUnit.SECONDS.toNanos(1), saturatedMultiply(smoothedRtt, 4L));
+                > Math.max(TimeUnit.SECONDS.toNanos(1), multiply(smoothedRtt, 4L));
     }
 
     private void updateMode(long now, long inFlightBytes) {
         final long rtt = minRtt == Long.MAX_VALUE ? Math.max(1, smoothedRtt) : minRtt;
-        final long bdp = Math.max(minimumCongestionWindow(), saturatedMultiply(maxBandwidth(), rtt) / 1_000_000_000L);
+        final long bdp = Math.max(minimumCongestionWindow(), multiply(maxBandwidth(), rtt) / 1_000_000_000L);
         if (minRttStamp != 0 && now - minRttStamp > MIN_RTT_FILTER_NANOS
                 && canProbeRtt(now)
                 && congestionMode != CongestionMode.PROBE_RTT) {
@@ -977,7 +969,7 @@ final class AdaptiveTransportController {
             ackEpochBytes = 0;
         }
         ackEpochBytes += bytes;
-        final long expected = saturatedMultiply(maxBandwidth(), now - ackEpochStart) / 1_000_000_000L;
+        final long expected = multiply(maxBandwidth(), now - ackEpochStart) / 1_000_000_000L;
         final long excess = Math.max(0, ackEpochBytes - expected);
         ackAggregationBytes = Math.min(minimumCongestionWindow() * 4L,
                 Math.max(ackAggregationBytes * 7L / 8L, excess));
@@ -991,7 +983,7 @@ final class AdaptiveTransportController {
         final long samplingWindow = Math.max(TimeUnit.MILLISECONDS.toNanos(1),
                 Math.min(TimeUnit.MILLISECONDS.toNanos(100), Math.max(1, smoothedRtt / 2L)));
         if (interval < samplingWindow) return;
-        final long rawSample = saturatedMultiply(deliverySampleBytes, 1_000_000_000L) / interval;
+        final long rawSample = multiply(deliverySampleBytes, 1_000_000_000L) / interval;
         // ACK compression can report a delivery rate higher than this sender
         // actually injected. BBR applies the same send-rate bound before a
         // sample is allowed to become retained path capacity.
@@ -1020,7 +1012,7 @@ final class AdaptiveTransportController {
 
     private void updateResumeValidation(long now, int acknowledgedBytes, long packetSentNanos) {
         if (resumeState != ResumeState.UNVALIDATED || packetSentNanos < resumeStartedNanos) return;
-        resumeValidationAckedBytes = saturatedAdd(resumeValidationAckedBytes, acknowledgedBytes);
+        resumeValidationAckedBytes = add(resumeValidationAckedBytes, acknowledgedBytes);
         final long roundBytes = Math.max(minimumCongestionWindow(), resumeValidationRoundBytes);
         while (resumeValidationAckedBytes >= roundBytes && resumeValidatedRounds < RESUME_VALIDATION_ROUNDS) {
             resumeValidationAckedBytes -= roundBytes;
@@ -1052,37 +1044,21 @@ final class AdaptiveTransportController {
     }
 
     private double lossRatio() {
-        rotate();
-        long a = 0, l = 0;
-        for (int i = 0; i < WINDOW_BUCKETS; i++) { a += acked[i]; l += lost[i]; }
-        return a + l == 0 ? 0D : (double) l / (a + l);
+        return lossWindow.lossRatio(System.nanoTime());
+    }
+
+    private double currentLossRatio() {
+        return lossWindow.currentLossRatio();
     }
 
     private double ecnCeRatio() {
-        long a = 0, ce = 0;
-        for (int i = 0; i < WINDOW_BUCKETS; i++) { a += acked[i]; ce += ecnMarks[i]; }
-        return a + ce == 0 ? 0D : ce / (double) (a + ce);
+        return lossWindow.currentEcnRatio();
     }
 
     private int recordLargeLoss(long now) {
         if (lastLargeLossNanos == 0 || now - lastLargeLossNanos > TimeUnit.SECONDS.toNanos(10)) largeLosses = 0;
         lastLargeLossNanos = now;
         return ++largeLosses;
-    }
-
-    private void rotate() {
-        final long now = System.nanoTime();
-        long elapsed = (now - bucketStarted) / TimeUnit.SECONDS.toNanos(1);
-        if (elapsed >= WINDOW_BUCKETS) {
-            Arrays.fill(acked, 0); Arrays.fill(lost, 0); Arrays.fill(ackedBytes, 0);
-            Arrays.fill(ecnMarks, 0);
-            bucket = 0; bucketStarted = now; return;
-        }
-        while (elapsed-- > 0) {
-            bucket = (bucket + 1) % WINDOW_BUCKETS;
-            acked[bucket] = lost[bucket] = ackedBytes[bucket] = ecnMarks[bucket] = 0;
-            bucketStarted += TimeUnit.SECONDS.toNanos(1);
-        }
     }
 
     private long maxBandwidth() {
@@ -1099,28 +1075,30 @@ final class AdaptiveTransportController {
                 && minRtt != Long.MAX_VALUE && smoothedRtt < minRtt * 3L / 2L;
     }
     private long lossSampleCount() {
-        long samples = 0;
-        for (int i = 0; i < WINDOW_BUCKETS; i++) samples += acked[i] + lost[i];
-        return samples;
+        return lossWindow.sampleCount();
     }
     private long minimumCongestionWindow() { return Math.max(4L * config.getMTU(), 4L * 576L); }
     private long maximumCongestionWindow() { return Math.max(minimumCongestionWindow(), config.getMaxQueuedBytes()); }
 
     private void publishMetrics() {
-        final boolean calibrating = calibrationWindowOpen(System.nanoTime());
-        final boolean workConserving = workConservingBulk(System.nanoTime());
+        final long now = System.nanoTime();
+        final boolean calibrating = calibrationWindowOpen(now);
+        // Metrics must be observational. workConservingBulk() rotates the loss
+        // window, so derive the displayed state from the already-current buckets.
+        final boolean workConserving = burstDrainActive && (calibrating
+                || calibrationProbeAllowed(currentLossRatio()));
         config.getMetrics().adaptivePacingRate(packetsPerSecond);
         config.getMetrics().adaptiveBytePacingRate(burstDrainActive && !workConserving
                 ? burstAdmissionRateBytesPerSecond : 0L);
         config.getMetrics().adaptiveDemand(!burstDrainActive, burstDrainActive ? "BULK" : "IDLE",
-                burstDrainActive ? Math.max(0L, System.nanoTime() - burstDrainStartedNanos) : 0L,
+                burstDrainActive ? Math.max(0L, now - burstDrainStartedNanos) : 0L,
                 burstRecoveryProbes);
         config.getMetrics().adaptivePathModel(maxBandwidth(), lastDeliverySampleApplicationLimited,
                 calibrating ? "CALIBRATING" : workConserving
                 ? "WORK_CONSERVING" : resumeState.name(), resumeValidatedRounds);
         config.getMetrics().adaptiveDeliveryRate(deliveryRateBytesPerSecond);
-        long acknowledgements = 0, losses = 0;
-        for (int i = 0; i < WINDOW_BUCKETS; i++) { acknowledgements += acked[i]; losses += lost[i]; }
+        final long acknowledgements = lossWindow.acknowledgedCount();
+        final long losses = lossWindow.lostCount();
         config.getMetrics().adaptiveLoss(acknowledgements + losses == 0 ? 0D
                 : losses / (double) (acknowledgements + losses), acknowledgements, losses);
         config.getMetrics().adaptiveLossType(lossType.name());
@@ -1146,15 +1124,6 @@ final class AdaptiveTransportController {
         final int min = Math.max(1, config.getAdaptiveMinPps());
         final int max = Math.max(min, config.getAdaptiveMaxPps());
         return Math.max(min, Math.min(max, value));
-    }
-
-    private static long saturatedAdd(long a, long b) {
-        return a > Long.MAX_VALUE - b ? Long.MAX_VALUE : a + b;
-    }
-
-    private static long saturatedMultiply(long a, long b) {
-        if (a <= 0 || b <= 0) return 0;
-        return a > Long.MAX_VALUE / b ? Long.MAX_VALUE : a * b;
     }
 
     static final class FecParameters {

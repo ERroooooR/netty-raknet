@@ -83,7 +83,8 @@ public class ConnectionInitializer extends AbstractConnectionInitializer {
                 if (msg instanceof ConnectionRequest) {
                     final ConnectionRequest cr = (ConnectionRequest) msg;
                     final long negotiated = config.getProtocolVersion() >= 12 && config.isAdaptiveTransportEnabled()
-                            ? cr.getTransportFeatures() & TransportFeatures.SUPPORTED : 0;
+                            ? TransportFeatures.negotiate(TransportFeatures.SUPPORTED,
+                            cr.getTransportFeatures()) : 0;
                     ctx.channel().attr(RakNet.TRANSPORT_FEATURES).set(negotiated);
                     final Packet packet = new ServerHandshake(
                             (InetSocketAddress) ctx.channel().remoteAddress(),

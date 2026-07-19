@@ -5,8 +5,6 @@ import io.netty.buffer.Unpooled;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
-import java.lang.reflect.InvocationTargetException;
-import java.lang.reflect.Method;
 import java.util.Arrays;
 import java.util.List;
 
@@ -22,11 +20,11 @@ public class LimitedFecHandlerTest {
 
     @Test
     public void targetedWindowPinsCriticalSequenceAndUsesNewestContext() {
-        final java.util.List<LimitedFecHandler.Entry> rolling = new java.util.ArrayList<>();
+        final java.util.List<FecPacketCodec.Entry> rolling = new java.util.ArrayList<>();
         for (int sequence = 10; sequence <= 15; sequence++) {
-            rolling.add(new LimitedFecHandler.Entry(sequence, 4, new byte[]{1, 2, 3, 4}));
+            rolling.add(new FecPacketCodec.Entry(sequence, 4, new byte[]{1, 2, 3, 4}));
         }
-        final java.util.List<LimitedFecHandler.Entry> selected =
+        final java.util.List<FecPacketCodec.Entry> selected =
                 LimitedFecHandler.selectTargetedGroup(rolling, 11);
         Assertions.assertEquals(4, selected.size());
         Assertions.assertEquals(11, selected.get(0).seq);
@@ -41,12 +39,12 @@ public class LimitedFecHandlerTest {
                 new byte[]{4, 5, 6, 7, 8},
                 new byte[]{9},
                 new byte[]{10, 11, 12, 13});
-        final byte[] parity = LimitedFecHandler.xor(packets);
+        final byte[] parity = FecPacketCodec.xor(packets);
         for (int missing = 0; missing < packets.size(); missing++) {
             final java.util.ArrayList<byte[]> present = new java.util.ArrayList<>(packets);
             final byte[] expected = present.remove(missing);
             Assertions.assertArrayEquals(expected,
-                    LimitedFecHandler.recover(parity, present, expected.length));
+                    FecPacketCodec.recover(parity, present, expected.length));
         }
     }
 
@@ -55,8 +53,8 @@ public class LimitedFecHandlerTest {
         final byte[] a = {1, 3, 5};
         final byte[] b = {2, 4};
         Assertions.assertArrayEquals(
-                LimitedFecHandler.xor(Arrays.asList(a, b)),
-                LimitedFecHandler.xor(Arrays.asList(b, a)));
+                FecPacketCodec.xor(Arrays.asList(a, b)),
+                FecPacketCodec.xor(Arrays.asList(b, a)));
     }
 
     @Test
@@ -110,12 +108,9 @@ public class LimitedFecHandlerTest {
         packet.writeByte(0x1e).writeInt(1).writeByte(4);
         for (int i = 0; i < 4; i++) packet.writeMediumLE(i).writeShort(5);
         packet.writeShort(4).writeZero(4);
-        final Method read = LimitedFecHandler.class.getDeclaredMethod("readLegacyParity", ByteBuf.class);
-        read.setAccessible(true);
         try {
-            final InvocationTargetException error = Assertions.assertThrows(
-                    InvocationTargetException.class, () -> read.invoke(null, packet));
-            Assertions.assertTrue(error.getCause() instanceof IllegalArgumentException);
+            Assertions.assertThrows(IllegalArgumentException.class,
+                    () -> FecPacketCodec.readLegacyParity(packet));
         } finally {
             packet.release();
         }

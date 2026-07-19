@@ -37,6 +37,47 @@ import static org.mockito.Mockito.when;
 public class ReliabilityAdaptiveRecoveryHandlerTest {
 
     @Test
+    public void handlerRemovalCancelsAllTransportScheduling() {
+        final Fixture fixture = new Fixture();
+        final ScheduledFuture<?> ackFlush = mock(ScheduledFuture.class);
+        final ScheduledFuture<?> coalesce = mock(ScheduledFuture.class);
+        final ScheduledFuture<?> pacing = mock(ScheduledFuture.class);
+        fixture.handler.ackFlushFuture = ackFlush;
+        fixture.handler.coalesceFuture = coalesce;
+        fixture.handler.pacingFuture = pacing;
+        fixture.handler.coalesceScheduled = true;
+        fixture.handler.pacingScheduled = true;
+        fixture.handler.productionScheduled = true;
+
+        fixture.handler.handlerRemoved(fixture.ctx);
+
+        verify(ackFlush).cancel(false);
+        verify(coalesce).cancel(false);
+        verify(pacing).cancel(false);
+        Assertions.assertTrue(fixture.handler.removed);
+        Assertions.assertFalse(fixture.handler.coalesceScheduled);
+        Assertions.assertFalse(fixture.handler.pacingScheduled);
+        Assertions.assertFalse(fixture.handler.productionScheduled);
+    }
+
+    @Test
+    public void rejectsExcessiveIncomingSequenceGapBeforeSchedulingAck() {
+        final Fixture fixture = new Fixture();
+        fixture.enableNacks();
+        final FrameSet frameSet = FrameSet.create();
+        try {
+            frameSet.setSeqId(network.ycc.raknet.utils.Constants.MAX_PACKET_LOSS + 2);
+            Assertions.assertThrows(io.netty.handler.codec.DecoderException.class,
+                    () -> fixture.handler.readFrameSet(fixture.ctx, frameSet));
+            Assertions.assertTrue(fixture.handler.ackSet.isEmpty());
+            verify(fixture.eventLoop, never()).schedule(
+                    any(Runnable.class), anyLong(), eq(TimeUnit.NANOSECONDS));
+        } finally {
+            frameSet.release();
+        }
+    }
+
+    @Test
     public void learnedTrueLossBypassesGraceInFrameSetProcessing() {
         final Fixture fixture = new Fixture();
         fixture.enableNacks();

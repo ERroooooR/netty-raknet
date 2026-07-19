@@ -13,4 +13,19 @@ public final class TransportFeatures {
             | DPLPMTUD_STATE_MACHINE | MODEL_CONGESTION_CONTROL;
 
     private TransportFeatures() {}
+
+    /**
+     * Intersects both peers' capabilities and removes dependent features whose
+     * required base transport was not negotiated.
+     */
+    public static long negotiate(long local, long remote) {
+        long negotiated = local & remote & SUPPORTED;
+        if ((negotiated & FEC) == 0) {
+            negotiated &= ~(DYNAMIC_FEC | REED_SOLOMON_FEC);
+        }
+        if ((negotiated & PLPMTUD) == 0) {
+            negotiated &= ~DPLPMTUD_STATE_MACHINE;
+        }
+        return negotiated;
+    }
 }

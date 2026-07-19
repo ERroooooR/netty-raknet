@@ -71,7 +71,7 @@ MTU up to `PLPMTUD_MAX_MTU`. Java/native transports can publish validated ICMP P
 signals with `TransportFeedbackEvent`; local EMSGSIZE/message-too-long write failures are converted
 automatically. MTU changes wait for queued and in-flight frames to drain.
 
-The model congestion controller keeps a ten-second max-delivery-rate filter, minimum RTT, explicit
+The model congestion controller keeps a ten-gain-cycle max-delivery-rate filter, minimum RTT, explicit
 bytes-in-flight and congestion window, ACK aggregation allowance, STARTUP/DRAIN/PROBE_BW/PROBE_RTT
 phases, pacing gains and ECN-CE response. This replaces packet-rate-only growth while retaining the
 configured PPS bounds as operational safety limits.

@@ -30,8 +30,7 @@ public class ReliabilityNackReorderingTest {
 
     @Test
     public void reorderedPacketCancelsBeforeNackBecomesVisible() {
-        final ReliabilityHandler.DeferredNackTracker tracker =
-                new ReliabilityHandler.DeferredNackTracker();
+        final DeferredNackTracker tracker = new DeferredNackTracker();
         final List<Integer> due = new ArrayList<>();
         Assertions.assertTrue(tracker.defer(10, 1_000));
         Assertions.assertTrue(tracker.cancel(10));
@@ -41,8 +40,7 @@ public class ReliabilityNackReorderingTest {
 
     @Test
     public void onlyExpiredDeferredNacksAreDrained() {
-        final ReliabilityHandler.DeferredNackTracker tracker =
-                new ReliabilityHandler.DeferredNackTracker();
+        final DeferredNackTracker tracker = new DeferredNackTracker();
         final List<Integer> due = new ArrayList<>();
         tracker.defer(10, 1_000);
         tracker.defer(11, 2_000);
@@ -55,8 +53,7 @@ public class ReliabilityNackReorderingTest {
 
     @Test
     public void confirmedLargeGapCanDrainAllPendingNacksImmediately() {
-        final ReliabilityHandler.DeferredNackTracker tracker =
-                new ReliabilityHandler.DeferredNackTracker();
+        final DeferredNackTracker tracker = new DeferredNackTracker();
         final List<Integer> confirmed = new ArrayList<>();
         tracker.defer(10, 10_000);
         tracker.defer(11, 10_000);
@@ -69,8 +66,7 @@ public class ReliabilityNackReorderingTest {
 
     @Test
     public void repeatedTrueLossTemporarilyBypassesReorderGrace() {
-        final ReliabilityHandler.AdaptiveNackGrace policy =
-                new ReliabilityHandler.AdaptiveNackGrace();
+        final AdaptiveNackGrace policy = new AdaptiveNackGrace();
         final long rtt = TimeUnit.MILLISECONDS.toNanos(80);
         for (int i = 0; i < 8; i++) {
             policy.onLost(i + 1L, rtt);
@@ -82,8 +78,7 @@ public class ReliabilityNackReorderingTest {
 
     @Test
     public void oneReorderInInitialWindowPreventsPrematureBypass() {
-        final ReliabilityHandler.AdaptiveNackGrace policy =
-                new ReliabilityHandler.AdaptiveNackGrace();
+        final AdaptiveNackGrace policy = new AdaptiveNackGrace();
         final long rtt = TimeUnit.MILLISECONDS.toNanos(80);
         for (int i = 0; i < 7; i++) policy.onLost(i + 1L, rtt);
         policy.onReordered(8L);
@@ -94,8 +89,7 @@ public class ReliabilityNackReorderingTest {
 
     @Test
     public void bypassUsesOneProbeAndImmediatelyReentersOnTrueLoss() {
-        final ReliabilityHandler.AdaptiveNackGrace policy =
-                new ReliabilityHandler.AdaptiveNackGrace();
+        final AdaptiveNackGrace policy = new AdaptiveNackGrace();
         final long rtt = TimeUnit.MILLISECONDS.toNanos(80);
         for (int i = 0; i < 8; i++) policy.onLost(i + 1L, rtt);
 
@@ -110,8 +104,7 @@ public class ReliabilityNackReorderingTest {
 
     @Test
     public void successfulProbeRestoresReorderGrace() {
-        final ReliabilityHandler.AdaptiveNackGrace policy =
-                new ReliabilityHandler.AdaptiveNackGrace();
+        final AdaptiveNackGrace policy = new AdaptiveNackGrace();
         final long rtt = TimeUnit.MILLISECONDS.toNanos(80);
         for (int i = 0; i < 8; i++) policy.onLost(i + 1L, rtt);
 
@@ -125,8 +118,7 @@ public class ReliabilityNackReorderingTest {
 
     @Test
     public void ackProtectionRequiresDuplicateBurstAndExpires() {
-        final ReliabilityHandler.AdaptiveAckProtection policy =
-                new ReliabilityHandler.AdaptiveAckProtection();
+        final AdaptiveAckProtection policy = new AdaptiveAckProtection();
         final long rtt = TimeUnit.MILLISECONDS.toNanos(80);
         final long now = TimeUnit.SECONDS.toNanos(1);
 
@@ -143,8 +135,7 @@ public class ReliabilityNackReorderingTest {
 
     @Test
     public void sparseDuplicateFrameSetsDoNotActivateAckProtection() {
-        final ReliabilityHandler.AdaptiveAckProtection policy =
-                new ReliabilityHandler.AdaptiveAckProtection();
+        final AdaptiveAckProtection policy = new AdaptiveAckProtection();
         final long rtt = TimeUnit.MILLISECONDS.toNanos(80);
         policy.onDuplicateFrameSet(1L, rtt);
         policy.onDuplicateFrameSet(TimeUnit.SECONDS.toNanos(2), rtt);
@@ -159,8 +150,7 @@ public class ReliabilityNackReorderingTest {
 
     @Test
     public void duplicateDuringProtectionExtendsQuietDeadline() {
-        final ReliabilityHandler.AdaptiveAckProtection policy =
-                new ReliabilityHandler.AdaptiveAckProtection();
+        final AdaptiveAckProtection policy = new AdaptiveAckProtection();
         final long rtt = TimeUnit.MILLISECONDS.toNanos(80);
         final long now = TimeUnit.SECONDS.toNanos(1);
         policy.onDuplicateFrameSet(now, rtt);

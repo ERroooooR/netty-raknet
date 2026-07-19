@@ -20,6 +20,7 @@ public final class PathMtuDiscoveryHandler extends ChannelDuplexHandler {
     private static final long INTERVAL_SECONDS = 30;
     private ScheduledFuture<?> task;
     private ScheduledFuture<?> probeTimeout;
+    private ScheduledFuture<?> retryTask;
     private long pendingToken;
     private int pendingMtu;
 
@@ -33,8 +34,12 @@ public final class PathMtuDiscoveryHandler extends ChannelDuplexHandler {
     public void handlerRemoved(ChannelHandlerContext ctx) {
         if (task != null) task.cancel(false);
         if (probeTimeout != null) probeTimeout.cancel(false);
+        if (retryTask != null) retryTask.cancel(false);
         task = null;
         probeTimeout = null;
+        retryTask = null;
+        pendingToken = 0L;
+        pendingMtu = 0;
     }
 
     @Override
@@ -58,15 +63,12 @@ public final class PathMtuDiscoveryHandler extends ChannelDuplexHandler {
                 } else if (in.readableBytes() == 11) {
                     final long token = in.getLong(in.readerIndex() + 1);
                     final int mtu = in.getUnsignedShort(in.readerIndex() + 9);
-                    if (token == pendingToken && mtu == pendingMtu) {
+                    if (pendingToken != 0L && token == pendingToken && mtu == pendingMtu) {
                         final ReliabilityHandler reliability = ctx.pipeline().get(ReliabilityHandler.class);
                         if (reliability != null) reliability.adaptiveController().onProbeAck(mtu);
                         RakNet.config(ctx).getMetrics().pathMtuProbe(true, mtu);
                         RakNet.config(ctx).getMetrics().pathMtuProbeResult("acknowledged", mtu);
-                        pendingToken = 0;
-                        pendingMtu = 0;
-                        if (probeTimeout != null) probeTimeout.cancel(false);
-                        probeTimeout = null;
+                        clearPendingProbe();
                     }
                 }
             } finally {
@@ -89,6 +91,21 @@ public final class PathMtuDiscoveryHandler extends ChannelDuplexHandler {
         probe.writeByte(PROBE_ID).writeLong(pendingToken).writeShort(candidate);
         probe.writeZero(candidate - probe.readableBytes());
         reliability.adaptiveController().onProbeSent(candidate);
+        final long token = pendingToken;
+        probeTimeout = ctx.executor().schedule(() -> {
+            probeTimeout = null;
+            if (pendingToken == token && pendingMtu == candidate) {
+                reliability.adaptiveController().onProbeTimeout(candidate);
+                pendingToken = 0L;
+                pendingMtu = 0;
+                if (reliability.adaptiveController().shouldRetryProbe()) {
+                    retryTask = ctx.executor().schedule(() -> {
+                        retryTask = null;
+                        probe(ctx);
+                    }, 100, TimeUnit.MILLISECONDS);
+                }
+            }
+        }, 5, TimeUnit.SECONDS);
         final ChannelFuture write = ctx.writeAndFlush(probe);
         write.addListener(future -> {
             if (!future.isSuccess()) {
@@ -98,25 +115,18 @@ public final class PathMtuDiscoveryHandler extends ChannelDuplexHandler {
                     ctx.fireExceptionCaught(future.cause());
                     ctx.close();
                 }
-                pendingToken = 0;
-                pendingMtu = 0;
-                if (probeTimeout != null) probeTimeout.cancel(false);
-                probeTimeout = null;
+                clearPendingProbe();
             }
         });
         RakNet.config(ctx).getMetrics().pathMtuProbe(false, candidate);
         RakNet.config(ctx).getMetrics().pathMtuProbeResult("sent", candidate);
-        probeTimeout = ctx.executor().schedule(() -> {
-            if (pendingMtu == candidate) {
-                reliability.adaptiveController().onProbeTimeout(candidate);
-                pendingToken = 0;
-                pendingMtu = 0;
-                if (reliability.adaptiveController().shouldRetryProbe()) {
-                    ctx.executor().schedule(() -> probe(ctx), 100, TimeUnit.MILLISECONDS);
-                }
-            }
-            probeTimeout = null;
-        }, 5, TimeUnit.SECONDS);
+    }
+
+    private void clearPendingProbe() {
+        pendingToken = 0L;
+        pendingMtu = 0;
+        if (probeTimeout != null) probeTimeout.cancel(false);
+        probeTimeout = null;
     }
 
     private static boolean enabled(ChannelHandlerContext ctx) {
