@@ -74,7 +74,15 @@ automatically. MTU changes wait for queued and in-flight frames to drain.
 The model congestion controller keeps a ten-gain-cycle max-delivery-rate filter, minimum RTT, explicit
 bytes-in-flight and congestion window, ACK aggregation allowance, STARTUP/DRAIN/PROBE_BW/PROBE_RTT
 phases, pacing gains and ECN-CE response. This replaces packet-rate-only growth while retaining the
-configured PPS bounds as operational safety limits.
+configured PPS bounds as operational safety limits. Delay-only congestion response requires both
+meaningful RTT inflation and transport occupancy; low-flight ACK jitter cannot pin a healthy bulk
+sender to its minimum PPS. Unknown healthy paths use a four-datagram, 128 KiB/s byte-admission
+bootstrap and then probe geometrically from ACK-validated delivery samples.
+Application-limited ACK bursts cannot raise retained path capacity. Timeout-only
+loss remains an ambiguous RANDOM/BURST signal because it may represent reverse-path
+ACK loss; NACK/RACK/ECN evidence is required before RTT inflation becomes persistent
+queue-loss pressure. Recovered low-flight RTT pressure is released independently of
+the longer rolling loss window while its loss pacing ceiling remains active.
 
 Adaptive DSCP operates on the single shared server socket. It requires at least 16 connection votes,
 a 2:1 majority and a 30-second cooldown before switching between AF41 and CS0. Per-player DSCP is not
@@ -83,6 +91,7 @@ possible with the shared-socket server architecture.
 `RakNet.MetricsLogger` exposes pacing and delivery rates, rolling ACK/loss samples, loss type,
 active MTU and DPLPMTUD state, FEC shards/recovery budget, congestion mode/cwnd/in-flight/bandwidth,
 ACK aggregation, ECN ratio, shared-socket DSCP changes, coalesced small writes and pacing delay.
+Admission diagnostics also expose the byte-rate target, active bulk PPS floor and RTT-pressure flag.
 Implementations may leave these default methods unused; the transport does not perform blocking
 metric export on an event loop.
   

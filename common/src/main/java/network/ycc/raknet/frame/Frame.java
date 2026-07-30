@@ -168,6 +168,7 @@ public final class Frame extends AbstractReferenceCounted {
                 out.frameData = FrameData.read(data, length, true);
                 out.frameData.setOrderChannel(getOrderChannel());
                 out.frameData.setReliability(getReliability().makeReliable()); //reliable form only
+                out.frameData.setPriority(frameData.getPriority());
                 assert out.frameData.isFragment();
                 if (out.getRoughPacketSize() > splitSize) {
                     throw new IllegalStateException("mtu fragment mismatch");
@@ -323,7 +324,17 @@ public final class Frame extends AbstractReferenceCounted {
             } else if (!b.getReliability().isReliable) {
                 return 1;
             }
-            return UINT.B3.minusWrap(a.reliableIndex, b.reliableIndex) < 0 ? -1 : 1;
+            final int priorityComparison = Integer.compare(
+                    b.frameData.getPriority(),
+                    a.frameData.getPriority()
+            );
+            if (priorityComparison != 0) {
+                return priorityComparison;
+            }
+            return Integer.compare(
+                    UINT.B3.minusWrap(a.reliableIndex, b.reliableIndex),
+                    0
+            );
         }
     }
 

@@ -28,6 +28,11 @@ public final class FrameData extends AbstractReferenceCounted implements FramedP
     private boolean fragment;
     private ByteBuf data;
     private FramedPacket.Reliability reliability;
+    /**
+     * Sender-local scheduling priority. It is intentionally not serialized:
+     * reliability and ordered-channel semantics remain the wire contract.
+     */
+    private int priority;
     private FrameData(Recycler.Handle<FrameData> handle) {
         this.handle = handle;
         setRefCnt(0);
@@ -41,6 +46,7 @@ public final class FrameData extends AbstractReferenceCounted implements FramedP
         out.fragment = false;
         out.data = null;
         out.reliability = FramedPacket.Reliability.RELIABLE_ORDERED;
+        out.priority = 0;
         out.setRefCnt(1);
         out.tracker = leakDetector.track(out);
         return out;
@@ -135,7 +141,13 @@ public final class FrameData extends AbstractReferenceCounted implements FramedP
         this.orderId = orderChannel;
     }
 
+    public int getPriority() {
+        return priority;
+    }
 
+    public void setPriority(int priority) {
+        this.priority = priority;
+    }
 
 
 

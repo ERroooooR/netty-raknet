@@ -132,6 +132,9 @@ public class RakNet {
                                     long backlogAgeNanos, long backlogProbes) {}
         default void adaptivePathModel(long validatedRateBytesPerSecond, boolean sampleApplicationLimited,
                                        String resumeState, int validatedRounds) {}
+        default void adaptiveAdmissionDiagnostics(long targetBytesPerSecond,
+                                                  double burstFloorPacketsPerSecond,
+                                                  boolean rttPressureActive) {}
         default void frameError(int delta) {}
         default void bytesIn(int delta) {}
         default void packetsOut(int delta) {}

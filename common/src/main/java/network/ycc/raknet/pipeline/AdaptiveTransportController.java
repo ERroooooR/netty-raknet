@@ -43,7 +43,9 @@ final class AdaptiveTransportController {
     private static final int BURST_DRAIN_RTT_MULTIPLIER = 4;
     private static final long STARTUP_CALIBRATION_NANOS = TimeUnit.MINUTES.toNanos(1);
     private static final long BURST_ADMISSION_INITIAL_BPS = 384L * 1024L;
+    private static final long BURST_ADMISSION_BOOTSTRAP_BPS = 128L * 1024L;
     private static final double BURST_ADMISSION_GROWTH = 1.25D;
+    private static final double VALIDATED_PROBE_HEADROOM = 1.50D;
     private static final double VALIDATED_CAPACITY_FLOOR = 0.80D;
     private static final int BURST_ADMISSION_TOKEN_DATAGRAMS = 4;
     private static final long BURST_ADMISSION_MAX_GROWTH_INTERVAL_NANOS = TimeUnit.MILLISECONDS.toNanos(250);
@@ -51,6 +53,8 @@ final class AdaptiveTransportController {
     private static final double APPLICATION_ARRIVAL_HEADROOM = 1.10D;
     private static final long VALIDATED_PATH_LIFETIME_NANOS = TimeUnit.MINUTES.toNanos(5);
     private static final int RESUME_VALIDATION_ROUNDS = 2;
+    private static final long MIN_QUEUE_DELAY_NANOS = TimeUnit.MILLISECONDS.toNanos(10);
+    private static final int RTT_PRESSURE_RELEASE_ACKS = 3;
 
     private final RakNet.Config config;
     private DplpmtudController pathMtu;
@@ -90,6 +94,7 @@ final class AdaptiveTransportController {
     private long gainCycleStarted;
     private long lastInFlightBytes;
     private long lastLossNanos;
+    private long lastRttPressureNanos;
     private long lastCongestionResponseNanos;
     private boolean congestionEpisodeActive;
     private long lossRecoveryUpdatedNanos;
@@ -119,6 +124,7 @@ final class AdaptiveTransportController {
     private long scheduledPacingDeadlineNanos;
     private long pacerWakeupLatenessNanos;
     private boolean rttPressureActive;
+    private int lowFlightRttAcks;
     private long calibrationStartedNanos;
 
     AdaptiveTransportController(RakNet.Config config) {
@@ -233,7 +239,7 @@ final class AdaptiveTransportController {
 
     boolean allowsApplicationLimitedRecovery() {
         return !config.isAdaptiveTransportEnabled()
-                || (!burstDrainActive && !queueInflated()
+                || (!burstDrainActive && !rttPressureActive
                 && lossType != LossType.QUEUE && lossType != LossType.MTU_BLACK_HOLE);
     }
 
@@ -272,22 +278,42 @@ final class AdaptiveTransportController {
         }
         final double recentLoss = lossRatio();
         final boolean inflated = queueInflated();
-        if (inflated && recentLoss >= 0.01D) {
+        if (inflated && recentLoss >= 0.01D
+                && lossType == LossType.QUEUE
+                && hasRttQueuePressureEvidence(inFlightBytes)) {
+            // A rolling loss ratio can also contain ambiguous timeout
+            // retransmissions caused by lost/delayed ACKs. Only a loss episode
+            // already classified from forward-path evidence may turn that
+            // ratio into persistent queue pressure.
             lossType = LossType.QUEUE;
             congestionReason = "RTT_INFLATION_LOSS";
             rttPressureActive = true;
+            lowFlightRttAcks = 0;
             if (!congestionEpisodeActive && enterCongestion(now)) {
                 congestionEpisodeActive = true;
             }
-        } else if (inflated && burstDrainActive) {
+        } else if (inflated && burstDrainActive
+                && hasRttQueuePressureEvidence(inFlightBytes)) {
+            lowFlightRttAcks = 0;
             if (!rttPressureActive) enterRttPressure(now);
-        } else if (recentLoss < 0.005D && lossQuiet(now)) {
-            lossType = LossType.NONE;
-            if (rttRecovered()) {
-                rttPressureActive = false;
-                congestionReason = "NONE";
+        } else {
+            if (rttPressureActive
+                    && lossQuietForRecovery(now)
+                    && (!inflated
+                    || !hasRttQueuePressureEvidence(inFlightBytes))) {
+                if (++lowFlightRttAcks >= RTT_PRESSURE_RELEASE_ACKS) {
+                    leaveRttPressure();
+                }
+            } else if (rttPressureActive) {
+                lowFlightRttAcks = 0;
             }
-            congestionEpisodeActive = false;
+            if (recentLoss < 0.005D && lossQuiet(now)) {
+                lossType = LossType.NONE;
+                if (!rttPressureActive) {
+                    congestionReason = "NONE";
+                    congestionEpisodeActive = false;
+                }
+            }
         }
         updateCongestionModel(now, inFlightBytes, bytes);
         updateResumeValidation(now, bytes, packetSentNanos);
@@ -307,7 +333,13 @@ final class AdaptiveTransportController {
             congestionReason = "MTU_BLACK_HOLE";
             pathMtu.onBlackHole();
             largeLosses = 0;
-        } else if (queueInflated() && (timeout || lossRatio() >= 0.01D)) {
+        } else if (queueInflated()
+                && ((!timeout && lossRatio() >= 0.01D)
+                || lossType == LossType.QUEUE)) {
+            // A timeout proves only that an ACK did not arrive. It cannot
+            // distinguish forward data loss from reverse-path ACK loss. NACK,
+            // RACK and ECN evidence may classify queue loss; a timeout-only
+            // episode remains RANDOM/BURST and still receives loss backoff.
             lossType = LossType.QUEUE;
             congestionReason = "RTT_INFLATION_LOSS";
         } else if (nonCongestiveHighLoss()) {
@@ -379,6 +411,8 @@ final class AdaptiveTransportController {
     long validatedPathRateBytesPerSecond() { return maxBandwidth(); }
     ResumeState resumeState() { return resumeState; }
     int resumeValidatedRounds() { return resumeValidatedRounds; }
+    boolean rttPressureActive() { return rttPressureActive; }
+    double burstDrainFloorPps() { return burstDrainFloorPps; }
 
     void onApplicationQueued(long now, int bytes) {
         if (!config.isAdaptiveTransportEnabled() || bytes <= 0) return;
@@ -391,7 +425,7 @@ final class AdaptiveTransportController {
         final double ratio = lossRatio();
         return config.isAdaptiveTransportEnabled() && lossType == LossType.RANDOM
                 && ratio >= 0.005D && ratio <= 0.03D
-                && !burstDrainActive && !queueInflated();
+                && !burstDrainActive && !rttPressureActive;
     }
 
     int smallWriteCoalesceMicros() {
@@ -569,7 +603,7 @@ final class AdaptiveTransportController {
             // of fragment HOL before a useful path sample existed.
             ceiling = healthyBurstCeiling();
         }
-        if (minRtt != Long.MAX_VALUE && smoothedRtt >= minRtt * 2L) target *= 0.85D;
+        if (rttPressureActive) target *= 0.85D;
         burstDrainFloorPps = Math.max(config.getAdaptiveMinPps(), Math.min(ceiling, target));
         updateBurstAdmissionTarget(now, outstandingBytes, estimatedPayloadBytes, ceiling);
         packetsPerSecond = applyBurstDrainFloor(packetsPerSecond);
@@ -596,10 +630,25 @@ final class AdaptiveTransportController {
         final long validatedRate = maxBandwidth();
         final long packetRate = (long) Math.ceil(packetsPerSecond * Math.max(256D, averagePacketBytes));
         final long minimum = burstAdmissionMinimumBytesPerSecond();
-        long initial = Math.max(minimum,
-                Math.min(BURST_ADMISSION_INITIAL_BPS, packetRate));
         final boolean healthy = lossType == LossType.NONE && lossRatio() < 0.005D
-                && !queueInflated() && lossQuietForRecovery(now);
+                && !rttPressureActive && lossQuietForRecovery(now);
+        // Unknown healthy paths start with a bounded 128KiB/s floor. Starting
+        // at the current packet-rate estimate reproduces a sender-limited
+        // sample: a path pinned to 30pps can then only rediscover roughly
+        // 30pps. Four datagrams of token capacity and cwnd still prevent an
+        // initial burst. A path with congestion evidence keeps its reduced
+        // sender-derived rate and does not receive the bootstrap floor.
+        final long senderRate = Math.max(
+                minimum,
+                Math.min(BURST_ADMISSION_INITIAL_BPS, packetRate)
+        );
+        long initial = healthy ? Math.max(
+                senderRate,
+                Math.min(
+                        BURST_ADMISSION_INITIAL_BPS,
+                        BURST_ADMISSION_BOOTSTRAP_BPS
+                )
+        ) : senderRate;
         final boolean validatedRateIsFresh = validatedRate > 0L && lastValidatedBandwidthNanos != 0L
                 && now - lastValidatedBandwidthNanos <= VALIDATED_PATH_LIFETIME_NANOS;
         resumeStartedNanos = now;
@@ -661,7 +710,15 @@ final class AdaptiveTransportController {
         final long observedMaximum = resumeState == ResumeState.UNVALIDATED
                 ? Math.max(minimum, burstAdmissionRateBytesPerSecond)
                 : validatedRate > 0L
-                ? Math.max(minimum, (long) Math.ceil(validatedRate * 1.25D))
+                ? Math.max(minimum, Math.max(
+                        (long) Math.ceil(
+                                validatedRate * VALIDATED_PROBE_HEADROOM
+                        ),
+                        (long) Math.ceil(
+                                burstAdmissionRateBytesPerSecond
+                                        * BURST_ADMISSION_GROWTH
+                        )
+                ))
                 : (long) Math.ceil(Math.min(DEGRADED_BURST_MAX_PPS, config.getAdaptiveMaxPps())
                 * Math.max(256D, estimatedPayloadBytes));
         final long safeMaximum = Math.max(minimum,
@@ -674,7 +731,8 @@ final class AdaptiveTransportController {
                 && validatedRate > 0L && lossType == LossType.NONE
                 && lastValidatedBandwidthNanos != 0L
                 && now - lastValidatedBandwidthNanos <= VALIDATED_PATH_LIFETIME_NANOS
-                && lossRatio() < 0.005D && !queueInflated() && lossQuietForRecovery(now);
+                && lossRatio() < 0.005D && !rttPressureActive
+                && lossQuietForRecovery(now);
         final long capacityFloor = trustedHealthyPath
                 ? (long) Math.ceil(validatedRate * VALIDATED_CAPACITY_FLOOR) : 0L;
         final long demandTarget = Math.max(minimum,
@@ -722,7 +780,10 @@ final class AdaptiveTransportController {
 
         final boolean recentAck = lastAckNanos != 0L && now - lastAckNanos <= Math.max(rtt * 2L,
                 TimeUnit.MILLISECONDS.toNanos(250));
-        final boolean healthy = lossRatio() < 0.005D && !queueInflated() && lossQuietForRecovery(now);
+        final boolean healthy = lossType == LossType.NONE
+                && lossRatio() < 0.005D
+                && !rttPressureActive
+                && lossQuietForRecovery(now);
         if (!recentAck || !healthy || resumeState == ResumeState.UNVALIDATED) {
             // Do not bank rate-growth credit while ACK feedback is absent or the path is unhealthy.
             // Spending that credit on recovery turns a held queue into a one-sample drain spike.
@@ -793,7 +854,7 @@ final class AdaptiveTransportController {
     }
 
     private boolean calibrationProbeAllowed(double recentLoss) {
-        return recentLoss < 0.03D && !queueInflated() && !rttPressureActive
+        return recentLoss < 0.03D && !rttPressureActive
                 && lossType != LossType.QUEUE && lossType != LossType.RATE_LIMIT
                 && lossType != LossType.BURST && lossType != LossType.MTU_BLACK_HOLE;
     }
@@ -814,10 +875,11 @@ final class AdaptiveTransportController {
 
     private void enterRttPressure(long now) {
         rttPressureActive = true;
+        lowFlightRttAcks = 0;
         congestionEpisodeActive = true;
         congestionMode = CongestionMode.DRAIN;
         congestionReason = "RTT_INFLATION";
-        lastLossNanos = now;
+        lastRttPressureNanos = now;
         bandwidthProbeSuppressedUntil = Math.max(bandwidthProbeSuppressedUntil,
                 now + Math.max(TimeUnit.SECONDS.toNanos(1), multiply(smoothedRtt, 4L)));
         gainCycle = 2;
@@ -830,6 +892,26 @@ final class AdaptiveTransportController {
         lossPacingCeiling = Math.min(lossPacingCeiling, packetsPerSecond);
         lossRecoveryUpdatedNanos = now;
         reduceBurstAdmission(reduction);
+    }
+
+    private void leaveRttPressure() {
+        rttPressureActive = false;
+        lowFlightRttAcks = 0;
+        lastRttPressureNanos = 0L;
+        if (lossType == LossType.NONE) {
+            congestionReason = "NONE";
+            congestionEpisodeActive = false;
+            lossPacingCeiling = Double.POSITIVE_INFINITY;
+            pacingCapped = false;
+        }
+    }
+
+    private boolean hasRttQueuePressureEvidence(long inFlightBytes) {
+        final long threshold = Math.max(
+                2L * config.getMTU(),
+                congestionWindowBytes / 4L
+        );
+        return inFlightBytes >= threshold;
     }
 
     private boolean rttRecovered() {
@@ -892,9 +974,14 @@ final class AdaptiveTransportController {
             pacingCapped = false;
             return modelRate;
         }
+        final long recoveryReference = Math.max(
+                lastLossNanos,
+                lastRttPressureNanos
+        );
         final long quietPeriod = Math.max(TimeUnit.MILLISECONDS.toNanos(250),
                 multiply(smoothedRtt, 2L));
-        if (now - lastLossNanos > quietPeriod) {
+        if (recoveryReference == 0L
+                || now - recoveryReference > quietPeriod) {
             final long elapsed = Math.max(0L, now - lossRecoveryUpdatedNanos);
             final long recoveryStep = Math.max(MIN_QOS_RECOVERY_STEP_NANOS, smoothedRtt);
             final long steps = elapsed / recoveryStep;
@@ -908,7 +995,9 @@ final class AdaptiveTransportController {
                 lossRecoveryUpdatedNanos = now;
             }
             if (lossPacingCeiling >= modelRate || (lossRatio() < 0.005D
-                    && now - lastLossNanos > TimeUnit.SECONDS.toNanos(5))) {
+                    && (recoveryReference == 0L
+                    || now - recoveryReference
+                    > TimeUnit.SECONDS.toNanos(5)))) {
                 lossPacingCeiling = Double.POSITIVE_INFINITY;
                 pacingCapped = false;
                 return modelRate;
@@ -1001,10 +1090,14 @@ final class AdaptiveTransportController {
             if (!deliverySampleApplicationLimited) {
                 unvalidatedBandwidthSample = Math.max(unvalidatedBandwidthSample, sample);
             }
-        } else if (!deliverySampleApplicationLimited || sample >= maxBandwidth()) {
+        } else if (!deliverySampleApplicationLimited) {
+            // Application-limited ACK bursts do not prove sustainable path
+            // capacity. Letting a high compressed sample enter the max filter
+            // makes the model PPS itself the send-rate bound and can turn an
+            // idle 0.2MiB/s stream into a retained 4MiB/s path estimate.
             bandwidthFilter[bandwidthCycle] = Math.max(bandwidthFilter[bandwidthCycle], sample);
-            bandwidthCycleHadValidSample |= !deliverySampleApplicationLimited;
-            if (!deliverySampleApplicationLimited) lastValidatedBandwidthNanos = now;
+            bandwidthCycleHadValidSample = true;
+            lastValidatedBandwidthNanos = now;
         }
         deliveryRateBytesPerSecond = maxBandwidth();
         deliverySampleStarted = now;
@@ -1070,7 +1163,9 @@ final class AdaptiveTransportController {
     }
 
     private boolean queueInflated() {
-        return minRtt != Long.MAX_VALUE && smoothedRtt > minRtt * 3L / 2L;
+        if (minRtt == Long.MAX_VALUE || smoothedRtt <= minRtt) return false;
+        final long queueDelay = smoothedRtt - minRtt;
+        return queueDelay >= Math.max(MIN_QUEUE_DELAY_NANOS, minRtt / 2L);
     }
     private boolean nonCongestiveHighLoss() {
         return lossSampleCount() >= 64 && lossRatio() >= 0.03D
@@ -1084,11 +1179,11 @@ final class AdaptiveTransportController {
 
     private void publishMetrics() {
         final long now = System.nanoTime();
-        final boolean calibrating = calibrationWindowOpen(now);
-        // Metrics must be observational. workConservingBulk() rotates the loss
-        // window, so derive the displayed state from the already-current buckets.
-        final boolean workConserving = burstDrainActive && (calibrating
-                || calibrationProbeAllowed(currentLossRatio()));
+        final boolean calibrating =
+                burstDrainActive && calibrationWindowOpen(now);
+        // Metrics must use the same work-conserving predicate as sendBudget,
+        // but must not rotate the loss window while observing it.
+        final boolean workConserving = workConservingBulkSnapshot(now);
         config.getMetrics().adaptivePacingRate(packetsPerSecond);
         config.getMetrics().adaptiveBytePacingRate(burstDrainActive && !workConserving
                 ? burstAdmissionRateBytesPerSecond : 0L);
@@ -1098,6 +1193,11 @@ final class AdaptiveTransportController {
         config.getMetrics().adaptivePathModel(maxBandwidth(), lastDeliverySampleApplicationLimited,
                 calibrating ? "CALIBRATING" : workConserving
                 ? "WORK_CONSERVING" : resumeState.name(), resumeValidatedRounds);
+        config.getMetrics().adaptiveAdmissionDiagnostics(
+                burstAdmissionTargetBytesPerSecond,
+                burstDrainFloorPps,
+                rttPressureActive
+        );
         config.getMetrics().adaptiveDeliveryRate(deliveryRateBytesPerSecond);
         final long acknowledgements = lossWindow.acknowledgedCount();
         final long losses = lossWindow.lostCount();
@@ -1115,6 +1215,17 @@ final class AdaptiveTransportController {
                 : Math.max(1D, smoothedRtt / (double) minRtt);
         config.getMetrics().congestionDiagnostics(congestionReason, inflation, pacingCapped,
                 System.nanoTime() < bandwidthProbeSuppressedUntil);
+    }
+
+    private boolean workConservingBulkSnapshot(long now) {
+        return burstDrainActive
+                && !calibrationWindowOpen(now)
+                && resumeState == ResumeState.VALIDATED
+                && lastValidatedBandwidthNanos != 0L
+                && now - lastValidatedBandwidthNanos
+                <= VALIDATED_PATH_LIFETIME_NANOS
+                && lossSampleCount() >= 64
+                && calibrationProbeAllowed(currentLossRatio());
     }
 
     private void publishPathMtuMetrics() {
